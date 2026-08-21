@@ -25,11 +25,13 @@ if str(Path(__file__).parent) not in _sys.path:   # sibling imports under `api.i
 
 from _accounts import router as accounts_router  # noqa: E402
 from _admin import router as admin_router  # noqa: E402
+from _agent import router as agent_router  # noqa: E402
 from _db import PACKS  # noqa: E402
 from _jobs import router as jobs_router  # noqa: E402
 
 app.include_router(accounts_router)
 app.include_router(admin_router)
+app.include_router(agent_router)
 app.include_router(jobs_router)
 
 

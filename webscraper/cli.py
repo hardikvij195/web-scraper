@@ -181,5 +181,18 @@ def serve(
 
 
 @app.command()
+def agent(
+    token: str = typer.Option(..., "--token", help="Agent token from the cloud Settings tab"),
+    base: str = typer.Option("https://web-scraper-leads.vercel.app", "--base"),
+    poll: int = typer.Option(20, "--poll", help="Seconds between cloud polls"),
+) -> None:
+    """Run cloud jobs on this machine: poll -> scrape locally -> sync results up."""
+    from webscraper.agent import run_agent
+
+    console.print(f"[bold]agent[/] polling {base} every {poll}s  (Ctrl-C to stop)")
+    run_agent(base, token, poll)
+
+
+@app.command()
 def version() -> None:
     console.print(__version__)

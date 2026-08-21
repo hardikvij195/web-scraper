@@ -125,6 +125,7 @@ class Store:
             ("started_at", "TEXT"),          # worker picked it up
             ("scrape_started_at", "TEXT"),
             ("enrich_started_at", "TEXT"),
+            ("cloud_id", "INTEGER"),         # scrape_jobs.id when mirrored from the cloud queue
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
