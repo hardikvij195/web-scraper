@@ -18,6 +18,21 @@ app = FastAPI(title="web-scraper cloud viewer")
 TABLE = "web_scraper_leads"
 HTML = (Path(__file__).parent.parent / "index.html")
 
+import sys as _sys
+
+if str(Path(__file__).parent) not in _sys.path:   # sibling imports under `api.index:app` too
+    _sys.path.insert(0, str(Path(__file__).parent))
+
+from _accounts import router as accounts_router  # noqa: E402
+from _db import PACKS  # noqa: E402
+
+app.include_router(accounts_router)
+
+
+@app.get("/api/config")
+def config():
+    return {"cloud": True, "packs": [{"id": k, **v} for k, v in PACKS.items()]}
+
 
 def _supa() -> tuple[str, str] | None:
     url = (os.getenv("SUPABASE_PROJECT_URL") or "").strip().rstrip("/")
