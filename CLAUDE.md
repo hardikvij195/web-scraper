@@ -9,9 +9,11 @@ for usage; this file is for working on the code.
 
 ```
 webscraper/
-  cli.py         typer CLI: scrape | enrich | export | run | jobs | stats | serve
+  cli.py         typer CLI: scrape | enrich | export | run | jobs | stats | serve | agent
   server.py      FastAPI local UI (:8765) + single Worker thread; jobs.phase drives progress;
                  routes /api/jobs (POST/GET), /api/jobs/{id}[/places|/stop|/export?fmt=xlsx|csv|json]
+  agent.py       cloud agent mode: polls the Vercel API for the member's queued jobs, mirrors them
+                 into local jobs rows (jobs.cloud_id), reuses the same Worker, syncs results up
   static/index.html  vanilla-JS single page: form -> jobs list -> progress bars -> leads table -> downloads
   maps.py        Playwright: search URL -> scroll feed (FeedCard) -> per-place panel -> Place
   enrich.py      async httpx: home + contact/about pages -> emails, socials, WhatsApp
@@ -19,9 +21,45 @@ webscraper/
   store.py       sqlite3 (jobs, places), stats, CSV/JSON export, tiny ALTER-TABLE migrate
   models.py      Place / Contacts dataclasses
   config.py      .env -> Settings (delay, pauses, headless, proxy, country, paths)
-tests/test_extractors.py
+vercel-app/      cloud product on Vercel (web-scraper-leads.vercel.app) — see "Cloud product" below
+  api/index.py   app assembly (mounts routers below, serves index.html, /api/config, /api/health)
+  api/_db.py     PostgREST/GoTrue helpers + PACKS (pack prices live HERE, server-side only)
+  api/_auth.py   JWT session dep + X-Agent-Token dep; _accounts.py login/settings/agent-tokens
+  api/_admin.py  member management; _jobs.py browser job CRUD; _agent.py claim/progress/sync
+  api/_webhooks.py signed per-lead webhooks + /api/cron/webhooks; _pay.py Razorpay+PayU; _ai.py
+  index.html     login overlay + tabs: Scraper(jobs) / All leads / Billing / Settings / Admin
+supabase_migrations/  001 accounts, 002 jobs+credits (+debit_credits RPC), 003 leads multiuser
+scripts/         apply_migrations.py (psycopg2 pooler scan), create_admin.py (GoTrue admin REST)
+tests/test_extractors.py + tests/cloud/ (pure-logic unit tests for the cloud API)
 data/            gitignored: leads.db, browser-profile/, exports/
 ```
+
+## Cloud product (Lead Finder Cloud, since 2026-08-21)
+
+- **Spec/plan:** `docs/superpowers/specs/2026-08-21-lead-finder-cloud-design.md` +
+  `docs/superpowers/plans/2026-08-21-lead-finder-cloud.md`.
+- **Supabase project `gfgkcnjxvxlusplwmvae`** (own — NOT the CRM's). Auth: admin creates members
+  (no self-signup); roles in `profiles`. RLS owner-or-admin everywhere; the API uses the service
+  role key from env.
+- **Job flow:** member creates job in browser → `scrape_jobs` queued → member's PC runs
+  `python -m webscraper agent --token <wsk_…>` → claims, scrapes locally, `POST /api/agent/sync`.
+- **Verified lead** = enrich_status finished AND (phone OR email). Only verified leads debit
+  credits (`debit_credits` RPC, race-safe, partial-accept → job `paused_quota`) and fire the
+  member's webhook (HMAC `X-Signature`, retries, `webhook_deliveries` log, daily Vercel cron
+  re-drive `/api/cron/webhooks` with `CRON_SECRET`).
+- **Packs (one-time):** `starter_3k` 3,000 leads $10/₹880 · `pro_5k` 5,000 leads $15/₹1,320 —
+  amounts are server-side constants in `_db.PACKS`, never trust the client. Razorpay =
+  order → checkout.js → server signature verify (+ `payment.captured` webhook backup). PayU =
+  server hash → form redirect → reverse-hash verify on `/api/pay/payu/return`. Crediting
+  idempotent per order.
+- **AI keys:** member's own Gemini/OpenAI keys (Settings tab, stored server-side, masked in API)
+  power `/api/suggest` + `/api/leads/summarize`; server `GEMINI_API_KEY` is the fallback.
+- **Vercel env (production):** SUPABASE_PROJECT_URL / SERVICE_ROLE_KEY / ANON_KEY,
+  GEMINI_API_KEY, APP_BASE_URL, CRON_SECRET set 2026-08-21; RAZORPAY_KEY_ID/KEY_SECRET/
+  WEBHOOK_SECRET + PAYU_KEY/SALT/PAYU_BASE **not set yet** — payments 503 until then.
+  Local mirror: `vercel-app/.env.deploy` (gitignored).
+- Deploy: `cd vercel-app && npx vercel deploy --prod --yes`. Local API run for testing:
+  `set -a && . ./.env.deploy && set +a && python -m uvicorn api.index:app --port 8899`.
 
 ## Facts learned the hard way (2026-08-20)
 

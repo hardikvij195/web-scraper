@@ -84,3 +84,13 @@ Google `place_id` when known). Exports land in `data/exports/`. `data/` is gitig
 
 Push results into HVT CRM (`lead_gen_results` -> Leads import UI), wallet debit, move the
 same container to the VPS with CPU caps. See `CLAUDE.md`.
+
+## Run as a cloud member (Lead Finder Cloud)
+
+1. Sign in at https://web-scraper-leads.vercel.app (ask the admin for an account).
+2. Settings tab → **Agent tokens → New token** — copy the `wsk_…` token (shown once).
+3. On your PC (this repo, deps installed): `python -m webscraper agent --token wsk_…`
+4. Create jobs in the browser (Scraper tab). Your agent picks them up, scrapes locally and
+   syncs results; verified leads (phone or email found) use 1 credit each and are POSTed to
+   your webhook (Settings) with an `X-Signature` HMAC header.
+5. Buy credits in the Billing tab (Razorpay or PayU).
