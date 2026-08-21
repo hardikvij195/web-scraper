@@ -108,6 +108,21 @@
   .chip { background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe; border-radius:999px; padding:3px 10px; font-size:12px; cursor:pointer; }
   .chip:hover { background:#dbeafe; }
   .chips .src { font-size:11px; color:var(--muted); align-self:center; }
+  /* ── text fields: one consistent look everywhere ── */
+  input[type="text"], input[type="email"], input[type="password"], input[type="number"],
+  input[type="url"], input[type="search"], input:not([type]), select, textarea {
+    padding: 9px 12px; border: 1px solid var(--line, #d5dee8); border-radius: 8px;
+    font: inherit; color: inherit; background: #fff; min-width: 0;
+    transition: border-color .12s, box-shadow .12s;
+  }
+  input::placeholder, textarea::placeholder { color: #93a4b5; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: none; border-color: var(--brand, #1f6feb);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand, #1f6feb) 18%, transparent);
+  }
+  input[type="checkbox"], input[type="radio"] { padding: 0; border-radius: 4px; }
+  #login input { width: 100%; box-sizing: border-box; }
+  #tab-settings input, #tab-admin input { box-sizing: border-box; }
 </style>
 </head>
 <body>
