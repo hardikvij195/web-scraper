@@ -28,11 +28,13 @@ from _admin import router as admin_router  # noqa: E402
 from _agent import router as agent_router  # noqa: E402
 from _db import PACKS  # noqa: E402
 from _jobs import router as jobs_router  # noqa: E402
+from _leads import router as leads_router  # noqa: E402
 
 app.include_router(accounts_router)
 app.include_router(admin_router)
 app.include_router(agent_router)
 app.include_router(jobs_router)
+app.include_router(leads_router)
 
 
 @app.get("/api/config")
@@ -55,24 +57,6 @@ def index() -> str:
 def health():
     return {"ok": True, "cloud": True, "worker_alive": False, "current_job": None,
             "supabase": _supa() is not None}
-
-
-@app.get("/api/leads")
-def leads(unique: bool = True, limit: int = 5000, source: str = "supabase"):
-    cfg = _supa()
-    if not cfg:
-        return {"total": 0, "rows": [], "source": "none"}
-    url, key = cfg
-    try:
-        r = httpx.get(f"{url}/rest/v1/{TABLE}?select=*&order=scraped_at.desc&limit={max(1, min(limit, 10000))}",
-                      headers={"apikey": key, "Authorization": f"Bearer {key}"}, timeout=25)
-        if r.status_code == 404:
-            return {"total": 0, "rows": [], "source": "supabase"}
-        r.raise_for_status()
-        rows = r.json()
-        return {"total": len(rows), "rows": rows, "source": "supabase"}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, f"supabase: {e}") from e
 
 
 @app.get("/api/supabase/status")
