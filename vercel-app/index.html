@@ -542,7 +542,7 @@ async function refresh() {
     if (h.cloud) { applyCloudMode(); $('#health').textContent = '☁ cloud viewer — scraping runs on your PC'; }
     else $('#health').textContent = h.worker_alive ? (h.current_job ? `working on job #${h.current_job}` : 'idle') : 'worker down';
   } catch { $('#health').textContent = 'server unreachable'; }
-  if (window.CLOUD) { if (leadsRows === null) { showTab('leads', true); loadLeads(true); } clearTimeout(pollTimer); return; }
+  if (window.CLOUD) { if (leadsRows === null) { if (tabFromHash() !== 'scraper') showTab('leads', true); loadLeads(true); } clearTimeout(pollTimer); return; }
   jobs = await api('/api/jobs').catch(()=>[]);
   if (currentId == null) { const first = jobs.find(j => j.phase !== 'draft'); if (first) currentId = first.id; }
   renderJobs();
@@ -733,9 +733,12 @@ function applyCloudMode() {
   document.body.classList.add('cloud');
   const nb = document.querySelector('.btn-new');
   if (nb) { nb.textContent = 'ⓘ Scraper runs locally'; nb.onclick = () => alert('The scraper runs on your own computer, not in the cloud.\n\nRun web-scraper on your PC — its results appear here automatically (they sync to Supabase).\n\nThis page is a shared read-only viewer of everyone\'s leads.'); }
-  const st = $('#tab-btn-scraper'); if (st) st.style.display = 'none';
   const fc = $('#fromcloud'); if (fc) { fc.checked = true; fc.closest('label').style.display = 'none'; }
-  showTab('leads', true);
+  // Jobs stay visible in the cloud viewer; they run on the user's PC, so the list explains that
+  // instead of hiding the whole tab. (Cloud job queue is coming — see docs/superpowers/plans.)
+  $('#jobs').innerHTML = '<div class="muted">Jobs run on your own PC for now.<br><br>' +
+    'Start the local app (<code>python -m webscraper serve</code>) to create and watch jobs there; ' +
+    'finished leads sync to this page automatically (All&nbsp;leads tab).</div>';
 }
 
 setupTagInput();
