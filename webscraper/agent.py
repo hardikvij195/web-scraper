@@ -196,14 +196,16 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas") -> None:
     mirrored = {r["cloud_id"] for r in store.conn.execute(
         "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=?", (kind,)).fetchall()}
     for cj in cloud.jobs():
-        if cj["id"] in mirrored:
-            continue
         # On-demand WhatsApp re-verify: no scrape/enrich — fetch the job's existing
-        # results, check each number, write wa_verified back. CRM-only.
+        # results, check each number, write wa_verified back. CRM-only. Checked BEFORE
+        # the `mirrored` guard because a re-verify targets a job that was ALREADY
+        # scraped+mirrored earlier — the guard would otherwise skip it forever.
         if kind == "crm" and cj.get("wa_verify_only"):
             if cloud.claim(cj["id"]) is None:
                 continue
             _reverify_wa(cloud, store, cj["id"])
+            continue
+        if cj["id"] in mirrored:
             continue
         if cloud.claim(cj["id"]) is None:
             continue
