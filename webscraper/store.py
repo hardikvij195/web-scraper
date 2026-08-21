@@ -182,8 +182,11 @@ class Store:
         return [dict(r) for r in self.conn.execute("SELECT * FROM wa_accounts ORDER BY name")]
 
     def add_wa_account(self, name: str) -> None:
+        # Upsert + re-enable: a fresh wa-login clears a prior 'disabled' flag (e.g. one
+        # set when a headless verify misread the session as logged-out).
         self.conn.execute(
-            "INSERT OR IGNORE INTO wa_accounts(name, added_at) VALUES (?, ?)", (name, now_iso()))
+            "INSERT INTO wa_accounts(name, added_at) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET disabled=0", (name, now_iso()))
         self.conn.commit()
 
     def remove_wa_account(self, name: str) -> None:

@@ -49,7 +49,11 @@ class Settings:
     wa_daily_cap: int = _int(os.getenv("WA_DAILY_CAP"), 200)          # per account, per day
     wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 8.0)
     wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 20.0)
-    wa_verify_headless: bool = _bool(os.getenv("WA_VERIFY_HEADLESS"), True)
+    # Headed by default: WhatsApp Web treats a headless Chromium as a NEW device and
+    # shows the QR again (session doesn't carry over), so headless verify sees every
+    # account as logged-out. On a headless VPS set WA_VERIFY_HEADLESS=true + run under
+    # xvfb, or keep a headed display.
+    wa_verify_headless: bool = _bool(os.getenv("WA_VERIFY_HEADLESS"), False)
 
 
 settings = Settings()

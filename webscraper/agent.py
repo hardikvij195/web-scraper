@@ -168,12 +168,14 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
 
     def onp(pk: str, status: str) -> None:
         collected[pk] = status
-        if len(collected) % 5 == 0 or len(collected) == total:
+        # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live
+        # (batching hid progress and looked stuck).
+        try:
             cloud.progress(jid, "verifying_wa",
                            {"wa_verify_total": total, "wa_verify_done": len(collected)})
-            # flush partial results so the CRM shows badges as they land
-            cloud.set_wa(jid, [{"place_key": k, "wa_verified": v}
-                              for k, v in list(collected.items())[-5:]])
+            cloud.set_wa(jid, [{"place_key": pk, "wa_verified": status}])
+        except httpx.HTTPError as e:
+            log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
 
     try:
         # job_id=None → verify_places won't touch the local store's places (they aren't

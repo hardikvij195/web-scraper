@@ -31,7 +31,10 @@ log = logging.getLogger("webscraper.wa_verify")
 
 WA_SEND = "https://web.whatsapp.com/send?phone={num}&text&type=phone_number&app_absent=0"
 _LOGIN_TIMEOUT_MS = 120_000     # QR scan grace
-_CHECK_TIMEOUT_MS = 45_000      # per-number decision grace
+_CHECK_TIMEOUT_MS = 25_000      # per-number decision grace
+# WhatsApp's "this number isn't registered" popup — exact wording varies, so match any.
+_NOT_ON_WA = ("isn't on whatsapp", "not on whatsapp", "is invalid", "shared via url",
+              "phone number shared", "no está en whatsapp")
 
 
 class WaNotLoggedIn(RuntimeError):
@@ -76,29 +79,28 @@ def _is_logged_in(page: Page) -> bool:
 def _decide(page: Page) -> str:
     """On an already-loaded send URL, return 'yes' | 'no' | 'unknown'.
 
-    Valid number      -> WhatsApp opens the conversation (compose box appears).
-    Invalid/not-on-WA -> a popup: "Phone number shared via url is invalid."
+    Valid number      -> WhatsApp opens the conversation (#main chat pane appears).
+    Not-on-WhatsApp    -> a popup, e.g. "The number +44 … isn't on WhatsApp." (~2 s).
     """
     deadline = time.monotonic() + _CHECK_TIMEOUT_MS / 1000
-    invalid_sel = (
-        'div[role="dialog"]:has-text("invalid"), '
-        'div[role="dialog"]:has-text("not on WhatsApp"), '
-        '[data-testid="popup-contents"]:has-text("invalid")'
-    )
-    compose_sel = (
-        'footer div[contenteditable="true"][data-tab], '
-        '[data-testid="conversation-compose-box-input"], '
-        'div[title="Type a message"]'
-    )
+    compose_sel = ('footer div[contenteditable="true"][data-tab], '
+                   'div[contenteditable="true"][data-tab], div[title="Type a message"]')
     while time.monotonic() < deadline:
-        if page.locator(invalid_sel).count():
-            return "no"
-        if page.locator(compose_sel).count():
+        dlg = page.locator('div[role="dialog"]')
+        if dlg.count():
+            try:
+                txt = dlg.first.inner_text().lower()
+            except Exception:  # noqa: BLE001
+                txt = ""
+            if any(p in txt for p in _NOT_ON_WA):
+                return "no"
+        # Chat pane / compose box present => the number opened a conversation => on WA.
+        if page.locator('#main').count() or page.locator(compose_sel).count():
             return "yes"
         # Session dropped mid-run (rare) — surface as not-logged-in so the caller stops.
         if page.locator('canvas[aria-label*="Scan"], [data-testid="qrcode"]').count():
             raise WaNotLoggedIn("session ended mid-run")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(400)
     return "unknown"
 
 
