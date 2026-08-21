@@ -24,9 +24,11 @@ if str(Path(__file__).parent) not in _sys.path:   # sibling imports under `api.i
     _sys.path.insert(0, str(Path(__file__).parent))
 
 from _accounts import router as accounts_router  # noqa: E402
+from _admin import router as admin_router  # noqa: E402
 from _db import PACKS  # noqa: E402
 
 app.include_router(accounts_router)
+app.include_router(admin_router)
 
 
 @app.get("/api/config")

@@ -126,6 +126,7 @@
   <nav class="tabs">
     <button class="tab active" id="tab-btn-scraper" onclick="showTab('scraper')">Scraper</button>
     <button class="tab" id="tab-btn-leads" onclick="showTab('leads')">All leads</button>
+    <button class="tab" id="tab-btn-admin" style="display:none" onclick="showTab('admin')">Admin</button>
   </nav>
   <span class="sub" style="margin-left:auto"><span id="whoami-email"></span> <span id="whoami-credits"></span> · <span id="health">…</span>
     <button class="tab" style="margin-left:8px" onclick="logout()">Sign out</button></span>
@@ -162,6 +163,22 @@
       <div class="msg" id="supa-status" style="margin:4px 0 4px"></div>
       <div class="toolbar" id="leads-filters" style="gap:6px 12px"></div>
       <div class="tbl" id="leads-tbl"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+</main>
+
+<!-- ── admin tab ──────────────────────────────────────────────────────────── -->
+<main id="tab-admin" style="display:none;grid-template-columns:1fr">
+  <section>
+    <div class="card">
+      <h2>Members</h2>
+      <form id="new-member" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <input id="nm-email" type="email" placeholder="email" required>
+        <input id="nm-pass" type="text" placeholder="temp password" required minlength="8">
+        <input id="nm-name" type="text" placeholder="name">
+        <button class="btn-primary" type="submit">Create member</button>
+      </form>
+      <div class="tbl" id="members-tbl"><div class="empty">loading…</div></div>
     </div>
   </section>
 </main>
@@ -423,11 +440,40 @@ function readHash() {
 window.showTab = (t, skipHash) => {
   $('#tab-scraper').style.display = t === 'scraper' ? 'grid' : 'none';
   $('#tab-leads').style.display = t === 'leads' ? 'grid' : 'none';
+  $('#tab-admin').style.display = t === 'admin' ? 'grid' : 'none';
   $('#tab-btn-scraper').classList.toggle('active', t === 'scraper');
   $('#tab-btn-leads').classList.toggle('active', t === 'leads');
+  $('#tab-btn-admin').classList.toggle('active', t === 'admin');
   if (!skipHash) writeHash(t);
   if (t === 'leads' && leadsRows === null) loadLeads();
+  if (t === 'admin') loadMembers();
 };
+
+// ── admin: members ───────────────────────────────────────────────────────────
+async function loadMembers() {
+  const rows = await authApi('/api/admin/members').catch(e => { alert(e.message); return []; });
+  $('#members-tbl').innerHTML = '<table><thead><tr><th>email</th><th>name</th><th>role</th><th>credits</th><th>active</th><th></th></tr></thead><tbody>' +
+    rows.map(m => `<tr><td>${m.email}</td><td>${m.name||''}</td><td>${m.role}</td>
+      <td>${m.balance} <a style="cursor:pointer;color:var(--brand2,#2563eb)" onclick="adjCredits('${m.user_id}')">±</a></td>
+      <td>${m.active ? '✓' : '✗'}</td>
+      <td><a style="cursor:pointer;color:var(--brand2,#2563eb)" onclick="toggleMember('${m.user_id}', ${!m.active})">${m.active?'deactivate':'activate'}</a></td></tr>`).join('') +
+    '</tbody></table>';
+}
+window.adjCredits = async uid => {
+  const d = parseInt(prompt('Credits delta (e.g. 500 or -200):') || '0', 10);
+  if (d) { await authApi('/api/admin/credits', {method:'POST', body: JSON.stringify({user_id: uid, delta: d})}); loadMembers(); }
+};
+window.toggleMember = async (uid, active) => {
+  await authApi('/api/admin/members/' + uid, {method:'PATCH', body: JSON.stringify({active})}); loadMembers();
+};
+document.getElementById('new-member').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    await authApi('/api/admin/members', {method:'POST', body: JSON.stringify(
+      {email: $('#nm-email').value, password: $('#nm-pass').value, name: $('#nm-name').value})});
+    e.target.reset(); loadMembers();
+  } catch (err) { alert(err.message); }
+});
 window.addEventListener('hashchange', () => { const t = tabFromHash(); if (t !== ($('#tab-btn-leads').classList.contains('active') ? 'leads' : 'scraper')) showTab(t, true); });
 async function loadLeads(force) {
   if (force) leadsRows = null;
@@ -801,6 +847,7 @@ if (!SESSION) {
   authApi('/api/me').then(m => {
     $('#whoami-email').textContent = m.email + (m.role === 'admin' ? ' (admin)' : '');
     $('#whoami-credits').textContent = '· ' + m.balance + ' credits';
+    if (m.role === 'admin') $('#tab-btn-admin').style.display = '';
   }).catch(()=>{});
 }
 refresh();
