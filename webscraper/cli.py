@@ -182,15 +182,18 @@ def serve(
 
 @app.command()
 def agent(
-    token: str = typer.Option(..., "--token", help="Agent token from the cloud Settings tab"),
-    base: str = typer.Option("https://web-scraper-leads.vercel.app", "--base"),
+    token: str = typer.Option(..., "--token", help="Agent token (cloud Settings tab or CRM Lead Finder page)"),
+    base: str = typer.Option("", "--base", help="Override the API base URL"),
+    crm: bool = typer.Option(False, "--crm", help="Serve the HVT CRM Lead Finder queue instead of the SaaS cloud"),
     poll: int = typer.Option(20, "--poll", help="Seconds between cloud polls"),
 ) -> None:
     """Run cloud jobs on this machine: poll -> scrape locally -> sync results up."""
     from webscraper.agent import run_agent
 
-    console.print(f"[bold]agent[/] polling {base} every {poll}s  (Ctrl-C to stop)")
-    run_agent(base, token, poll)
+    resolved = base or ("https://fyfhkjxewzbyxdwspkuc.supabase.co/functions/v1" if crm
+                        else "https://web-scraper-leads.vercel.app")
+    console.print(f"[bold]agent[/] ({'crm' if crm else 'saas'}) polling {resolved} every {poll}s  (Ctrl-C to stop)")
+    run_agent(resolved, token, poll, kind="crm" if crm else "saas")
 
 
 @app.command()

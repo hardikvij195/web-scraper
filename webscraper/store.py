@@ -126,6 +126,7 @@ class Store:
             ("scrape_started_at", "TEXT"),
             ("enrich_started_at", "TEXT"),
             ("cloud_id", "INTEGER"),         # scrape_jobs.id when mirrored from the cloud queue
+            ("cloud_kind", "TEXT"),          # 'saas' | 'crm' — which queue cloud_id belongs to
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")

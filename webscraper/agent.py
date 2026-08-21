@@ -50,6 +50,50 @@ class Cloud:
         return r.json()
 
 
+def crm_payload(action: str, **kw) -> dict:
+    return {"action": action, **kw}
+
+
+class CrmCloud:
+    """Same interface as Cloud, but speaks the CRM Edge Function protocol
+    (single POST endpoint, {action: ...} bodies)."""
+
+    def __init__(self, base: str, token: str):
+        self.url = base.rstrip("/") + "/lead-finder-agent"
+        self.c = httpx.Client(timeout=60, headers={"X-Agent-Token": token,
+                                                   "Content-Type": "application/json"})
+
+    def _post(self, payload: dict) -> httpx.Response:
+        return self.c.post(self.url, json=payload)
+
+    def jobs(self) -> list[dict]:
+        r = self._post(crm_payload("jobs"))
+        r.raise_for_status()
+        return r.json()
+
+    def claim(self, jid: int) -> dict | None:
+        r = self._post(crm_payload("claim", job_id=jid))
+        if r.status_code == 409:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    def progress(self, jid: int, phase: str | None, progress: dict) -> bool:
+        r = self._post(crm_payload("progress", job_id=jid, phase=phase, progress=progress))
+        r.raise_for_status()
+        return bool(r.json().get("cancelled"))
+
+    def done(self, jid: int, status: str, error: str | None = None) -> None:
+        self._post(crm_payload("done", job_id=jid, status=status, error=error)).raise_for_status()
+
+    def sync(self, jid: int, rows: list[dict]) -> dict:
+        r = self._post(crm_payload("sync", job_id=jid, rows=rows))
+        r.raise_for_status()
+        # CRM has no quota — normalize to the Cloud.sync result shape _tick expects
+        d = r.json()
+        return {"accepted": d.get("accepted", 0), "rejected_quota": 0}
+
+
 def _flat(r: dict) -> dict:
     from webscraper.supa import _row
     return _row(r)
@@ -60,24 +104,24 @@ def _local_progress(row: Any) -> dict:
             "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"]}
 
 
-def run_agent(base: str, token: str, poll_sec: int = 20) -> None:
+def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    cloud = Cloud(base, token)
+    cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
-    log.info("agent up — polling %s every %ss", base, poll_sec)
+    log.info("agent up (%s) — polling %s every %ss", kind, base, poll_sec)
     while True:
         try:
-            _tick(cloud, store)
+            _tick(cloud, store, kind)
         except httpx.HTTPError as e:
             log.warning("cloud unreachable: %s", e)
         time.sleep(poll_sec)
 
 
-def _tick(cloud: Cloud, store: Store) -> None:
+def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas") -> None:
     mirrored = {r["cloud_id"] for r in store.conn.execute(
-        "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL").fetchall()}
+        "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=?", (kind,)).fetchall()}
     for cj in cloud.jobs():
         if cj["id"] in mirrored:
             continue
@@ -89,11 +133,12 @@ def _tick(cloud: Cloud, store: Store) -> None:
             phase="queued", do_enrich=True, headless=True, country=cj.get("country"),
             radius_km=cj.get("radius_km"),
             center_lat=cj.get("lat"), center_lng=cj.get("lng"))
-        store.update_job(local_id, cloud_id=cj["id"])
+        store.update_job(local_id, cloud_id=cj["id"], cloud_kind=kind)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
     # mirror running/finished local state up
     for row in store.conn.execute(
-            "SELECT * FROM jobs WHERE cloud_id IS NOT NULL AND (note IS NULL OR note <> 'synced')").fetchall():
+            "SELECT * FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
+            "AND (note IS NULL OR note <> 'synced')", (kind,)).fetchall():
         cid = row["cloud_id"]
         if row["phase"] in ("scraping", "enriching", "queued", "waiting", "researching"):
             cancelled = cloud.progress(cid, row["phase"], _local_progress(row))
