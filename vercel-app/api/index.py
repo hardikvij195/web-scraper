@@ -26,6 +26,7 @@ if str(Path(__file__).parent) not in _sys.path:   # sibling imports under `api.i
 from _accounts import router as accounts_router  # noqa: E402
 from _admin import router as admin_router  # noqa: E402
 from _agent import router as agent_router  # noqa: E402
+from _ai import router as ai_router  # noqa: E402
 from _db import PACKS  # noqa: E402
 from _jobs import router as jobs_router  # noqa: E402
 from _leads import router as leads_router  # noqa: E402
@@ -35,6 +36,7 @@ from _webhooks import router as webhooks_router  # noqa: E402
 app.include_router(accounts_router)
 app.include_router(admin_router)
 app.include_router(agent_router)
+app.include_router(ai_router)
 app.include_router(jobs_router)
 app.include_router(leads_router)
 app.include_router(pay_router)
@@ -79,47 +81,6 @@ def supa_status():
         return {"configured": True, "reachable": True, "table_exists": exists, "count": count, "cloud": True}
     except httpx.HTTPError:
         return {"configured": True, "reachable": False, "table_exists": False, "count": 0, "cloud": True}
-
-
-@app.get("/api/suggest")
-def suggest(q: str):
-    q = (q or "").strip()
-    if len(q) < 2:
-        return {"source": "none", "keywords": []}
-    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_AI_STUDIO_API_KEY")
-    prompt = (f"You help build Google Maps lead-generation searches. For the business type {q!r}, "
-              "list 10 other Google Maps search keywords that find the same or closely related businesses. "
-              "Reply as a JSON array of short strings only, no prose.")
-    if key:
-        try:
-            r = httpx.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={key}",
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1000,
-                                           "responseMimeType": "application/json",
-                                           "thinkingConfig": {"thinkingBudget": 0}}},
-                timeout=25)
-            r.raise_for_status()
-            t = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            kws = [str(x).strip() for x in _json.loads(t[t.find("["): t.rfind("]") + 1]) if str(x).strip()][:12]
-            if kws:
-                return {"source": "gemini", "keywords": kws}
-        except (httpx.HTTPError, ValueError, KeyError, IndexError):
-            pass
-    kws = []
-    try:
-        for seed in (q, f"{q} near", f"best {q}"):
-            r = httpx.get("https://suggestqueries.google.com/complete/search",
-                          params={"client": "firefox", "q": seed}, timeout=10,
-                          headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                for s in r.json()[1]:
-                    s = s.strip()
-                    if s and s.lower() != q.lower() and s not in kws:
-                        kws.append(s)
-    except (httpx.HTTPError, ValueError, IndexError):
-        pass
-    return {"source": "autosuggest", "keywords": kws[:12]}
 
 
 @app.get("/api/geocode")

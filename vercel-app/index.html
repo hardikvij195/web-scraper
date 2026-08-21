@@ -676,7 +676,7 @@ window.renderLeads = () => {
         ${p.twitter_x?`<a href="${esc(p.twitter_x)}" target="_blank">X</a>`:''}
       </td>
       <td class="muted">${esc(p.owner||'')}</td>
-      <td class="wrap muted">${esc(p.summary||'')}</td>
+      <td class="wrap muted">${esc(p.ai_summary||p.summary||'')} ${window.CLOUD?`<a style="cursor:pointer" title="AI summary" onclick="summLead('${esc(p.place_key)}')">🧠</a>`:''}</td>
       <td class="wrap muted">${Array.isArray(p.team)?p.team.map(t=>esc(t.name)+(t.role?` (${esc(t.role)})`:'')).join('<br>'):esc(p.team||'')}</td>
       <td class="wrap muted">${esc(p.address||'')}</td>
       <td class="muted">${esc(p.country||'')}</td>
@@ -685,6 +685,12 @@ window.renderLeads = () => {
       <td class="muted">#${p.job_id} ${esc(p.job_query||'')}${p.job_location?` · ${esc(p.job_location)}`:''}</td>
     </tr>`).join('')}
     </tbody></table>` : '<div class="empty">no leads yet</div>';
+};
+window.summLead = async pk => {
+  try {
+    const r = await authApi('/api/leads/summarize', {method:'POST', body: JSON.stringify({place_key: pk})});
+    alert(r.summary); loadLeads(true);
+  } catch (e) { alert(e.message); }
 };
 
 async function saveJob(asDraft) {
