@@ -161,9 +161,15 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         log.warning("re-verify #%s: could not fetch results: %s", jid, e)
         cloud.done(jid, "error", "could not fetch results")
         return
-    targets = [r for r in rows if (r.get("phone") or r.get("whatsapp_number"))]
+    # Only rows with a number AND not already decided — a 'yes'/'no' is final, re-checking
+    # it wastes the daily cap. 'unknown'/null are re-tried.
+    targets = [r for r in rows if (r.get("phone") or r.get("whatsapp_number"))
+               and r.get("wa_verified") not in ("yes", "no")]
+    already = sum(1 for r in rows if r.get("wa_verified") in ("yes", "no"))
     total = len(targets)
     src_by_pk = {r["place_key"]: r.get("whatsapp_source") for r in targets}
+    if already:
+        log.info("re-verify #%s: skipping %d already-verified", jid, already)
     cloud.progress(jid, "verifying_wa", {"wa_verify_total": total, "wa_verify_done": 0})
     collected: dict[str, str] = {}
 

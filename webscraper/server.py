@@ -297,7 +297,8 @@ class Worker(threading.Thread):
                 if job["do_wa_verify"] and not user_stop():
                     from webscraper import wa_verify
                     targets = [p for p in store.places(job_id)
-                               if (p.get("phone") or p.get("whatsapp_number"))]
+                               if (p.get("phone") or p.get("whatsapp_number"))
+                               and p.get("wa_verified") not in ("yes", "no")]
                     store.update_job(job_id, phase="verifying_wa", wa_verify_total=len(targets),
                                      wa_verify_done=0,
                                      message=f"checking {len(targets)} numbers on WhatsApp (paced)…")

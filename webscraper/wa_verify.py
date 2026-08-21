@@ -188,6 +188,9 @@ def verify_places(
         for r in rows:
             if should_stop():
                 break
+            # A already-decided number is final — never re-check (defensive; callers filter).
+            if r.get("wa_verified") in ("yes", "no"):
+                continue
             num = _e164_digits(r.get("phone"), r.get("whatsapp_number"), r.get("country"))
             pk = r["place_key"]
             if not num:
