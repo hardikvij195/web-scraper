@@ -636,6 +636,14 @@ async function saveJob(asDraft) {
   if (!keywords.length) { $('#formmsg').textContent = 'add at least one keyword'; return; }
   $('#start').disabled = true; $('#formmsg').textContent = '';
   try {
+    if (window.CLOUD) {
+      const b = jobBody();
+      await api('/api/jobs', {method:'POST', body: JSON.stringify({query: b.query, location: b.location || null,
+        lat: b.center_lat, lng: b.center_lng, radius_km: b.radius_km,
+        limit_places: b.max_places || 100, country: b.country || null})});
+      lastJobsHtml = ''; closeJobDialog(); refresh();
+      $('#start').disabled = false; return;
+    }
     let job;
     if (editingId) {
       job = await api(`/api/jobs/${editingId}`, {method:'PATCH', body: JSON.stringify(jobBody())});
@@ -669,6 +677,23 @@ async function suggest() {
 }
 window.pickKw = el => { addKw(el.textContent.replace(/^\+\s*/, '')); el.style.display = 'none'; };
 
+// ── cloud jobs list ──────────────────────────────────────────────────────────
+function renderCloudJobs() {
+  if (!jobs.length) { $('#jobs').innerHTML = '<div class="muted">none yet — hit ＋ New job</div>'; return; }
+  const label = s => ({queued:'⏳ queued — start your agent', claimed:'🤝 claimed', running:'▶ running',
+    paused_quota:'⛔ out of credits', done:'✓ done', error:'✗ error', cancelled:'∅ cancelled'}[s] || s);
+  const html = jobs.map(j => {
+    const p = j.progress || {};
+    return `<div class="job"><b>#${j.id}</b> ${j.query}${j.location ? ' · ' + j.location : ''}
+      <div class="muted" style="font-size:12px">${label(j.status)}${j.phase ? ' · ' + j.phase : ''}` +
+      `${p.scraped_count != null ? ` · ${p.scraped_count} scraped` : ''}` +
+      `${p.enrich_done != null ? ` · ${p.enrich_done}/${p.enrich_total||0} enriched` : ''}</div>` +
+      `${['queued','claimed','running'].includes(j.status) ? `<a style="cursor:pointer;color:#2563eb;font-size:12px" onclick="cancelCloudJob(${j.id})">cancel</a>` : ''}</div>`;
+  }).join('');
+  if (html !== lastJobsHtml) { lastJobsHtml = html; $('#jobs').innerHTML = html; }
+}
+window.cancelCloudJob = async id => { await api(`/api/jobs/${id}/cancel`, {method:'POST'}); lastJobsHtml = ''; refresh(); };
+
 // ── jobs list ────────────────────────────────────────────────────────────────
 let lastJobsHtml = '';
 function renderJobs() {
@@ -695,7 +720,14 @@ async function refresh() {
     if (h.cloud) { applyCloudMode(); $('#health').textContent = '☁ cloud viewer — scraping runs on your PC'; }
     else $('#health').textContent = h.worker_alive ? (h.current_job ? `working on job #${h.current_job}` : 'idle') : 'worker down';
   } catch { $('#health').textContent = 'server unreachable'; }
-  if (window.CLOUD) { if (leadsRows === null) { if (tabFromHash() !== 'scraper') showTab('leads', true); loadLeads(true); } clearTimeout(pollTimer); return; }
+  if (window.CLOUD) {
+    if (!SESSION) { clearTimeout(pollTimer); return; }
+    if (leadsRows === null && tabFromHash() === 'leads') loadLeads(true);
+    jobs = await api('/api/jobs').catch(()=>[]);
+    renderCloudJobs();
+    clearTimeout(pollTimer); pollTimer = setTimeout(refresh, 5000);
+    return;
+  }
   jobs = await api('/api/jobs').catch(()=>[]);
   if (currentId == null) { const first = jobs.find(j => j.phase !== 'draft'); if (first) currentId = first.id; }
   renderJobs();
@@ -884,14 +916,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeMap()
 
 function applyCloudMode() {
   document.body.classList.add('cloud');
-  const nb = document.querySelector('.btn-new');
-  if (nb) { nb.textContent = 'ⓘ Scraper runs locally'; nb.onclick = () => alert('The scraper runs on your own computer, not in the cloud.\n\nRun web-scraper on your PC — its results appear here automatically (they sync to Supabase).\n\nThis page is a shared read-only viewer of everyone\'s leads.'); }
   const fc = $('#fromcloud'); if (fc) { fc.checked = true; fc.closest('label').style.display = 'none'; }
-  // Jobs stay visible in the cloud viewer; they run on the user's PC, so the list explains that
-  // instead of hiding the whole tab. (Cloud job queue is coming — see docs/superpowers/plans.)
-  $('#jobs').innerHTML = '<div class="muted">Jobs run on your own PC for now.<br><br>' +
-    'Start the local app (<code>python -m webscraper serve</code>) to create and watch jobs there; ' +
-    'finished leads sync to this page automatically (All&nbsp;leads tab).</div>';
 }
 
 setupTagInput();

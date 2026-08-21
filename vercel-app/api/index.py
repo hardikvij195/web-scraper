@@ -26,9 +26,11 @@ if str(Path(__file__).parent) not in _sys.path:   # sibling imports under `api.i
 from _accounts import router as accounts_router  # noqa: E402
 from _admin import router as admin_router  # noqa: E402
 from _db import PACKS  # noqa: E402
+from _jobs import router as jobs_router  # noqa: E402
 
 app.include_router(accounts_router)
 app.include_router(admin_router)
+app.include_router(jobs_router)
 
 
 @app.get("/api/config")
@@ -51,11 +53,6 @@ def index() -> str:
 def health():
     return {"ok": True, "cloud": True, "worker_alive": False, "current_job": None,
             "supabase": _supa() is not None}
-
-
-@app.get("/api/jobs")
-def jobs():
-    return []
 
 
 @app.get("/api/leads")
@@ -158,8 +155,3 @@ def geocode(q: str):
     return out
 
 
-# job-creation / mutation endpoints are disabled in the cloud viewer
-@app.post("/api/jobs")
-@app.post("/api/supabase/sync")
-def _disabled():
-    raise HTTPException(400, "The scraper runs locally, not in the cloud. Run web-scraper on your PC; it syncs here.")
