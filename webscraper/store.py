@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS places (
 CREATE INDEX IF NOT EXISTS idx_places_phone ON places(phone_digits);
 CREATE INDEX IF NOT EXISTS idx_places_domain ON places(domain);
 CREATE INDEX IF NOT EXISTS idx_places_enrich ON places(enrich_status);
+-- WhatsApp accounts used to verify numbers (one persistent browser profile each).
+-- sent_today/day track the per-account daily cap; reset lazily when `day` rolls over.
+CREATE TABLE IF NOT EXISTS wa_accounts (
+  name TEXT PRIMARY KEY,
+  added_at TEXT NOT NULL,
+  last_used_at TEXT,
+  sent_today INTEGER NOT NULL DEFAULT 0,
+  day TEXT,
+  disabled INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -75,7 +85,7 @@ def fmt_team(team: Any) -> str:
 
 class Store:
     EXPORT_COLS = [
-        "name", "category", "phone", "whatsapp_number", "whatsapp_source", "email", "emails", "website",
+        "name", "category", "phone", "whatsapp_number", "whatsapp_source", "wa_verified", "email", "emails", "website",
         "instagram", "facebook", "linkedin", "twitter_x", "youtube", "tiktok",
         "address", "country", "rating", "reviews_count", "price_range", "lat", "lng", "distance_km",
         "summary", "owner", "team", "maps_url", "place_id", "enrich_status", "job_id",
@@ -97,7 +107,9 @@ class Store:
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(places)")}
         for col, typ in (("price_range", "TEXT"), ("country", "TEXT"), ("distance_km", "REAL"),
                          ("summary", "TEXT"), ("owner", "TEXT"), ("team", "TEXT"),
-                         ("research_status", "TEXT"), ("researched_at", "TEXT")):
+                         ("research_status", "TEXT"), ("researched_at", "TEXT"),
+                         ("wa_verified", "TEXT"),        # 'yes' | 'no' | 'unknown'
+                         ("wa_verified_at", "TEXT"), ("wa_verify_account", "TEXT")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
@@ -121,6 +133,9 @@ class Store:
             ("skipped_known", "INTEGER NOT NULL DEFAULT 0"),
             ("do_research", "INTEGER NOT NULL DEFAULT 0"),     # LLM summary/owner/team pass
             ("research_done", "INTEGER NOT NULL DEFAULT 0"), ("research_total", "INTEGER NOT NULL DEFAULT 0"),
+            ("do_wa_verify", "INTEGER NOT NULL DEFAULT 0"),    # verify each number against WhatsApp Web
+            ("wa_verify_done", "INTEGER NOT NULL DEFAULT 0"), ("wa_verify_total", "INTEGER NOT NULL DEFAULT 0"),
+            ("locations", "TEXT"),           # JSON [{location, radius_km, lat, lng}] — multi-area scrape
             ("skipped_far", "INTEGER NOT NULL DEFAULT 0"),
             ("started_at", "TEXT"),          # worker picked it up
             ("scrape_started_at", "TEXT"),
@@ -155,6 +170,51 @@ class Store:
 
     def queued_jobs(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM jobs WHERE phase IN ('queued','waiting') ORDER BY id").fetchall()
+
+    # ── WhatsApp verification: numbers + account rotation with a per-account daily cap ──
+    def set_wa_verify(self, job_id: int, place_key: str, status: str, account: str | None) -> None:
+        self.conn.execute(
+            "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=? WHERE job_id=? AND place_key=?",
+            (status, now_iso(), account, job_id, place_key))
+        self.conn.commit()
+
+    def list_wa_accounts(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM wa_accounts ORDER BY name")]
+
+    def add_wa_account(self, name: str) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO wa_accounts(name, added_at) VALUES (?, ?)", (name, now_iso()))
+        self.conn.commit()
+
+    def remove_wa_account(self, name: str) -> None:
+        self.conn.execute("DELETE FROM wa_accounts WHERE name=?", (name,))
+        self.conn.commit()
+
+    def _roll_day(self, today: str) -> None:
+        """Zero every account's counter whose stored day is not today (lazy daily reset)."""
+        self.conn.execute("UPDATE wa_accounts SET sent_today=0, day=? WHERE day IS NULL OR day<>?",
+                          (today, today))
+        self.conn.commit()
+
+    def wa_capacity(self, cap: int, today: str) -> int:
+        """Total remaining checks across all enabled accounts for `today`."""
+        self._roll_day(today)
+        rows = self.conn.execute("SELECT sent_today FROM wa_accounts WHERE disabled=0").fetchall()
+        return sum(max(0, cap - int(r[0])) for r in rows)
+
+    def pick_wa_account(self, cap: int, today: str) -> str | None:
+        """Enabled account with remaining cap today, least-recently-used first (rotation)."""
+        self._roll_day(today)
+        row = self.conn.execute(
+            "SELECT name FROM wa_accounts WHERE disabled=0 AND sent_today<? "
+            "ORDER BY last_used_at IS NULL DESC, last_used_at ASC LIMIT 1", (cap,)).fetchone()
+        return row[0] if row else None
+
+    def bump_wa_account(self, name: str, today: str) -> None:
+        self.conn.execute(
+            "UPDATE wa_accounts SET sent_today=sent_today+1, last_used_at=?, day=? WHERE name=?",
+            (now_iso(), today, name))
+        self.conn.commit()
 
     def export_xlsx(self, job_id: int | None, out: Path | None = None, unique: bool = False) -> Path:
         from openpyxl import Workbook

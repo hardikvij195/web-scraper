@@ -43,6 +43,13 @@ class Settings:
     db_path: Path = ROOT / (os.getenv("DB_PATH") or "data/leads.db")
     profile_dir: Path = ROOT / "data" / "browser-profile"
     export_dir: Path = ROOT / "data" / "exports"
+    # WhatsApp number verification (opt-in per job). Each account = one persistent
+    # browser profile under wa_profiles/<name>/. Cap + throttle guard the account.
+    wa_profiles_dir: Path = ROOT / "data" / "wa-profiles"
+    wa_daily_cap: int = _int(os.getenv("WA_DAILY_CAP"), 200)          # per account, per day
+    wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 8.0)
+    wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 20.0)
+    wa_verify_headless: bool = _bool(os.getenv("WA_VERIFY_HEADLESS"), True)
 
 
 settings = Settings()

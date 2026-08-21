@@ -35,7 +35,7 @@ create policy "service role full access" on public.{TABLE}
 
 # columns pushed to Supabase (subset of place row, flattened)
 _COLS = ["place_key", "name", "category", "phone", "whatsapp_number", "whatsapp_source",
-         "email", "emails", "website", "instagram", "facebook", "linkedin", "twitter_x",
+         "wa_verified", "email", "emails", "website", "instagram", "facebook", "linkedin", "twitter_x",
          "youtube", "tiktok", "address", "country", "rating", "reviews_count", "price_range",
          "lat", "lng", "summary", "owner", "team", "maps_url", "place_id", "enrich_status",
          "scraped_at", "job_id", "job_query", "job_location"]

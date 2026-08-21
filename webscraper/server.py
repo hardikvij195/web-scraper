@@ -9,6 +9,7 @@ One Playwright profile = one scrape at a time; the enricher inside a job is conc
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from pathlib import Path
@@ -52,6 +53,65 @@ def in_window(start: str | None, end: str | None, now: datetime | None = None) -
     now = now or datetime.now()
     cur = now.hour * 60 + now.minute
     return a <= cur < b if a < b else (cur >= a or cur < b)
+
+
+def _clean_locations(body: "JobIn") -> list[dict[str, Any]]:
+    """Normalise JobIn.locations into a clean list; drops empty rows. Falls back to the
+    single location/radius/center fields when `locations` is absent."""
+    out: list[dict[str, Any]] = []
+    for e in (body.locations or []):
+        if not isinstance(e, dict):
+            continue
+        loc = (str(e.get("location") or "")).strip() or None
+        lat, lng = e.get("lat"), e.get("lng")
+        rad = e.get("radius_km")
+        if not (loc or (lat is not None and lng is not None)):
+            continue
+        out.append({"location": loc, "radius_km": rad,
+                    "lat": lat if lat is not None else None,
+                    "lng": lng if lng is not None else None})
+    if out:
+        return out
+    loc = (body.location or "").strip() or None
+    has_center = body.center_lat is not None and body.center_lng is not None
+    if loc or has_center:
+        return [{"location": loc, "radius_km": body.radius_km,
+                 "lat": body.center_lat if has_center else None,
+                 "lng": body.center_lng if has_center else None}]
+    return []
+
+
+def _job_areas(job: Any) -> list[dict[str, Any]]:
+    """Normalise a job into a list of scrape areas: {location, radius_km, center}.
+
+    Uses the `locations` JSON list when present (multi-area), else the single
+    location/radius/center columns. `center` is (lat, lng) or None.
+    """
+    import json as _json
+    raw = None
+    try:
+        raw = job["locations"]
+    except (KeyError, IndexError, TypeError):
+        raw = None
+    entries: list[dict[str, Any]] = []
+    if raw:
+        try:
+            parsed = _json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            parsed = None
+        for e in (parsed or []):
+            if not isinstance(e, dict):
+                continue
+            lat, lng = e.get("lat"), e.get("lng")
+            entries.append({
+                "location": (e.get("location") or "").strip() or None,
+                "radius_km": e.get("radius_km"),
+                "center": (lat, lng) if lat is not None and lng is not None else None,
+            })
+    if entries:
+        return entries
+    pinned = (job["center_lat"], job["center_lng"]) if job["center_lat"] is not None else None
+    return [{"location": job["location"], "radius_km": job["radius_km"], "center": pinned}]
 
 
 # ── worker ────────────────────────────────────────────────────────────────────
@@ -137,17 +197,26 @@ class Worker(threading.Thread):
                                  started_at=t0, scrape_started_at=t0)
                 pacing = Pacing(delay_sec=float(job["delay_sec"] or settings.delay_sec))
 
+                # Multi-location: a job can carry several {location, radius_km, lat, lng} areas.
+                # Each area is scraped in turn; counters accumulate; the (job_id, place_key) PK
+                # de-dupes a business that shows up in two overlapping areas.
+                areas = _job_areas(job)
+                agg = {"scraped_base": 0, "links_total": 0}
+                area_label = {"txt": ""}
+
                 def on_event(kind: str, data: dict[str, Any]) -> None:
+                    pfx = area_label["txt"]
                     if kind == "center":
                         store.update_job(job_id, center_lat=data["lat"], center_lng=data["lng"],
-                                         message=f"centre {data['lat']:.4f},{data['lng']:.4f} · radius {job['radius_km']} km")
+                                         message=f"{pfx}centre {data['lat']:.4f},{data['lng']:.4f}")
                     elif kind == "center_failed":
-                        store.update_job(job_id, message="couldn't resolve the location on Maps — radius ignored")
+                        store.update_job(job_id, message=f"{pfx}couldn't resolve the location on Maps — radius ignored")
                     elif kind == "tiles":
-                        store.update_job(job_id, message=f"radius split into {data['count']} search tiles…")
+                        store.update_job(job_id, message=f"{pfx}radius split into {data['count']} search tiles…")
                     elif kind == "links":
                         tile = f" · tile {data['tile']}/{data['tiles']}" if data.get("tiles", 1) > 1 else ""
-                        store.update_job(job_id, links_found=data["count"], message=f"collecting places from the results list{tile}…")
+                        store.update_job(job_id, links_found=agg["links_total"] + data["count"],
+                                         message=f"{pfx}collecting places from the results list{tile}…")
                     elif kind == "links_done":
                         notes = []
                         if data.get("skipped_far"):
@@ -155,28 +224,36 @@ class Worker(threading.Thread):
                         if data.get("skipped_known"):
                             notes.append(f"{data['skipped_known']} already in the system")
                         extra = f" ({', '.join(notes)} dropped)" if notes else ""
-                        store.update_job(job_id, links_found=data["count"], skipped_known=data.get("skipped_known", 0),
-                                         message=f"{data['count']} places found{extra}, opening each one…")
+                        store.update_job(job_id, links_found=agg["links_total"] + data["count"],
+                                         skipped_known=data.get("skipped_known", 0),
+                                         message=f"{pfx}{data['count']} places found{extra}, opening each one…")
                     elif kind == "place":
-                        store.update_job(job_id, scraped_count=data["i"])
+                        store.update_job(job_id, scraped_count=agg["scraped_base"] + data["i"])
                     elif kind == "far":
                         store.update_job(job_id, scraped_count=store.get_job(job_id)["scraped_count"] + 1,
                                          skipped_far=data["skipped"],
-                                         message=f"skipped {data['skipped']} outside radius (last: {data['name']}, {data['distance_km']} km)")
+                                         message=f"{pfx}skipped {data['skipped']} outside radius (last: {data['name']}, {data['distance_km']} km)")
                     elif kind == "captcha":
-                        store.update_job(job_id, message=f"Google captcha — backing off {data['backoff_sec']:.0f}s")
+                        store.update_job(job_id, message=f"{pfx}Google captcha — backing off {data['backoff_sec']:.0f}s")
                     elif kind == "skip":
-                        store.update_job(job_id, message=f"skipped one ({data['reason']})")
+                        store.update_job(job_id, message=f"{pfx}skipped one ({data['reason']})")
                     elif kind == "abort":
-                        store.update_job(job_id, message=data["reason"])
+                        store.update_job(job_id, message=f"{pfx}{data['reason']}")
 
-                pinned = (job["center_lat"], job["center_lng"]) if job["center_lat"] is not None else None
-                known = store.all_place_keys() if job["unique_new"] else None
-                run_scrape(store, job_id, job["query"], job["location"], int(job["max_places"]), pacing,
-                           headless=bool(job["headless"]), country=job["country"],
-                           on_event=on_event, should_stop=should_stop,
-                           radius_km=job["radius_km"], wait_if_paused=wait_if_paused, center=pinned,
-                           known_keys=known)
+                for idx, area in enumerate(areas):
+                    if should_stop():
+                        break
+                    area_label["txt"] = (f"area {idx + 1}/{len(areas)} ({area['location'] or 'anywhere'}): "
+                                         if len(areas) > 1 else "")
+                    known = store.all_place_keys() if job["unique_new"] else None
+                    run_scrape(store, job_id, job["query"], area["location"], int(job["max_places"]), pacing,
+                               headless=bool(job["headless"]), country=job["country"],
+                               on_event=on_event, should_stop=should_stop,
+                               radius_km=area["radius_km"], wait_if_paused=wait_if_paused,
+                               center=area["center"], known_keys=known)
+                    cur = store.get_job(job_id)
+                    agg["scraped_base"] = int(cur["scraped_count"] or 0)
+                    agg["links_total"] = int(cur["links_found"] or 0)
 
                 # A user Stop ends the job here; a time limit only ends the *scraping* — what was
                 # collected still gets enriched so the leads are complete.
@@ -216,6 +293,29 @@ class Worker(threading.Thread):
                     store.update_job(job_id, research_done=rdone["n"])
                     if rc.get("skipped") == len(targets) and targets:
                         store.update_job(job_id, message="AI research skipped — set GEMINI_API_KEY in .env")
+
+                if job["do_wa_verify"] and not user_stop():
+                    from webscraper import wa_verify
+                    targets = [p for p in store.places(job_id)
+                               if (p.get("phone") or p.get("whatsapp_number"))]
+                    store.update_job(job_id, phase="verifying_wa", wa_verify_total=len(targets),
+                                     wa_verify_done=0,
+                                     message=f"checking {len(targets)} numbers on WhatsApp (paced)…")
+                    vdone = {"n": 0}
+
+                    def on_wa(_pk: str, _s: str) -> None:
+                        vdone["n"] += 1
+                        store.update_job(job_id, wa_verify_done=vdone["n"])
+
+                    try:
+                        res = wa_verify.verify_places(store, targets, on_wa, user_stop, job_id=job_id)
+                        note = (f"WhatsApp: {res['yes']} on WA, {res['no']} not, "
+                                f"{res['unknown']} unknown")
+                        if res["capped"]:
+                            note += " · daily cap hit — re-run to finish the rest"
+                        store.update_job(job_id, message=note)
+                    except wa_verify.WaNotLoggedIn as e:
+                        store.update_job(job_id, message=f"WhatsApp verify skipped — {e}")
 
                 # push to Supabase (best-effort; no-op when not configured / table missing)
                 try:
@@ -273,7 +373,11 @@ class JobIn(BaseModel):
     draft: bool = False                                          # save without queueing
     unique_new: bool = False                                     # skip places already scraped by any job
     research: bool = False                                       # AI summary / owner / team pass
+    wa_verify: bool = False                                      # check each number against WhatsApp Web
     keywords: Optional[list[str]] = None                         # multiple search terms (joined into query)
+    # Multi-area: [{location, radius_km, lat, lng}]. When set (len>1) it wins over the single
+    # location/radius above; the first entry is mirrored into those columns for back-compat.
+    locations: Optional[list[dict[str, Any]]] = None
 
 
 PLACE_OVERHEAD_SEC = 3.5      # page load + parse on top of the configured delay
@@ -293,7 +397,7 @@ def _job_dict(r: Any) -> dict[str, Any]:
     """Row → dict plus derived `running`, `elapsed_sec`, `eta_sec` (None when unknown)."""
     d = dict(r)
     phase = d.get("phase")
-    d["running"] = phase in ("scraping", "enriching", "researching")
+    d["running"] = phase in ("scraping", "enriching", "researching", "verifying_wa")
     d["window_open"] = in_window(d.get("window_start"), d.get("window_end"))
     now = datetime.now(timezone.utc)
     started = _ts(d.get("started_at")) or (_ts(d.get("created_at")) if phase != "queued" else None)
@@ -347,9 +451,12 @@ def health() -> dict[str, Any]:
 def create_job(body: JobIn) -> dict[str, Any]:
     s = Store()
     try:
-        loc = (body.location or "").strip() or None
-        has_center = body.center_lat is not None and body.center_lng is not None
-        if body.radius_km and not (loc or has_center):
+        locs = _clean_locations(body)
+        primary = locs[0] if locs else {"location": (body.location or "").strip() or None,
+                                        "radius_km": body.radius_km, "lat": None, "lng": None}
+        loc = primary["location"]
+        has_center = primary.get("lat") is not None and primary.get("lng") is not None
+        if primary.get("radius_km") and not (loc or has_center):
             raise HTTPException(422, "radius needs a location (type one or pick it on the map)")
         win = (body.window_start, body.window_end) if (body.window_start and body.window_end) else (None, None)
         query = ", ".join(k.strip() for k in body.keywords if k.strip()) if body.keywords else (body.query or '').strip()
@@ -359,11 +466,12 @@ def create_job(body: JobIn) -> dict[str, Any]:
                               body.delay_sec, phase="draft" if body.draft else "queued",
                               do_enrich=body.enrich, headless=body.headless,
                               country=(body.country or "").strip().upper() or None,
-                              radius_km=body.radius_km, window_start=win[0], window_end=win[1],
-                              center_lat=body.center_lat if has_center else None,
-                              center_lng=body.center_lng if has_center else None,
+                              radius_km=primary.get("radius_km"), window_start=win[0], window_end=win[1],
+                              center_lat=primary.get("lat") if has_center else None,
+                              center_lng=primary.get("lng") if has_center else None,
                               max_minutes=body.max_minutes, unique_new=body.unique_new)
-        s.update_job(job_id, do_research=int(body.research),
+        s.update_job(job_id, do_research=int(body.research), do_wa_verify=int(body.wa_verify),
+                     locations=json.dumps(locs) if len(locs) > 1 else None,
                      message="draft" if body.draft else "queued",
                      status="draft" if body.draft else "running")
         job = _job_dict(s.get_job(job_id))
@@ -384,17 +492,21 @@ def update_draft(job_id: int, body: JobIn) -> dict[str, Any]:
             raise HTTPException(404, "no such job")
         if r["phase"] != "draft":
             raise HTTPException(409, "only drafts can be edited")
-        has_center = body.center_lat is not None and body.center_lng is not None
+        locs = _clean_locations(body)
+        primary = locs[0] if locs else {"location": (body.location or "").strip() or None,
+                                        "radius_km": body.radius_km, "lat": None, "lng": None}
+        has_center = primary.get("lat") is not None and primary.get("lng") is not None
         win = (body.window_start, body.window_end) if (body.window_start and body.window_end) else (None, None)
         query = ", ".join(k.strip() for k in body.keywords if k.strip()) if body.keywords else (body.query or '').strip()
-        s.update_job(job_id, query=query or (body.query or '').strip(), location=(body.location or "").strip() or None,
-                     do_research=int(body.research),
+        s.update_job(job_id, query=query or (body.query or '').strip(), location=primary["location"],
+                     do_research=int(body.research), do_wa_verify=int(body.wa_verify),
+                     locations=json.dumps(locs) if len(locs) > 1 else None,
                      max_places=body.max_places, delay_sec=body.delay_sec,
                      do_enrich=int(body.enrich), headless=int(body.headless),
                      country=(body.country or "").strip().upper() or None,
-                     radius_km=body.radius_km, window_start=win[0], window_end=win[1],
-                     center_lat=body.center_lat if has_center else None,
-                     center_lng=body.center_lng if has_center else None,
+                     radius_km=primary.get("radius_km"), window_start=win[0], window_end=win[1],
+                     center_lat=primary.get("lat") if has_center else None,
+                     center_lng=primary.get("lng") if has_center else None,
                      max_minutes=body.max_minutes, unique_new=int(body.unique_new))
         return _job_dict(s.get_job(job_id))
     finally:

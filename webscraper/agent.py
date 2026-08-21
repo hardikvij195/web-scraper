@@ -49,6 +49,9 @@ class Cloud:
         r.raise_for_status()
         return r.json()
 
+    def config(self) -> dict:
+        return {}  # SaaS members set AI keys in their cloud Settings tab, not here
+
 
 def crm_payload(action: str, **kw) -> dict:
     return {"action": action, **kw}
@@ -93,6 +96,13 @@ class CrmCloud:
         d = r.json()
         return {"accepted": d.get("accepted", 0), "rejected_quota": 0}
 
+    def config(self) -> dict:
+        """API keys set on the CRM Lead Finder Setup tab (gemini_api_key, ...)."""
+        r = self._post(crm_payload("config"))
+        r.raise_for_status()
+        d = r.json()
+        return d if isinstance(d, dict) else {}
+
 
 def _flat(r: dict) -> dict:
     from webscraper.supa import _row
@@ -101,7 +111,9 @@ def _flat(r: dict) -> dict:
 
 def _local_progress(row: Any) -> dict:
     return {"scraped_count": row["scraped_count"], "links_found": row["links_found"],
-            "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"]}
+            "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"],
+            "research_done": row["research_done"], "research_total": row["research_total"],
+            "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
 
 
 def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> None:
@@ -110,6 +122,16 @@ def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> 
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
+    # Pull API keys from the cloud/CRM (Setup tab) — local .env always wins.
+    import os
+    try:
+        for k, v in cloud.config().items():
+            env = k.upper()  # gemini_api_key -> GEMINI_API_KEY
+            if v and not os.getenv(env):
+                os.environ[env] = v
+                log.info("config: %s set from cloud", env)
+    except httpx.HTTPError as e:
+        log.warning("config fetch failed (continuing with local .env): %s", e)
     log.info("agent up (%s) — polling %s every %ss", kind, base, poll_sec)
     while True:
         try:
@@ -127,20 +149,32 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas") -> None:
             continue
         if cloud.claim(cj["id"]) is None:
             continue
+        limit = cj.get("limit_places")
         local_id = store.create_job(
             query=cj["query"], location=cj.get("location"),
-            max_places=cj.get("limit_places") or 100, delay_sec=0,
-            phase="queued", do_enrich=True, headless=True, country=cj.get("country"),
+            max_places=100 if limit is None else int(limit),   # 0 = unlimited
+            delay_sec=float(cj.get("delay_sec") or 0),
+            phase="queued",
+            do_enrich=bool(cj.get("do_enrich", True)),
+            headless=bool(cj.get("headless", True)),
+            country=cj.get("country"),
             radius_km=cj.get("radius_km"),
-            center_lat=cj.get("lat"), center_lng=cj.get("lng"))
-        store.update_job(local_id, cloud_id=cj["id"], cloud_kind=kind)
+            center_lat=cj.get("lat"), center_lng=cj.get("lng"),
+            max_minutes=cj.get("max_minutes"),
+            unique_new=bool(cj.get("unique_new", False)))
+        import json as _json
+        locs = cj.get("locations")
+        store.update_job(local_id, cloud_id=cj["id"], cloud_kind=kind,
+                         do_research=int(bool(cj.get("do_research", False))),
+                         do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
+                         locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
     # mirror running/finished local state up
     for row in store.conn.execute(
             "SELECT * FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
             "AND (note IS NULL OR note <> 'synced')", (kind,)).fetchall():
         cid = row["cloud_id"]
-        if row["phase"] in ("scraping", "enriching", "queued", "waiting", "researching"):
+        if row["phase"] in ("scraping", "enriching", "queued", "waiting", "researching", "verifying_wa"):
             cancelled = cloud.progress(cid, row["phase"], _local_progress(row))
             if cancelled:
                 store.update_job(row["id"], stop_requested=1, note="synced")

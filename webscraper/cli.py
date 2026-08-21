@@ -182,18 +182,79 @@ def serve(
 
 @app.command()
 def agent(
-    token: str = typer.Option(..., "--token", help="Agent token (cloud Settings tab or CRM Lead Finder page)"),
+    token: str = typer.Option("", "--token", help="Agent token; falls back to CRM_AGENT_TOKEN in .env"),
     base: str = typer.Option("", "--base", help="Override the API base URL"),
     crm: bool = typer.Option(False, "--crm", help="Serve the HVT CRM Lead Finder queue instead of the SaaS cloud"),
     poll: int = typer.Option(20, "--poll", help="Seconds between cloud polls"),
 ) -> None:
-    """Run cloud jobs on this machine: poll -> scrape locally -> sync results up."""
+    """Run cloud jobs on this machine: poll -> scrape locally -> sync results up.
+
+    With no --token, reads CRM_AGENT_TOKEN (CRM mode) / AGENT_TOKEN (SaaS) from .env, so
+    `run-agent` scripts can start it hands-free once the token is saved once.
+    """
+    import os
+
     from webscraper.agent import run_agent
 
-    resolved = base or ("https://fyfhkjxewzbyxdwspkuc.supabase.co/functions/v1" if crm
-                        else "https://web-scraper-leads.vercel.app")
+    token = token or os.getenv("CRM_AGENT_TOKEN" if crm else "AGENT_TOKEN") or os.getenv("AGENT_TOKEN") or ""
+    if not token:
+        console.print("[red]no token[/] — pass --token or set CRM_AGENT_TOKEN in .env "
+                      "(mint one on the CRM Lead Finder → Setup tab)")
+        raise typer.Exit(1)
+    # CRM base, in priority order: --base, CRM_FUNCTIONS_URL, derived from the tenant's
+    # own VITE_SUPABASE_URL (so a CLONED CRM's agent targets ITS project, not HVT's),
+    # then the HVT default. This is what makes `run-agent` work unchanged inside any
+    # cloned tenant folder — its .env carries VITE_SUPABASE_URL + CRM_AGENT_TOKEN.
+    def _crm_base() -> str:
+        env = os.getenv("CRM_FUNCTIONS_URL")
+        if env:
+            return env.rstrip("/")
+        supa = os.getenv("VITE_SUPABASE_URL")
+        if supa:
+            return supa.rstrip("/") + "/functions/v1"
+        return "https://fyfhkjxewzbyxdwspkuc.supabase.co/functions/v1"
+    resolved = base or (_crm_base() if crm else "https://web-scraper-leads.vercel.app")
     console.print(f"[bold]agent[/] ({'crm' if crm else 'saas'}) polling {resolved} every {poll}s  (Ctrl-C to stop)")
     run_agent(resolved, token, poll, kind="crm" if crm else "saas")
+
+
+@app.command(name="wa-login")
+def wa_login(name: str = typer.Argument(..., help="Account label, e.g. 'spare1'")) -> None:
+    """Link a WhatsApp account for number verification: opens a window, scan the QR once."""
+    from webscraper import wa_verify
+    console.print(f"[bold]Opening WhatsApp Web for [cyan]{name}[/][/] — scan the QR with that phone.")
+    ok = wa_verify.login(name)
+    console.print("[green]linked[/]" if ok else "[red]not linked (timed out)[/]")
+
+
+@app.command(name="wa-accounts")
+def wa_accounts() -> None:
+    """List linked WhatsApp accounts and today's usage against the daily cap."""
+    from webscraper.config import settings
+    from webscraper.store import Store
+    rows = Store().list_wa_accounts()
+    if not rows:
+        console.print("no accounts — run [cyan]python -m webscraper wa-login <name>[/]")
+        return
+    cap = settings.wa_daily_cap
+    active = sum(0 if a["disabled"] else 1 for a in rows)
+    for a in rows:
+        state = "disabled" if a["disabled"] else "active"
+        console.print(f"[bold]{a['name']}[/]  {a['sent_today']}/{cap} today  · {state}"
+                      f" · last used {a['last_used_at'] or 'never'}")
+    console.print(f"[dim]total capacity/day ~ {cap * active} across {active} active account(s)[/]")
+
+
+@app.command(name="wa-verify")
+def wa_verify_cmd(job_id: int = typer.Argument(..., help="Verify the numbers of this job's leads")) -> None:
+    """Run WhatsApp verification over an existing job's leads (rotates accounts, respects the cap)."""
+    from webscraper import wa_verify
+    from webscraper.store import Store
+    s = Store()
+    rows = [p for p in s.places(job_id) if (p.get("phone") or p.get("whatsapp_number"))]
+    console.print(f"verifying {len(rows)} numbers for job {job_id}…")
+    res = wa_verify.verify_places(s, rows, job_id=job_id)
+    console.print(res)
 
 
 @app.command()
