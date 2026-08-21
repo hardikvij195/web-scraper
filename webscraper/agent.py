@@ -103,6 +103,16 @@ class CrmCloud:
         d = r.json()
         return d if isinstance(d, dict) else {}
 
+    def results(self, jid: int) -> list[dict]:
+        """Existing results of a job (for on-demand WhatsApp re-verify)."""
+        r = self._post(crm_payload("results", job_id=jid))
+        r.raise_for_status()
+        d = r.json()
+        return d if isinstance(d, list) else []
+
+    def set_wa(self, jid: int, updates: list[dict]) -> None:
+        self._post(crm_payload("set_wa", job_id=jid, updates=updates)).raise_for_status()
+
 
 def _flat(r: dict) -> dict:
     from webscraper.supa import _row
@@ -141,11 +151,59 @@ def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> 
         time.sleep(poll_sec)
 
 
+def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
+    """Verify an existing CRM job's numbers on WhatsApp and sync wa_verified back.
+    No scraping/enriching — operates purely on the job's already-synced results."""
+    from webscraper import wa_verify
+    try:
+        rows = cloud.results(jid)
+    except httpx.HTTPError as e:
+        log.warning("re-verify #%s: could not fetch results: %s", jid, e)
+        cloud.done(jid, "error", "could not fetch results")
+        return
+    targets = [r for r in rows if (r.get("phone") or r.get("whatsapp_number"))]
+    total = len(targets)
+    cloud.progress(jid, "verifying_wa", {"wa_verify_total": total, "wa_verify_done": 0})
+    collected: dict[str, str] = {}
+
+    def onp(pk: str, status: str) -> None:
+        collected[pk] = status
+        if len(collected) % 5 == 0 or len(collected) == total:
+            cloud.progress(jid, "verifying_wa",
+                           {"wa_verify_total": total, "wa_verify_done": len(collected)})
+            # flush partial results so the CRM shows badges as they land
+            cloud.set_wa(jid, [{"place_key": k, "wa_verified": v}
+                              for k, v in list(collected.items())[-5:]])
+
+    try:
+        # job_id=None → verify_places won't touch the local store's places (they aren't
+        # here); `store` is still used for WA account rotation + daily caps.
+        wa_verify.verify_places(store, targets, on_progress=onp, job_id=None)
+    except wa_verify.WaNotLoggedIn as e:
+        cloud.done(jid, "error", f"WhatsApp verify skipped — {e}")
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("re-verify #%s failed", jid)
+        cloud.done(jid, "error", str(e)[:200])
+        return
+    if collected:
+        cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()])
+    cloud.done(jid, "done")
+    log.info("re-verify #%s: %d checked", jid, len(collected))
+
+
 def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas") -> None:
     mirrored = {r["cloud_id"] for r in store.conn.execute(
         "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=?", (kind,)).fetchall()}
     for cj in cloud.jobs():
         if cj["id"] in mirrored:
+            continue
+        # On-demand WhatsApp re-verify: no scrape/enrich — fetch the job's existing
+        # results, check each number, write wa_verified back. CRM-only.
+        if kind == "crm" and cj.get("wa_verify_only"):
+            if cloud.claim(cj["id"]) is None:
+                continue
+            _reverify_wa(cloud, store, cj["id"])
             continue
         if cloud.claim(cj["id"]) is None:
             continue
