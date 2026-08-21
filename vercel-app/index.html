@@ -111,13 +111,24 @@
 </style>
 </head>
 <body>
+<div id="login" style="position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:#0b1620">
+  <form id="login-form" class="card" style="width:340px;display:flex;flex-direction:column;gap:10px">
+    <h2 style="margin:0">Lead Finder — sign in</h2>
+    <input id="login-email" type="email" placeholder="email" required autocomplete="username">
+    <input id="login-pass" type="password" placeholder="password" required autocomplete="current-password">
+    <button class="btn-primary" type="submit">Sign in</button>
+    <div id="login-err" style="color:#e11d48;font-size:12.5px"></div>
+    <div class="muted" style="font-size:12px">No account? Ask your admin to create one.</div>
+  </form>
+</div>
 <header>
   <h1>Lead Scraper</h1>
   <nav class="tabs">
     <button class="tab active" id="tab-btn-scraper" onclick="showTab('scraper')">Scraper</button>
     <button class="tab" id="tab-btn-leads" onclick="showTab('leads')">All leads</button>
   </nav>
-  <span class="sub" style="margin-left:auto">runs on this machine · <span id="health">…</span></span>
+  <span class="sub" style="margin-left:auto"><span id="whoami-email"></span> <span id="whoami-credits"></span> · <span id="health">…</span>
+    <button class="tab" style="margin-left:8px" onclick="logout()">Sign out</button></span>
 </header>
 <main id="tab-scraper">
   <aside>
@@ -238,11 +249,41 @@
 const $ = s => document.querySelector(s);
 // Cloud viewer: the scraper engine runs locally, not here. Detect via /api/health.
 window.CLOUD = false;
-const api = async (path, opt) => {
-  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opt||{}));
+
+// ── auth session ─────────────────────────────────────────────────────────────
+let SESSION = null; try { SESSION = JSON.parse(localStorage.getItem('ws_session')||'null'); } catch {}
+window.IS_ADMIN = () => !!(SESSION && SESSION.role === 'admin');
+function saveSession(s) { SESSION = s; if (s) localStorage.setItem('ws_session', JSON.stringify(s)); else localStorage.removeItem('ws_session'); }
+function showLogin(show) { $('#login').style.display = show ? 'flex' : 'none'; }
+window.logout = () => { saveSession(null); location.reload(); };
+
+async function rawApi(path, opt) {
+  const headers = Object.assign({'Content-Type':'application/json'},
+    SESSION ? {'Authorization': 'Bearer ' + SESSION.access_token} : {}, (opt||{}).headers||{});
+  return fetch(path, Object.assign({}, opt||{}, {headers}));
+}
+async function authApi(path, opt) {
+  let r = await rawApi(path, opt);
+  if (r.status === 401 && SESSION && SESSION.refresh_token) {
+    const rr = await fetch('/api/refresh', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({refresh_token: SESSION.refresh_token})});
+    if (rr.ok) { const s = await rr.json(); saveSession(Object.assign({}, SESSION, s)); r = await rawApi(path, opt); }
+  }
+  if (r.status === 401 && window.CLOUD) { saveSession(null); showLogin(true); throw new Error('signed out'); }
   if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail || r.statusText);
   return r.json();
-};
+}
+document.getElementById('login-form').addEventListener('submit', async e => {
+  e.preventDefault(); $('#login-err').textContent = '';
+  try {
+    const s = await (await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email: $('#login-email').value, password: $('#login-pass').value})})).json();
+    if (!s.access_token) throw new Error(s.detail || 'login failed');
+    saveSession(s); showLogin(false); location.reload();
+  } catch (err) { $('#login-err').textContent = err.message; }
+});
+
+const api = (path, opt) => authApi(path, opt);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const host = u => { try { return new URL(u).hostname.replace(/^www\./,''); } catch { return u; } };
 const fmtDur = s => { if (s == null) return '—'; s = Math.max(0, Math.round(s)); const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), x = s%60; return h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`; };
@@ -753,6 +794,14 @@ setupTagInput();
 async function openDraftById(id) {
   try { const j = await api(`/api/jobs/${id}`); openJobDialog(j); }
   catch { openJobDialog(); }
+}
+if (!SESSION) {
+  showLogin(true);
+} else {
+  authApi('/api/me').then(m => {
+    $('#whoami-email').textContent = m.email + (m.role === 'admin' ? ' (admin)' : '');
+    $('#whoami-credits').textContent = '· ' + m.balance + ' credits';
+  }).catch(()=>{});
 }
 refresh();
 </script>
