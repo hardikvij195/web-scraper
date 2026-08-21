@@ -163,17 +163,26 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         return
     targets = [r for r in rows if (r.get("phone") or r.get("whatsapp_number"))]
     total = len(targets)
+    src_by_pk = {r["place_key"]: r.get("whatsapp_source") for r in targets}
     cloud.progress(jid, "verifying_wa", {"wa_verify_total": total, "wa_verify_done": 0})
     collected: dict[str, str] = {}
 
-    def onp(pk: str, status: str) -> None:
+    def onp(pk: str, status: str, num: str | None = None) -> None:
         collected[pk] = status
-        # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live
-        # (batching hid progress and looked stuck).
+        upd: dict[str, Any] = {"place_key": pk, "wa_verified": status}
+        # Confirmed hit -> promote the verified number + mark source 'verified' (drops an
+        # 'assumed_mobile' guess). Miss on a guessed number -> clear it.
+        if status == "yes" and num:
+            upd["whatsapp_number"] = num
+            upd["whatsapp_source"] = "verified"
+        elif status == "no" and src_by_pk.get(pk) == "assumed_mobile":
+            upd["whatsapp_number"] = None
+            upd["whatsapp_source"] = None
+        # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
         try:
             cloud.progress(jid, "verifying_wa",
                            {"wa_verify_total": total, "wa_verify_done": len(collected)})
-            cloud.set_wa(jid, [{"place_key": pk, "wa_verified": status}])
+            cloud.set_wa(jid, [upd])
         except httpx.HTTPError as e:
             log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
 

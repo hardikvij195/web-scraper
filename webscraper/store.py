@@ -172,10 +172,22 @@ class Store:
         return self.conn.execute("SELECT * FROM jobs WHERE phase IN ('queued','waiting') ORDER BY id").fetchall()
 
     # ── WhatsApp verification: numbers + account rotation with a per-account daily cap ──
-    def set_wa_verify(self, job_id: int, place_key: str, status: str, account: str | None) -> None:
+    def set_wa_verify(self, job_id: int, place_key: str, status: str, account: str | None,
+                      wa_number: str | None = None, prior_source: str | None = None) -> None:
         self.conn.execute(
             "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=? WHERE job_id=? AND place_key=?",
             (status, now_iso(), account, job_id, place_key))
+        # On a confirmed hit, promote the verified number into whatsapp_number and mark the
+        # source 'verified' (replacing an 'assumed_mobile' guess). On a miss, drop a guessed
+        # number so 'assumed_mobile' no longer implies a WhatsApp we couldn't confirm.
+        if status == "yes" and wa_number:
+            self.conn.execute(
+                "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
+                (wa_number, job_id, place_key))
+        elif status == "no" and prior_source == "assumed_mobile":
+            self.conn.execute(
+                "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL WHERE job_id=? AND place_key=?",
+                (job_id, place_key))
         self.conn.commit()
 
     def list_wa_accounts(self) -> list[dict[str, Any]]:

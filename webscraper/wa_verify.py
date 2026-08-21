@@ -172,7 +172,7 @@ def verify_places(
     Rotates across enabled accounts, respects each account's daily cap, paces checks.
     Returns counts: {yes, no, unknown, checked, capped, no_number}.
     """
-    on_progress = on_progress or (lambda pk, s: None)
+    on_progress = on_progress or (lambda pk, s, num=None: None)
     should_stop = should_stop or (lambda: False)
     cap = settings.wa_daily_cap
     today = date.today().isoformat()
@@ -194,7 +194,7 @@ def verify_places(
                 counts["no_number"] += 1
                 if job_id is not None:
                     store.set_wa_verify(job_id, pk, "unknown", None)
-                on_progress(pk, "unknown")
+                on_progress(pk, "unknown", None)
                 continue
 
             name = store.pick_wa_account(cap, today)
@@ -225,8 +225,9 @@ def verify_places(
             counts[status] += 1
             counts["checked"] += 1
             if job_id is not None:
-                store.set_wa_verify(job_id, pk, status, name)
-            on_progress(pk, status)
+                store.set_wa_verify(job_id, pk, status, name,
+                                    wa_number=num, prior_source=r.get("whatsapp_source"))
+            on_progress(pk, status, num)
             time.sleep(random.uniform(settings.wa_delay_min, settings.wa_delay_max))
     finally:
         for pw_ctx, _ in open_ctx.values():
