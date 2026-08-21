@@ -29,12 +29,14 @@ from _agent import router as agent_router  # noqa: E402
 from _db import PACKS  # noqa: E402
 from _jobs import router as jobs_router  # noqa: E402
 from _leads import router as leads_router  # noqa: E402
+from _webhooks import router as webhooks_router  # noqa: E402
 
 app.include_router(accounts_router)
 app.include_router(admin_router)
 app.include_router(agent_router)
 app.include_router(jobs_router)
 app.include_router(leads_router)
+app.include_router(webhooks_router)
 
 
 @app.get("/api/config")
