@@ -126,6 +126,7 @@
   <nav class="tabs">
     <button class="tab active" id="tab-btn-scraper" onclick="showTab('scraper')">Scraper</button>
     <button class="tab" id="tab-btn-leads" onclick="showTab('leads')">All leads</button>
+    <button class="tab" id="tab-btn-billing" onclick="showTab('billing')">Billing</button>
     <button class="tab" id="tab-btn-settings" onclick="showTab('settings')">Settings</button>
     <button class="tab" id="tab-btn-admin" style="display:none" onclick="showTab('admin')">Admin</button>
   </nav>
@@ -164,6 +165,18 @@
       <div class="msg" id="supa-status" style="margin:4px 0 4px"></div>
       <div class="toolbar" id="leads-filters" style="gap:6px 12px"></div>
       <div class="tbl" id="leads-tbl"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+</main>
+
+<!-- ── billing tab ────────────────────────────────────────────────────────── -->
+<main id="tab-billing" style="display:none;grid-template-columns:1fr">
+  <section>
+    <div class="card" style="max-width:760px">
+      <h2>Buy lead credits</h2>
+      <p class="muted" style="font-size:12.5px">1 credit = 1 verified lead (has phone or email after enrichment). Unverified rows are free.</p>
+      <div id="packs" style="display:flex;gap:14px;flex-wrap:wrap"></div>
+      <div class="muted" id="billing-msg" style="margin-top:10px"></div>
     </div>
   </section>
 </main>
@@ -292,6 +305,7 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 // Cloud viewer: the scraper engine runs locally, not here. Detect via /api/health.
@@ -472,15 +486,48 @@ window.showTab = (t, skipHash) => {
   $('#tab-leads').style.display = t === 'leads' ? 'grid' : 'none';
   $('#tab-admin').style.display = t === 'admin' ? 'grid' : 'none';
   $('#tab-settings').style.display = t === 'settings' ? 'grid' : 'none';
+  $('#tab-billing').style.display = t === 'billing' ? 'grid' : 'none';
   $('#tab-btn-scraper').classList.toggle('active', t === 'scraper');
   $('#tab-btn-leads').classList.toggle('active', t === 'leads');
   $('#tab-btn-admin').classList.toggle('active', t === 'admin');
   $('#tab-btn-settings').classList.toggle('active', t === 'settings');
+  $('#tab-btn-billing').classList.toggle('active', t === 'billing');
   if (!skipHash) writeHash(t);
   if (t === 'leads' && leadsRows === null) loadLeads();
   if (t === 'admin') loadMembers();
   if (t === 'settings') loadSettings();
+  if (t === 'billing') loadPacks();
 };
+
+// ── billing ──────────────────────────────────────────────────────────────────
+async function loadPacks() {
+  const cfg = await authApi('/api/config');
+  $('#packs').innerHTML = cfg.packs.map(p => `
+    <div class="card" style="min-width:230px">
+      <h3 style="margin:0 0 6px">${p.label}</h3>
+      <div style="font-size:22px;font-weight:700">$${p.usd} <span class="muted" style="font-size:13px">₹${(p.amount_inr/100).toFixed(0)}</span></div>
+      <div class="muted" style="font-size:12.5px">${p.leads.toLocaleString()} verified leads</div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn-primary" onclick="buyRzp('${p.id}')">Razorpay</button>
+        <button class="btn-ghost" onclick="buyPayU('${p.id}')">PayU</button>
+      </div>
+    </div>`).join('');
+  const st = new URLSearchParams(location.hash.split('?')[1]||'').get('status');
+  if (st) $('#billing-msg').textContent = st === 'ok' ? '✓ payment received — credits added' : '✗ payment failed';
+}
+window.buyRzp = async pack => {
+  try {
+    const o = await authApi('/api/pay/razorpay/order', {method:'POST', body: JSON.stringify({pack})});
+    new Razorpay({key: o.key_id, order_id: o.order_id, amount: o.amount, currency: o.currency,
+      name: 'Lead Finder', description: pack,
+      handler: async resp => {
+        const v = await authApi('/api/pay/razorpay/verify', {method:'POST', body: JSON.stringify(resp)});
+        $('#billing-msg').textContent = v.ok ? `✓ credits added — balance ${v.balance}` : '✗ verification failed';
+        authApi('/api/me').then(m => $('#whoami-credits').textContent = '· ' + m.balance + ' credits');
+      }}).open();
+  } catch (e) { alert(e.message); }
+};
+window.buyPayU = pack => alert('PayU arrives in the next release');
 
 // ── settings ─────────────────────────────────────────────────────────────────
 async function loadSettings() {
