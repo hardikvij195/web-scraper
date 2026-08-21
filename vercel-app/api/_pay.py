@@ -79,6 +79,71 @@ def rzp_verify(body: RzpVerifyIn, user: User = Depends(current_user)):
     return {"ok": True, "balance": bal[0]["balance"] if bal else 0}
 
 
+# ── PayU ─────────────────────────────────────────────────────────────────────
+import secrets as _secrets  # noqa: E402
+
+from fastapi import Form  # noqa: E402
+from fastapi.responses import RedirectResponse  # noqa: E402
+
+
+def payu_request_hash(key: str, salt: str, txnid: str, amount: str, productinfo: str,
+                      firstname: str, email: str, udf1: str, udf2: str) -> str:
+    seq = f"{key}|{txnid}|{amount}|{productinfo}|{firstname}|{email}|{udf1}|{udf2}|||||||||{salt}"
+    return hashlib.sha512(seq.encode()).hexdigest()
+
+
+def payu_response_hash(key: str, salt: str, status: str, txnid: str, amount: str, productinfo: str,
+                       firstname: str, email: str, udf1: str, udf2: str) -> str:
+    seq = f"{salt}|{status}||||||||{udf2}|{udf1}|{email}|{firstname}|{productinfo}|{amount}|{txnid}|{key}"
+    return hashlib.sha512(seq.encode()).hexdigest()
+
+
+class PayUIn(BaseModel):
+    pack: str
+
+
+@router.post("/payu/initiate")
+def payu_initiate(body: PayUIn, user: User = Depends(current_user)):
+    if body.pack not in PACKS:
+        raise HTTPException(400, "unknown pack")
+    key, salt = os.getenv("PAYU_KEY", ""), os.getenv("PAYU_SALT", "")
+    base = os.getenv("PAYU_BASE", "https://test.payu.in").rstrip("/")
+    app_base = os.getenv("APP_BASE_URL", "").rstrip("/")
+    if not key or not salt or not app_base:
+        raise HTTPException(503, "PayU not configured")
+    p = PACKS[body.pack]
+    txnid = "ws" + _secrets.token_hex(10)
+    amount = f"{p['amount_inr'] / 100:.2f}"
+    fields = {"key": key, "txnid": txnid, "amount": amount, "productinfo": body.pack,
+              "firstname": "Member", "email": user.email or "member@leadfinder.local",
+              "udf1": user.id, "udf2": body.pack,
+              "surl": f"{app_base}/api/pay/payu/return", "furl": f"{app_base}/api/pay/payu/return"}
+    fields["hash"] = payu_request_hash(key, salt, txnid, amount, body.pack,
+                                       fields["firstname"], fields["email"], user.id, body.pack)
+    sb_post("orders", {"user_id": user.id, "pack": body.pack, "leads": p["leads"],
+                       "amount_inr": p["amount_inr"], "gateway": "payu",
+                       "gateway_order_id": txnid}, prefer="return=minimal")
+    return {"action": f"{base}/_payment", "fields": fields}
+
+
+@router.post("/payu/return")
+def payu_return(status: str = Form(""), txnid: str = Form(""), amount: str = Form(""),
+                productinfo: str = Form(""), firstname: str = Form(""), email: str = Form(""),
+                udf1: str = Form(""), udf2: str = Form(""), hash: str = Form("")):
+    key, salt = os.getenv("PAYU_KEY", ""), os.getenv("PAYU_SALT", "")
+    expect = payu_response_hash(key, salt, status, txnid, amount, productinfo, firstname, email, udf1, udf2)
+    ok = hmac.compare_digest(expect, hash) and status == "success"
+    if ok:
+        rows = sb_get("orders", {"gateway_order_id": f"eq.{txnid}", "select": "*"})
+        if rows:
+            credit_order(rows[0])
+        else:
+            ok = False
+    else:
+        sb_patch("orders", {"status": "failed"}, {"gateway_order_id": f"eq.{txnid}", "status": "neq.paid"})
+    return RedirectResponse(url=f"/#billing?status={'ok' if ok else 'failed'}", status_code=303)
+
+
 @router.post("/razorpay/webhook")
 async def rzp_webhook(request: Request, x_razorpay_signature: str = Header(default="")):
     body = await request.body()

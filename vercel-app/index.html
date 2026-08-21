@@ -527,7 +527,16 @@ window.buyRzp = async pack => {
       }}).open();
   } catch (e) { alert(e.message); }
 };
-window.buyPayU = pack => alert('PayU arrives in the next release');
+window.buyPayU = async pack => {
+  try {
+    const o = await authApi('/api/pay/payu/initiate', {method:'POST', body: JSON.stringify({pack})});
+    const f = document.createElement('form'); f.method = 'POST'; f.action = o.action;
+    for (const [k, v] of Object.entries(o.fields)) {
+      const i = document.createElement('input'); i.type = 'hidden'; i.name = k; i.value = v; f.appendChild(i);
+    }
+    document.body.appendChild(f); f.submit();
+  } catch (e) { alert(e.message); }
+};
 
 // ── settings ─────────────────────────────────────────────────────────────────
 async function loadSettings() {
