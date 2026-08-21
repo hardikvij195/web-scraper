@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lead Scraper</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<style>
+  :root { --bg:#f5f7fb; --card:#fff; --line:#e3e7ef; --text:#111827; --muted:#6b7280; --brand:#1f4e79; --brand2:#2563eb; --ok:#059669; --warn:#d97706; --bad:#dc2626; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); display:flex; flex-direction:column; overflow:hidden; }
+  header { background:var(--brand); color:#fff; padding:14px 22px; display:flex; align-items:center; gap:14px; flex:0 0 auto; }
+  header h1 { margin:0; font-size:17px; font-weight:600; }
+  header .sub { opacity:.8; font-size:12px; }
+  .tabs { display:flex; gap:4px; margin-left:18px; }
+  .tab { background:transparent; color:#cfe0f0; padding:7px 14px; border-radius:7px; font-weight:600; font-size:13px; }
+  .tab:hover { background:rgba(255,255,255,.12); }
+  .tab.active { background:#fff; color:var(--brand); }
+  /* fixed app shell: page never scrolls; jobs list + leads table scroll inside */
+  main { flex:1 1 auto; min-height:0; display:grid; grid-template-columns:300px 1fr; gap:18px; padding:18px 22px; width:100%; max-width:1700px; margin:0 auto; }
+  main > aside { display:flex; flex-direction:column; gap:12px; min-height:0; min-width:0; }
+  /* min-width:0 stops the wide leads table from blowing the grid column past the viewport —
+     without it the table wins over .tbl's own scrollbar */
+  main > section { min-height:0; min-width:0; display:flex; flex-direction:column; }
+  main > section > .card { min-width:0; max-width:100%; }
+  .tbl { max-width:100%; }
+  @media (max-width:900px){ body { overflow:auto; } main { grid-template-columns:1fr; } main > aside .jobs { max-height:40vh; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  input[type=text], input[type=number], select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:7px; font:inherit; background:#fff; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+  .chk { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); }
+  button { font:inherit; border:0; border-radius:7px; padding:9px 14px; cursor:pointer; }
+  .btn-primary { background:var(--brand2); color:#fff; font-weight:600; }
+  .btn-primary:disabled { opacity:.5; cursor:default; }
+  .btn-ghost { background:#eef2f7; color:var(--text); padding:7px 11px; font-size:12.5px; }
+  .btn-danger { background:#fee2e2; color:var(--bad); padding:7px 11px; font-size:12.5px; }
+  .btn-new { width:100%; padding:11px; font-size:14px; }
+  .jobs { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
+  #jobs { flex:1 1 auto; min-height:0; overflow-y:auto; padding-right:4px; }
+  .job { padding:10px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; cursor:pointer; }
+  .job.active { border-color:var(--brand2); background:#eff6ff; }
+  .job .t { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .job .m { color:var(--muted); font-size:12px; display:flex; justify-content:space-between; gap:6px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600; background:#e5e7eb; color:#374151; white-space:nowrap; }
+  .pill.queued,.pill.waiting{background:#e5e7eb} .pill.scraping,.pill.enriching{background:#dbeafe;color:#1d4ed8} .pill.done{background:#d1fae5;color:#065f46} .pill.stopped{background:#fef3c7;color:#92400e} .pill.failed{background:#fee2e2;color:#991b1b} .pill.draft{background:#f3e8ff;color:#7c3aed} .pill.researching{background:#ede9fe;color:#6d28d9}
+  .progress { height:8px; background:#e5e7eb; border-radius:999px; overflow:hidden; margin:6px 0 4px; }
+  .progress > div { height:100%; background:var(--brand2); width:0; transition:width .4s; }
+  .progress.green > div { background:var(--ok); }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr)); gap:10px; margin:12px 0; }
+  .kpi { background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:9px 10px; }
+  .kpi b { display:block; font-size:19px; }
+  .kpi span { color:var(--muted); font-size:12px; }
+  .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  .toolbar .sp { flex:1; }
+  .toolbar input[type=text] { width:200px; }
+  /* leads table: scrolls both ways inside its box */
+  .tbl { flex:1 1 auto; min-height:120px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  table { border-collapse:collapse; font-size:12.5px; min-width:1350px; width:100%; }
+  th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }
+  td.wrap { white-space:normal; min-width:220px; max-width:340px; }
+  th { position:sticky; top:0; background:#f8fafc; font-weight:600; color:#374151; z-index:2; }
+  td a { color:var(--brand2); text-decoration:none; }
+  td a:hover { text-decoration:underline; }
+  .soc a { display:inline-block; margin-right:6px; font-weight:600; }
+  .muted { color:var(--muted); }
+  .empty { text-align:center; padding:40px; color:var(--muted); }
+  .msg { font-size:12px; color:var(--muted); }
+  .wa { font-size:11px; padding:1px 6px; border-radius:4px; background:#ecfdf5; color:#065f46; }
+  .wa.assumed { background:#fffbeb; color:#92400e; }
+  .locrow { display:flex; gap:6px; }
+  .locrow input { flex:1; }
+  .pin { font-size:11px; color:var(--ok); margin-top:4px; display:flex; gap:8px; align-items:center; }
+  .pin a { color:var(--muted); cursor:pointer; }
+  /* modals */
+  .modal-bg { position:fixed; inset:0; background:rgba(17,24,39,.45); display:none; align-items:center; justify-content:center; z-index:1000; }
+  .modal-bg.open { display:flex; }
+  .modal { background:#fff; border-radius:12px; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,.3); }
+  .modal.map { width:min(960px,94vw); height:min(680px,90vh); }
+  .modal.form { width:min(820px,95vw); max-height:94vh; }
+  /* keyword tag input: chips + inline field, 3 lines tall then scrolls */
+  .tagbox { display:flex; flex-wrap:wrap; gap:6px; align-items:center; border:1px solid var(--line); border-radius:8px; padding:7px; min-height:44px; max-height:96px; overflow-y:auto; background:#fff; }
+  .tagbox.focus { border-color:var(--brand2); box-shadow:0 0 0 2px rgba(37,99,235,.15); }
+  .tag { display:inline-flex; align-items:center; gap:6px; background:#e0edff; color:#1d4ed8; border-radius:6px; padding:3px 8px; font-size:12.5px; font-weight:500; }
+  .tag b { font-weight:600; }
+  .tag .x { cursor:pointer; opacity:.7; font-weight:700; }
+  .tag .x:hover { opacity:1; }
+  .tagbox input { border:0; outline:0; flex:1; min-width:120px; padding:4px; font:inherit; }
+  .modal .mh { display:flex; gap:8px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; flex:0 0 auto; }
+  .modal .mh b { font-size:15px; }
+  .modal .mbody { padding:4px 16px 12px; overflow-y:auto; flex:1 1 auto; min-height:0; }
+  .modal .mb { flex:1; position:relative; min-height:0; }
+  #map { position:absolute; inset:0; }
+  .geo-results { position:absolute; top:52px; left:12px; z-index:500; background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.15); max-width:420px; max-height:260px; overflow:auto; display:none; }
+  .geo-results.open { display:block; }
+  .geo-results div { padding:8px 10px; cursor:pointer; font-size:13px; border-bottom:1px solid var(--line); }
+  .geo-results div:hover { background:#eff6ff; }
+  .modal .mf { display:flex; gap:10px; align-items:center; padding:12px 16px; border-top:1px solid var(--line); flex-wrap:wrap; flex:0 0 auto; }
+  .modal .mf input[type=range] { width:200px; }
+  .modal .mf .info { font-size:12px; color:var(--muted); flex:1; min-width:180px; }
+  .section-t { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--brand2); margin:16px 0 2px; }
+  .kwrow { display:flex; gap:6px; }
+  .kwrow input { flex:1; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chip { background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe; border-radius:999px; padding:3px 10px; font-size:12px; cursor:pointer; }
+  .chip:hover { background:#dbeafe; }
+  .chips .src { font-size:11px; color:var(--muted); align-self:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Lead Scraper</h1>
+  <nav class="tabs">
+    <button class="tab active" id="tab-btn-scraper" onclick="showTab('scraper')">Scraper</button>
+    <button class="tab" id="tab-btn-leads" onclick="showTab('leads')">All leads</button>
+  </nav>
+  <span class="sub" style="margin-left:auto">runs on this machine · <span id="health">…</span></span>
+</header>
+<main id="tab-scraper">
+  <aside>
+    <button class="btn-primary btn-new" onclick="openJobDialog()">＋ New job</button>
+    <div class="card jobs">
+      <h2>Jobs</h2>
+      <div id="jobs"><div class="muted">none yet</div></div>
+    </div>
+  </aside>
+  <section>
+    <div class="card" id="detail" style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column">
+      <div class="empty">Create a job or pick one on the left.</div>
+    </div>
+  </section>
+</main>
+
+<!-- ── all leads tab ──────────────────────────────────────────────────────── -->
+<main id="tab-leads" style="display:none;grid-template-columns:1fr">
+  <section>
+    <div class="card" style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <h2 style="margin:0;text-transform:none;letter-spacing:0;color:var(--text);font-size:16px">All leads</h2>
+        <span class="msg" id="leads-count"></span>
+        <span style="flex:1"></span>
+        <input type="text" id="lflt" placeholder="search name / phone / email / owner / keyword…" style="width:260px" oninput="LF.q=this.value;writeHash('leads');renderLeads()">
+        <label class="chk" style="margin:0" title="Load leads from your Supabase cloud table instead of this machine"><input type="checkbox" id="fromcloud" onchange="loadLeads(true)"> from Supabase</label>
+        <a class="btn-ghost" style="text-decoration:none" href="/api/leads/export?fmt=xlsx">⬇ Excel</a>
+        <a class="btn-ghost" style="text-decoration:none" href="/api/leads/export?fmt=csv">CSV</a>
+        <button class="btn-ghost" onclick="loadLeads(true)">↻ Refresh</button>
+      </div>
+      <div class="msg" id="supa-status" style="margin:4px 0 4px"></div>
+      <div class="toolbar" id="leads-filters" style="gap:6px 12px"></div>
+      <div class="tbl" id="leads-tbl"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+</main>
+
+<!-- ── new job / draft dialog ─────────────────────────────────────────────── -->
+<div class="modal-bg" id="jobmodal">
+  <div class="modal form">
+    <div class="mh"><b id="jm-title">New job</b><span style="flex:1"></span><button class="btn-ghost" onclick="closeJobDialog()">✕</button></div>
+    <div class="mbody">
+      <div class="section-t">What to find</div>
+      <label>Keywords * <span class="muted" style="font-weight:400">— press Enter or comma to add each; multiple keywords = multiple searches merged</span></label>
+      <div class="kwrow">
+        <div class="tagbox" id="tagbox" onclick="document.getElementById('kwinput').focus()">
+          <input type="text" id="kwinput" placeholder="dentist, orthodontist…" autocomplete="off">
+        </div>
+        <button type="button" class="btn-ghost" onclick="suggest()" title="AI-suggest related business keywords" style="align-self:flex-start">✨ Suggest</button>
+      </div>
+      <div class="chips" id="chips"></div>
+
+      <div class="section-t">Where</div>
+      <div class="row">
+        <div><label>Location</label>
+          <div class="locrow"><input type="text" id="location" placeholder="Pune · Koregaon Park, Pune"><button type="button" class="btn-map btn-ghost" id="mapbtn" title="Pick centre and radius on a map">📍 Map</button></div>
+          <div class="pin" id="pininfo" style="display:none"><span id="pintext"></span><a onclick="clearPin()">✕ clear pin</a></div>
+        </div>
+        <div><label title="Only keep places within this distance of the location. Empty = whatever Maps returns.">Radius (km)</label><input type="number" id="radius" placeholder="any" min="0.3" max="300" step="any"></div>
+      </div>
+
+      <div class="section-t">Limits</div>
+      <div class="row3">
+        <div><label>Max places</label><input type="number" id="max" value="50" min="1" max="100000">
+          <label class="chk" style="margin-top:6px"><input type="checkbox" id="unl" onchange="document.getElementById('max').disabled=this.checked"> unlimited</label></div>
+        <div><label title="Seconds between place visits. 6 s ≈ 8–10 places/min, safe from a home IP.">Delay (sec/place)</label><input type="number" id="delay" value="6" min="1" max="120" step="any"></div>
+        <div><label title="Stop scraping this many minutes after the job starts; it still enriches what it collected.">Max run time (min)</label><input type="number" id="maxmin" placeholder="no limit" min="1" max="1440" step="1"></div>
+      </div>
+
+      <div class="section-t">Options</div>
+      <div class="row">
+        <div><label title="Region for phone / WhatsApp numbers without a +country code. Auto = read from each lead's address.">Phone country</label>
+          <select id="country"><option value="">Auto (from address)</option><option>IN</option><option>GB</option><option>US</option><option>AE</option><option>AU</option><option>CA</option><option>SG</option><option>NZ</option><option>IE</option><option>DE</option><option>FR</option></select></div>
+        <div style="display:flex;flex-direction:column;justify-content:flex-end;gap:8px;padding-bottom:2px">
+          <label class="chk" style="margin:0"><input type="checkbox" id="enrich" checked> Crawl websites for email / socials / WhatsApp</label>
+          <label class="chk" style="margin:0"><input type="checkbox" id="headed"> Show browser (also gets review counts)</label>
+          <label class="chk" style="margin:0" title="Skip businesses that any earlier job already scraped — only brand-new leads are collected."><input type="checkbox" id="uninew"> Only new businesses (skip leads already in the system)</label>
+          <label class="chk" style="margin:0" title="After enriching, an AI reads each website (home + about/team pages) for a one-line summary, the owner/founder, and named team members with any phone/email found. Needs GEMINI_API_KEY in .env. Slower."><input type="checkbox" id="research"> AI research: summary, owner/founder &amp; team (from the website)</label>
+        </div>
+      </div>
+      <div class="msg" id="formmsg" style="margin-top:10px"></div>
+    </div>
+    <div class="mf">
+      <span class="info" id="jm-info"></span>
+      <button class="btn-ghost" onclick="closeJobDialog()">Cancel</button>
+      <button class="btn-ghost" id="jm-delete" style="display:none" onclick="deleteDraft()">Delete draft</button>
+      <button class="btn-ghost" onclick="saveJob(true)">💾 Save draft</button>
+      <button class="btn-primary" id="start" onclick="saveJob(false)">Start scraping</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── map picker ──────────────────────────────────────────────────────────── -->
+<div class="modal-bg" id="mapmodal">
+  <div class="modal map">
+    <div class="mh">
+      <b>Pick centre &amp; radius</b>
+      <input type="text" id="geoq" placeholder="Search a place… (Koregaon Park, Pune · Canary Wharf, London)" autocomplete="off" style="flex:1;min-width:200px">
+      <button class="btn-ghost" onclick="geoSearch()">Search</button>
+      <span class="msg">or click / drag on the map</span>
+      <button class="btn-ghost" onclick="closeMap()">✕</button>
+    </div>
+    <div class="mb"><div id="map"></div><div class="geo-results" id="georesults"></div></div>
+    <div class="mf">
+      <label style="margin:0">Radius</label>
+      <input type="range" id="mrad" min="0.5" max="50" step="0.5" value="5" oninput="setRadiusFromSlider(this.value)">
+      <input type="number" id="mradn" min="0.3" max="300" step="any" value="5" style="width:80px" oninput="setRadiusFromSlider(this.value,true)">
+      <span class="msg">km</span>
+      <span class="info" id="mapinfo">No centre yet — search or click the map.</span>
+      <button class="btn-ghost" onclick="closeMap()">Cancel</button>
+      <button class="btn-primary" style="margin:0" id="useloc" onclick="useLocation()" disabled>Use this location</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+const $ = s => document.querySelector(s);
+// Cloud viewer: the scraper engine runs locally, not here. Detect via /api/health.
+window.CLOUD = false;
+const api = async (path, opt) => {
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opt||{}));
+  if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail || r.statusText);
+  return r.json();
+};
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const host = u => { try { return new URL(u).hostname.replace(/^www\./,''); } catch { return u; } };
+const fmtDur = s => { if (s == null) return '—'; s = Math.max(0, Math.round(s)); const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), x = s%60; return h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`; };
+const isPending = j => j.running || j.phase === 'queued' || j.phase === 'waiting' || j.phase === 'researching';
+const timing = j => {
+  if (isPending(j)) {
+    const parts = [];
+    if (j.elapsed_sec != null) parts.push(`running for <b>${fmtDur(j.elapsed_sec)}</b>`);
+    if (j.eta_sec != null) parts.push(`ETA <b>~${fmtDur(j.eta_sec)}</b>`);
+    if (j.time_left_sec != null) parts.push(`time limit: stops scraping in <b>${fmtDur(j.time_left_sec)}</b>`);
+    else if (j.max_minutes && j.phase === 'queued') parts.push(`limit <b>${j.max_minutes} min</b> from start`);
+    return parts.join(' · ') || 'waiting…';
+  }
+  return j.elapsed_sec != null ? `ran for <b>${fmtDur(j.elapsed_sec)}</b>` : '';
+};
+
+let jobs = [], currentId = null, places = [], lastJob = null, pollTimer = null;
+// filter state on window so inline on* handlers mutate the SAME binding the render reads
+window.flt = { text: '', email: false, wa: false, unique: false };
+window.setFlt = (k, v) => { window.flt[k] = v; rerender(); };
+let pin = null, editingId = null, keywords = [];
+
+// ── keyword tag input ────────────────────────────────────────────────────────
+function renderTags() {
+  const box = $('#tagbox'); if (!box) return;
+  box.querySelectorAll('.tag').forEach(t => t.remove());
+  const input = $('#kwinput');
+  keywords.forEach((k, i) => {
+    const el = document.createElement('span');
+    el.className = 'tag';
+    el.innerHTML = `<b>${esc(k)}</b><span class="x" onclick="removeKw(${i})">✕</span>`;
+    box.insertBefore(el, input);
+  });
+}
+function addKw(raw) {
+  // split on comma / newline / tab / semicolon / bullet so a pasted list becomes many tags
+  raw.split(/[\n\r\t;,•|]+/).map(s => s.trim()).filter(Boolean).forEach(k => {
+    if (k.length > 80) k = k.slice(0, 80);
+    if (!keywords.some(x => x.toLowerCase() === k.toLowerCase())) keywords.push(k);
+  });
+  renderTags();
+}
+window.removeKw = i => { keywords.splice(i, 1); renderTags(); };
+function setupTagInput() {
+  const input = $('#kwinput'), box = $('#tagbox');
+  if (!input) return;
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); if (input.value.trim()) { addKw(input.value); input.value = ''; } }
+    else if (e.key === 'Backspace' && !input.value && keywords.length) { keywords.pop(); renderTags(); }
+  });
+  input.addEventListener('input', () => { if (input.value.includes(',')) { addKw(input.value); input.value = ''; } });
+  input.addEventListener('paste', e => {
+    const txt = (e.clipboardData || window.clipboardData).getData('text');
+    if (txt && /[\n\r\t;,•|]/.test(txt)) { e.preventDefault(); addKw(txt); input.value = ''; }
+  });
+  input.addEventListener('blur', () => { if (input.value.trim()) { addKw(input.value); input.value = ''; } box.classList.remove('focus'); });
+  input.addEventListener('focus', () => box.classList.add('focus'));
+}
+
+// ── new job dialog ───────────────────────────────────────────────────────────
+function openJobDialog(job) {
+  editingId = job ? job.id : null;
+  $('#jm-title').textContent = job ? `Draft #${job.id}` : 'New job';
+  $('#jm-delete').style.display = job ? '' : 'none';
+  $('#formmsg').textContent = ''; $('#chips').innerHTML = '';
+  keywords = job?.query ? job.query.split(',').map(s => s.trim()).filter(Boolean) : [];
+  $('#kwinput').value = ''; renderTags();
+  $('#location').value = job?.location || '';
+  $('#radius').value = job?.radius_km ?? '';
+  $('#max').value = job && job.max_places === 0 ? 50 : (job?.max_places ?? 50);
+  $('#unl').checked = job ? job.max_places === 0 : false;
+  $('#max').disabled = $('#unl').checked;
+  $('#delay').value = job?.delay_sec ?? 6;
+  $('#maxmin').value = job?.max_minutes ?? '';
+  $('#country').value = job?.country || '';
+  $('#enrich').checked = job ? !!job.do_enrich : true;
+  $('#headed').checked = job ? !job.headless : false;
+  $('#uninew').checked = job ? !!job.unique_new : false;
+  $('#research').checked = job ? !!job.do_research : false;
+  if (job && job.center_lat != null) { pin = { lat: job.center_lat, lng: job.center_lng, name: job.location }; showPin(); }
+  else clearPin();
+  $('#jm-info').textContent = job ? 'Saved draft — edit and start whenever you like.' : '';
+  $('#jobmodal').classList.add('open');
+  const h = job ? `#draft/${job.id}` : '#new';
+  if (location.hash !== h) history.replaceState(null, '', h);
+  setTimeout(() => $('#kwinput').focus(), 50);
+}
+function closeJobDialog() {
+  $('#jobmodal').classList.remove('open'); editingId = null;
+  if (location.hash === '#new' || location.hash.startsWith('#draft/')) history.replaceState(null, '', '#scraper');
+}
+
+function jobBody() {
+  if ($('#kwinput').value.trim()) { addKw($('#kwinput').value); $('#kwinput').value = ''; }
+  return {
+    keywords: keywords.slice(), query: keywords.join(', '), location: $('#location').value,
+    max_places: $('#unl').checked ? 0 : +$('#max').value,
+    delay_sec: +$('#delay').value, country: $('#country').value,
+    enrich: $('#enrich').checked, headless: !$('#headed').checked,
+    radius_km: $('#radius').value ? +$('#radius').value : null,
+    max_minutes: $('#maxmin').value ? +$('#maxmin').value : null,
+    center_lat: pin ? pin.lat : null, center_lng: pin ? pin.lng : null,
+    unique_new: $('#uninew').checked,
+    research: $('#research').checked,
+  };
+}
+
+// ── tabs (hash-routed) + all leads ───────────────────────────────────────────
+let leadsRows = null;
+// All-leads filters, persisted in the URL hash so refresh / back keeps them
+const LF = { q: '', country: '', has: {} };  // has: {email,phone,whatsapp,website,instagram,facebook,linkedin,twitter_x,owner,team,summary}
+const HAS_FIELDS = [
+  ['phone','Phone'],['whatsapp','WhatsApp'],['email','Email'],['website','Website'],
+  ['instagram','Instagram'],['facebook','Facebook'],['linkedin','LinkedIn'],['twitter_x','X'],
+  ['owner','Owner'],['team','Team'],['summary','Summary'],
+];
+function tabFromHash() { return (location.hash.replace('#','').split('?')[0]) || 'scraper'; }
+function writeHash(tab) {
+  let h = '#' + tab;
+  if (tab === 'leads') {
+    const p = new URLSearchParams();
+    if (LF.q) p.set('q', LF.q);
+    if (LF.country) p.set('country', LF.country);
+    Object.keys(LF.has).filter(k => LF.has[k]).forEach(k => p.append('has', k));
+    if ($('#fromcloud') && $('#fromcloud').checked) p.set('src', 'cloud');
+    const qs = p.toString(); if (qs) h += '?' + qs;
+  }
+  if (location.hash !== h) history.replaceState(null, '', h);
+}
+function readHash() {
+  const parts = location.hash.replace('#','').split('?');
+  const p = new URLSearchParams(parts[1] || '');
+  LF.q = p.get('q') || ''; LF.country = p.get('country') || '';
+  LF.has = {}; p.getAll('has').forEach(k => LF.has[k] = true);
+  return { tab: parts[0] || 'scraper', cloud: p.get('src') === 'cloud' };
+}
+window.showTab = (t, skipHash) => {
+  $('#tab-scraper').style.display = t === 'scraper' ? 'grid' : 'none';
+  $('#tab-leads').style.display = t === 'leads' ? 'grid' : 'none';
+  $('#tab-btn-scraper').classList.toggle('active', t === 'scraper');
+  $('#tab-btn-leads').classList.toggle('active', t === 'leads');
+  if (!skipHash) writeHash(t);
+  if (t === 'leads' && leadsRows === null) loadLeads();
+};
+window.addEventListener('hashchange', () => { const t = tabFromHash(); if (t !== ($('#tab-btn-leads').classList.contains('active') ? 'leads' : 'scraper')) showTab(t, true); });
+async function loadLeads(force) {
+  if (force) leadsRows = null;
+  $('#leads-tbl').innerHTML = '<div class="empty">loading…</div>';
+  supaStatus();
+  const cloud = $('#fromcloud') && $('#fromcloud').checked;
+  try {
+    const r = await api('/api/leads?unique=1&limit=10000' + (cloud ? '&source=supabase' : ''));
+    leadsRows = r.rows;
+    renderLeadFilters();
+    renderLeads();
+  } catch (e) { $('#leads-tbl').innerHTML = `<div class="empty">error: ${esc(e.message)}</div>`; }
+}
+async function supaStatus() {
+  try {
+    const s = await api('/api/supabase/status');
+    const el = $('#supa-status');
+    if (!s.configured) { el.innerHTML = '<span class="muted">Supabase not configured (add keys to .env to sync to the cloud)</span>'; return; }
+    if (!s.reachable) { el.innerHTML = '<span style="color:var(--bad)">Supabase unreachable</span>'; return; }
+    if (!s.table_exists) {
+      el.innerHTML = `<span style="color:var(--warn)">Supabase connected, table missing.</span> <a style="cursor:pointer;color:var(--brand2)" onclick="setupSupa()">Create table automatically</a> · <a style="cursor:pointer;color:var(--brand2)" onclick="showSql()">show SQL</a>`;
+      window._supaSql = s.setup_sql; return;
+    }
+    el.innerHTML = `<span style="color:var(--ok)">☁ Supabase connected · ${s.count} leads in the cloud</span> · <a style="cursor:pointer;color:var(--brand2)" onclick="syncSupa()">Sync local → cloud</a>`;
+  } catch { $('#supa-status').textContent = ''; }
+}
+window.showSql = () => { const w = window.open('', '_blank', 'width=680,height=520'); w.document.write('<pre style="white-space:pre-wrap;font:13px monospace;padding:16px">' + (window._supaSql || '').replace(/</g,'&lt;') + '</pre>'); };
+window.setupSupa = async () => {
+  $('#supa-status').innerHTML = '<span class="muted">creating table…</span>';
+  try { await api('/api/supabase/setup', {method:'POST'}); await syncSupa(); }
+  catch (e) { alert('Auto-create failed: ' + e.message + '\n\nPaste the setup SQL in the Supabase SQL editor instead.'); supaStatus(); }
+};
+window.syncSupa = async () => {
+  $('#supa-status').innerHTML = '<span class="muted">syncing…</span>';
+  try { const r = await api('/api/supabase/sync', {method:'POST'}); alert('Pushed ' + r.pushed + ' leads to Supabase'); }
+  catch (e) { alert('Sync failed: ' + e.message); }
+  supaStatus();
+};
+function renderLeadFilters() {
+  const countries = [...new Set((leadsRows||[]).map(p => p.country).filter(Boolean))].sort();
+  const chk = (k, label) => `<label class="chk" style="margin:0"><input type="checkbox" ${LF.has[k]?'checked':''} onchange="LF.has['${k}']=this.checked;writeHash('leads');renderLeads()"> ${label}</label>`;
+  $('#leads-filters').innerHTML =
+    HAS_FIELDS.map(([k,l]) => chk(k,'has '+l)).join('')
+    + `<label class="chk" style="margin:0">country <select onchange="LF.country=this.value;writeHash('leads');renderLeads()" style="width:auto;padding:4px 6px"><option value="">any</option>${countries.map(c=>`<option ${LF.country===c?'selected':''}>${esc(c)}</option>`).join('')}</select></label>`;
+  if ($('#lflt')) $('#lflt').value = LF.q;
+}
+window.renderLeads = () => {
+  if (!leadsRows) return;
+  LF.q = ($('#lflt') ? $('#lflt').value : LF.q) || '';
+  const t = LF.q.toLowerCase();
+  const rows = leadsRows.filter(p => {
+    for (const k of Object.keys(LF.has)) {
+      if (!LF.has[k]) continue;
+      const v = k === 'team' ? (p.team && (Array.isArray(p.team) ? p.team.length : String(p.team).trim())) : p[k];
+      if (!v) return false;
+    }
+    if (LF.country && p.country !== LF.country) return false;
+    if (t && ![p.name,p.category,p.phone,p.email,p.website,p.address,p.owner,p.summary,p.job_query,p.job_location]
+      .some(v => (v||'').toLowerCase().includes(t))) return false;
+    return true;
+  });
+  const cloud = $('#fromcloud') && $('#fromcloud').checked;
+  $('#leads-count').textContent = `${rows.length} of ${leadsRows.length}${cloud ? ' (Supabase)' : ' unique'}`;
+  $('#leads-tbl').innerHTML = rows.length ? `<table><thead><tr>
+      <th>#</th><th>Name</th><th>Phone</th><th>WhatsApp</th><th>Email</th><th>Website</th><th>Social</th><th>Owner</th><th>Summary</th><th>Team</th><th>Address</th><th>Country</th><th>Rating</th><th>Scraped</th><th>From job</th>
+    </tr></thead><tbody>
+    ${rows.map((p,i)=>`<tr>
+      <td class="muted">${i+1}</td>
+      <td class="wrap"><b>${esc(p.name)}</b><div class="muted">${esc(p.category||'')}</div></td>
+      <td>${p.phone?`<a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`:''}</td>
+      <td>${p.whatsapp_number?`<a href="https://wa.me/${esc(p.whatsapp_number)}" target="_blank">${esc(p.whatsapp_number)}</a>`:'<span class="muted">—</span>'}</td>
+      <td>${p.email?`<a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`:''}</td>
+      <td>${p.website?`<a href="${esc(p.website)}" target="_blank">${esc(host(p.website))}</a>`:''}</td>
+      <td class="soc">
+        ${p.instagram?`<a href="${esc(p.instagram)}" target="_blank">IG</a>`:''}
+        ${p.facebook?`<a href="${esc(p.facebook)}" target="_blank">FB</a>`:''}
+        ${p.linkedin?`<a href="${esc(p.linkedin)}" target="_blank">LI</a>`:''}
+        ${p.twitter_x?`<a href="${esc(p.twitter_x)}" target="_blank">X</a>`:''}
+      </td>
+      <td class="muted">${esc(p.owner||'')}</td>
+      <td class="wrap muted">${esc(p.summary||'')}</td>
+      <td class="wrap muted">${Array.isArray(p.team)?p.team.map(t=>esc(t.name)+(t.role?` (${esc(t.role)})`:'')).join('<br>'):esc(p.team||'')}</td>
+      <td class="wrap muted">${esc(p.address||'')}</td>
+      <td class="muted">${esc(p.country||'')}</td>
+      <td>${p.rating??''}${p.reviews_count?` <span class="muted">(${p.reviews_count})</span>`:''}</td>
+      <td class="muted">${p.scraped_at ? new Date(p.scraped_at).toLocaleString() : ''}</td>
+      <td class="muted">#${p.job_id} ${esc(p.job_query||'')}${p.job_location?` · ${esc(p.job_location)}`:''}</td>
+    </tr>`).join('')}
+    </tbody></table>` : '<div class="empty">no leads yet</div>';
+};
+
+async function saveJob(asDraft) {
+  if ($('#kwinput').value.trim()) { addKw($('#kwinput').value); $('#kwinput').value = ''; }
+  if (!keywords.length) { $('#formmsg').textContent = 'add at least one keyword'; return; }
+  $('#start').disabled = true; $('#formmsg').textContent = '';
+  try {
+    let job;
+    if (editingId) {
+      job = await api(`/api/jobs/${editingId}`, {method:'PATCH', body: JSON.stringify(jobBody())});
+      if (!asDraft) job = await api(`/api/jobs/${editingId}/start`, {method:'POST'});
+    } else {
+      job = await api('/api/jobs', {method:'POST', body: JSON.stringify(Object.assign(jobBody(), {draft: asDraft}))});
+    }
+    currentId = job.id; places = []; lastSig = '';
+    closeJobDialog(); refresh();
+  } catch (err) { $('#formmsg').textContent = 'error: ' + err.message; }
+  $('#start').disabled = false;
+}
+async function deleteDraft() {
+  if (!editingId || !confirm('Delete this draft?')) return;
+  await api(`/api/jobs/${editingId}`, {method:'DELETE'}).catch(e => alert(e.message));
+  closeJobDialog(); currentId = null; refresh();
+}
+
+// ── AI keyword suggestions ───────────────────────────────────────────────────
+async function suggest() {
+  // use the typed text, else the last keyword tag as the seed
+  const q = ($('#kwinput').value.trim() || keywords[keywords.length - 1] || '').trim();
+  if (!q) { $('#formmsg').textContent = 'type a keyword first'; return; }
+  $('#chips').innerHTML = '<span class="src">✨ thinking… (AI is finding related keywords)</span>';
+  try {
+    const r = await api('/api/suggest?q=' + encodeURIComponent(q));
+    if (!r.keywords.length) { $('#chips').innerHTML = '<span class="src">no suggestions</span>'; return; }
+    $('#chips').innerHTML = `<span class="src">click to add:</span>` + r.keywords.map(k => `<span class="chip" onclick="pickKw(this)">+ ${esc(k)}</span>`).join('')
+      + `<span class="src">${r.source === 'autosuggest' ? 'via Google autosuggest — add GEMINI_API_KEY to .env for smarter AI suggestions' : 'AI · ' + r.source}</span>`;
+  } catch (e) { $('#chips').innerHTML = `<span class="src">error: ${esc(e.message)}</span>`; }
+}
+window.pickKw = el => { addKw(el.textContent.replace(/^\+\s*/, '')); el.style.display = 'none'; };
+
+// ── jobs list ────────────────────────────────────────────────────────────────
+let lastJobsHtml = '';
+function renderJobs() {
+  if (!jobs.length) { $('#jobs').innerHTML = '<div class="muted">none yet</div>'; return; }
+  const html = jobs.map(j => `
+    <div class="job ${j.id===currentId?'active':''}" onclick="pick(${j.id})">
+      <div class="t">${esc(j.query)} <span class="muted">in ${esc(j.location||'anywhere')}</span></div>
+      <div class="m"><span>#${j.id}${j.phase==='draft'?'':` · ${j.places} leads`}${j.max_places===0?' · ∞':''}${j.phase==='draft'?'':` · ${isPending(j) ? (j.eta_sec!=null?'ETA ~'+fmtDur(j.eta_sec):'…') : fmtDur(j.elapsed_sec)}`}${j.radius_km?` · ${j.radius_km} km`:''}${j.max_minutes?` · ≤${j.max_minutes}m`:''}</span><span class="pill ${j.phase||''}">${j.phase||j.status}</span></div>
+    </div>`).join('');
+  if (html !== lastJobsHtml) { lastJobsHtml = html; $('#jobs').innerHTML = html; }
+}
+window.pick = id => {
+  const j = jobs.find(x => x.id === id);
+  if (j && j.phase === 'draft') { openJobDialog(j); return; }
+  currentId = id; places = []; lastSig = ''; renderJobs(); loadDetail();
+};
+
+// ── detail ───────────────────────────────────────────────────────────────────
+let lastSig = '';
+async function refresh() {
+  try {
+    const h = await api('/api/health');
+    window.CLOUD = !!h.cloud;
+    if (h.cloud) { applyCloudMode(); $('#health').textContent = '☁ cloud viewer — scraping runs on your PC'; }
+    else $('#health').textContent = h.worker_alive ? (h.current_job ? `working on job #${h.current_job}` : 'idle') : 'worker down';
+  } catch { $('#health').textContent = 'server unreachable'; }
+  if (window.CLOUD) { if (leadsRows === null) { showTab('leads', true); loadLeads(true); } clearTimeout(pollTimer); return; }
+  jobs = await api('/api/jobs').catch(()=>[]);
+  if (currentId == null) { const first = jobs.find(j => j.phase !== 'draft'); if (first) currentId = first.id; }
+  renderJobs();
+  if (currentId != null) await loadDetail();
+  const running = jobs.some(isPending);
+  clearTimeout(pollTimer); pollTimer = setTimeout(refresh, running ? 1500 : 6000);
+}
+async function loadDetail() {
+  const j = await api(`/api/jobs/${currentId}`).catch(()=>null);
+  if (!j || j.phase === 'draft') return;
+  const newPlaces = await api(`/api/jobs/${currentId}/places`).catch(()=>[]);
+  const sig = JSON.stringify([j.id, j.phase, j.links_found, j.scraped_count, j.enrich_done, j.enrich_total, j.message, newPlaces.length,
+    newPlaces.map(p => p.enrich_status + (p.email||'') + (p.whatsapp_number||'')).join('|')]);
+  places = newPlaces; lastJob = j;
+  if (sig !== lastSig) { lastSig = sig; renderDetail(j); }
+  else { const t = document.getElementById('timing'); if (t) t.innerHTML = timing(j) + (j.message ? ' · ' + esc(j.message) : '') + '&nbsp;'; }
+}
+window.rerender = () => lastJob && renderDetail(lastJob);
+
+function renderDetail(j) {
+  const prevTbl = document.querySelector('#detail .tbl');
+  const tblTop = prevTbl ? prevTbl.scrollTop : 0, tblLeft = prevTbl ? prevTbl.scrollLeft : 0;
+  const active = document.activeElement && document.activeElement.id === 'flt';
+  const caret = active ? document.activeElement.selectionStart : null;
+
+  const total = j.links_found || j.max_places || 1;
+  const scrapePct = Math.min(100, Math.round(100 * (j.scraped_count||0) / total));
+  const enrichPct = j.enrich_total ? Math.round(100 * (j.enrich_done||0) / j.enrich_total) : (j.phase==='done'?100:0);
+  const cnt = f => places.filter(f).length;
+  const F = window.flt;
+  const seenDom = new Set();
+  const retryable = cnt(p => ['failed','thin','pending'].includes(p.enrich_status));
+  const rows = places.filter(p => {
+    if (F.unique && p.domain) { if (seenDom.has(p.domain)) return false; seenDom.add(p.domain); }
+    if (F.email && !p.email) return false;
+    if (F.wa && !p.whatsapp_number) return false;
+    if (!F.text) return true;
+    const t = F.text.toLowerCase();
+    return [p.name,p.category,p.address,p.phone,p.email,p.website].some(v => (v||'').toLowerCase().includes(t));
+  });
+  $('#detail').innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <h2 style="margin:0;text-transform:none;letter-spacing:0;color:var(--text);font-size:16px">Job #${j.id} — ${esc(j.query)} <span class="muted">in ${esc(j.location||'anywhere')}${j.radius_km?` · within ${j.radius_km} km`:''}${j.max_minutes?` · max ${j.max_minutes} min`:''}</span></h2>
+      <span class="pill ${j.phase||''}">${j.phase||j.status}</span>
+      <span style="flex:1"></span>
+      ${isPending(j) ? `<button class="btn-danger" onclick="stopJob(${j.id})">Stop</button>` : `<button class="btn-ghost" onclick="deleteJob(${j.id})">Delete</button>`}
+    </div>
+    <div class="msg" id="timing" style="margin-top:6px">${timing(j)}${j.message ? ' · ' + esc(j.message) : ''}&nbsp;</div>
+    <div class="row${j.do_research?'3':''}" style="margin-top:8px">
+      <div><div class="msg">Scraping Google Maps — ${j.scraped_count||0} / ${j.links_found||'?'} places</div><div class="progress"><div style="width:${scrapePct}%"></div></div></div>
+      <div><div class="msg">Enriching websites — ${j.enrich_done||0} / ${j.enrich_total||0}</div><div class="progress green"><div style="width:${enrichPct}%"></div></div></div>
+      ${j.do_research?`<div><div class="msg">AI research — ${j.research_done||0} / ${j.research_total||0}</div><div class="progress" style="--x:0"><div style="width:${j.research_total?Math.round(100*(j.research_done||0)/j.research_total):(j.phase==='done'?100:0)}%;background:#7c3aed"></div></div></div>`:''}
+    </div>
+    <div class="kpis">
+      <div class="kpi"><b>${places.length}</b><span>leads</span></div>
+      <div class="kpi"><b>${cnt(p=>p.phone)}</b><span>phone</span></div>
+      <div class="kpi"><b>${cnt(p=>p.whatsapp_number)}</b><span>WhatsApp</span></div>
+      <div class="kpi"><b>${cnt(p=>p.email)}</b><span>email</span></div>
+      <div class="kpi"><b>${cnt(p=>p.instagram)}</b><span>Instagram</span></div>
+      <div class="kpi"><b>${cnt(p=>p.facebook)}</b><span>Facebook</span></div>
+      <div class="kpi"><b>${cnt(p=>p.linkedin)}</b><span>LinkedIn</span></div>
+      <div class="kpi"><b>${cnt(p=>p.twitter_x)}</b><span>X</span></div>
+    </div>
+    <div class="toolbar">
+      <input type="text" id="flt" placeholder="filter…" value="${esc(F.text)}" oninput="window.flt.text=this.value;rerender()">
+      <label class="chk" style="margin:0"><input type="checkbox" ${F.email?'checked':''} onchange="window.setFlt('email',this.checked)"> has email</label>
+      <label class="chk" style="margin:0"><input type="checkbox" ${F.wa?'checked':''} onchange="window.setFlt('wa',this.checked)"> has WhatsApp</label>
+      <label class="chk" style="margin:0" title="One lead per website — collapses chains with many branches"><input type="checkbox" ${F.unique?'checked':''} onchange="window.setFlt('unique',this.checked)"> unique websites</label>
+      <span class="sp"></span>
+      ${!isPending(j) && retryable ? `<button class="btn-ghost" onclick="reenrich(${j.id})" title="Retry the website crawl for failed / thin rows">↻ Re-enrich ${retryable}</button>` : ''}
+      <a class="btn-ghost" style="text-decoration:none" href="/api/jobs/${j.id}/export?fmt=xlsx${F.unique?'&unique=1':''}">⬇ Excel${F.unique?' (unique)':''}</a>
+      <a class="btn-ghost" style="text-decoration:none" href="/api/jobs/${j.id}/export?fmt=csv${F.unique?'&unique=1':''}">CSV</a>
+      <a class="btn-ghost" style="text-decoration:none" href="/api/jobs/${j.id}/export?fmt=json${F.unique?'&unique=1':''}">JSON</a>
+    </div>
+    <div class="msg">showing ${rows.length} of ${places.length}${F.unique?' · duplicates of the same website hidden':''}</div>
+    <div class="tbl">
+      ${rows.length ? `<table><thead><tr>
+        <th>#</th><th>Name</th><th>Phone</th><th>WhatsApp</th><th>Email</th><th>Website</th><th>Social</th>${j.do_research?'<th>Summary</th><th>Owner</th><th>Team</th>':''}<th>Address</th><th>Country</th>${j.radius_km?'<th>Dist</th>':''}<th>Rating</th><th>Status</th>
+      </tr></thead><tbody>
+      ${rows.map((p,i)=>`<tr>
+        <td class="muted">${i+1}</td>
+        <td class="wrap"><b>${esc(p.name)}</b><div class="muted">${esc(p.category||'')}</div></td>
+        <td>${p.phone?`<a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`:''}</td>
+        <td>${p.whatsapp_number?`<a href="https://wa.me/${esc(p.whatsapp_number)}" target="_blank">${esc(p.whatsapp_number)}</a> <span class="wa ${p.whatsapp_source==='assumed_mobile'?'assumed':''}">${esc(p.whatsapp_source)}</span>`:'<span class="muted">—</span>'}</td>
+        <td>${p.email?`<a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`:''}${(p.emails||[]).length>1?`<div class="muted">+${p.emails.length-1} more</div>`:''}</td>
+        <td>${p.website?`<a href="${esc(p.website)}" target="_blank">${esc(host(p.website))}</a>`:''}</td>
+        <td class="soc">
+          ${p.instagram?`<a href="${esc(p.instagram)}" target="_blank" title="${esc(p.instagram)}">IG</a>`:''}
+          ${p.facebook?`<a href="${esc(p.facebook)}" target="_blank" title="${esc(p.facebook)}">FB</a>`:''}
+          ${p.linkedin?`<a href="${esc(p.linkedin)}" target="_blank" title="${esc(p.linkedin)}">LI</a>`:''}
+          ${p.twitter_x?`<a href="${esc(p.twitter_x)}" target="_blank" title="${esc(p.twitter_x)}">X</a>`:''}
+          ${p.youtube?`<a href="${esc(p.youtube)}" target="_blank" title="${esc(p.youtube)}">YT</a>`:''}
+          ${p.tiktok?`<a href="${esc(p.tiktok)}" target="_blank" title="${esc(p.tiktok)}">TT</a>`:''}
+        </td>
+        ${j.do_research?`<td class="wrap muted">${esc(p.summary||'')}</td><td class="muted">${esc(p.owner||'')}</td><td class="wrap muted">${(p.team||[]).map(t=>esc(t.name)+(t.role?` (${esc(t.role)})`:'')+(t.phone?` · ${esc(t.phone)}`:'')+(t.email?` · ${esc(t.email)}`:'')).join('<br>')}</td>`:''}
+        <td class="wrap muted">${esc(p.address||'')}</td>
+        <td class="muted">${esc(p.country||'')}</td>
+        ${j.radius_km?`<td class="muted">${p.distance_km!=null?p.distance_km+' km':''}</td>`:''}
+        <td>${p.rating??''}${p.reviews_count?` <span class="muted">(${p.reviews_count})</span>`:''}</td>
+        <td class="muted">${esc(p.enrich_status)}</td>
+      </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">${j.phase==='waiting'?'Waiting for its turn…':j.phase==='queued'?'Waiting for the worker…':(j.running?'Collecting places…':'No leads')}</div>`}
+    </div>`;
+  const tbl = document.querySelector('#detail .tbl');
+  if (tbl) { tbl.scrollTop = tblTop; tbl.scrollLeft = tblLeft; }
+  if (active) { const f = document.getElementById('flt'); if (f) { f.focus(); try { f.setSelectionRange(caret, caret); } catch {} } }
+}
+
+window.stopJob = async id => { await api(`/api/jobs/${id}/stop`, {method:'POST'}); refresh(); };
+window.reenrich = async id => { try { await api(`/api/jobs/${id}/reenrich`, {method:'POST'}); } catch (e) { alert(e.message); } refresh(); };
+window.deleteJob = async id => { if (!confirm('Delete this job and its leads?')) return; try { await api(`/api/jobs/${id}`, {method:'DELETE'}); } catch (e) { alert(e.message); } currentId = null; places = []; refresh(); };
+
+// ── map picker ───────────────────────────────────────────────────────────────
+let map = null, marker = null, circle = null, mapCenter = null, mapName = '';
+const approxTiles = r => { const t = Math.min(r, 2), step = t * 1.6, n = Math.ceil(r / step); let c = 0; for (let i=-n;i<=n;i++) for (let j=-n;j<=n;j++) if (Math.hypot(i*step, j*step) <= r + t/2) c++; return Math.min(c, 150); };
+
+function openMap() {
+  $('#mapmodal').classList.add('open');
+  const r = +$('#radius').value || 5;
+  $('#mrad').value = Math.min(50, r); $('#mradn').value = r;
+  if (!map) {
+    map = L.map('map', { zoomControl: true }).setView([20.59, 78.96], 5);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+    map.on('click', e => setCenter(e.latlng.lat, e.latlng.lng, null, true));
+    $('#geoq').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); geoSearch(); } });
+  }
+  setTimeout(() => map.invalidateSize(), 60);
+  if (pin) { setCenter(pin.lat, pin.lng, pin.name); map.setView([pin.lat, pin.lng], 13); }
+  else if ($('#location').value.trim()) { $('#geoq').value = $('#location').value.trim(); geoSearch(true); }
+}
+function closeMap() { $('#mapmodal').classList.remove('open'); $('#georesults').classList.remove('open'); }
+
+async function geoSearch(auto) {
+  const q = $('#geoq').value.trim(); if (!q) return;
+  const box = $('#georesults'); box.innerHTML = '<div class="muted">searching…</div>'; box.classList.add('open');
+  try {
+    const res = await api('/api/geocode?q=' + encodeURIComponent(q));
+    if (!res.length) { box.innerHTML = '<div class="muted">no results</div>'; return; }
+    if (auto && res.length) { pickResult(res[0]); return; }
+    box.innerHTML = res.map(r => `<div onclick='pickResult(${JSON.stringify(r).replace(/'/g,"&#39;")})'><b>${esc(r.short)}</b><div class="muted">${esc(r.name)}</div></div>`).join('');
+  } catch (e) { box.innerHTML = `<div class="muted">error: ${esc(e.message)}</div>`; }
+}
+window.pickResult = r => {
+  $('#georesults').classList.remove('open');
+  setCenter(r.lat, r.lng, r.short);
+  if (r.bbox && r.bbox.length === 4) map.fitBounds([[r.bbox[0], r.bbox[2]], [r.bbox[1], r.bbox[3]]], { maxZoom: 14 });
+  else map.setView([r.lat, r.lng], 13);
+  fitCircle();
+};
+function setCenter(lat, lng, name, reverse) {
+  mapCenter = { lat, lng }; mapName = name || mapName || '';
+  if (!marker) { marker = L.marker([lat, lng], { draggable: true }).addTo(map); marker.on('dragend', () => { const p = marker.getLatLng(); setCenter(p.lat, p.lng, null, true); }); }
+  else marker.setLatLng([lat, lng]);
+  drawCircle(); updateInfo(); $('#useloc').disabled = false;
+  if (reverse) { api(`/api/revgeocode?lat=${lat}&lng=${lng}`).then(r => { mapName = r.short; updateInfo(); }).catch(()=>{}); }
+}
+function drawCircle() {
+  const r = +$('#mradn').value || 5;
+  if (!mapCenter) return;
+  if (!circle) circle = L.circle([mapCenter.lat, mapCenter.lng], { radius: r*1000, color:'#2563eb', weight:2, fillOpacity:.12 }).addTo(map);
+  else { circle.setLatLng([mapCenter.lat, mapCenter.lng]); circle.setRadius(r*1000); }
+}
+function fitCircle() { if (circle) map.fitBounds(circle.getBounds(), { padding:[20,20] }); }
+window.setRadiusFromSlider = (v, fromNumber) => { v = +v; if (fromNumber) $('#mrad').value = Math.min(50, v); else $('#mradn').value = v; drawCircle(); updateInfo(); fitCircle(); };
+function updateInfo() {
+  const r = +$('#mradn').value || 5;
+  const area = (Math.PI * r * r).toFixed(r < 3 ? 1 : 0);
+  const tiles = approxTiles(r);
+  $('#mapinfo').innerHTML = mapCenter
+    ? `<b>${esc(mapName || 'pinned point')}</b> · ${mapCenter.lat.toFixed(4)}, ${mapCenter.lng.toFixed(4)} · circle ≈ ${area} km² · ${tiles > 1 ? tiles + ' search tiles when unlimited / >110 places' : 'single search'}`
+    : 'No centre yet — search or click the map.';
+}
+function showPin() { $('#pininfo').style.display = 'flex'; $('#pintext').textContent = `📍 pinned ${pin.lat.toFixed(4)}, ${pin.lng.toFixed(4)}${$('#radius').value?` · ${$('#radius').value} km`:''}`; }
+window.useLocation = () => {
+  if (!mapCenter) return;
+  pin = { lat: mapCenter.lat, lng: mapCenter.lng, name: mapName };
+  if (mapName) $('#location').value = mapName;
+  $('#radius').value = +$('#mradn').value;
+  showPin();
+  closeMap();
+};
+window.clearPin = () => { pin = null; $('#pininfo').style.display = 'none'; };
+document.getElementById('mapbtn').addEventListener('click', openMap);
+document.getElementById('location').addEventListener('input', () => { if (pin) clearPin(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeMap(); closeJobDialog(); } });
+
+function applyCloudMode() {
+  document.body.classList.add('cloud');
+  const nb = document.querySelector('.btn-new');
+  if (nb) { nb.textContent = 'ⓘ Scraper runs locally'; nb.onclick = () => alert('The scraper runs on your own computer, not in the cloud.\n\nRun web-scraper on your PC — its results appear here automatically (they sync to Supabase).\n\nThis page is a shared read-only viewer of everyone\'s leads.'); }
+  const st = $('#tab-btn-scraper'); if (st) st.style.display = 'none';
+  const fc = $('#fromcloud'); if (fc) { fc.checked = true; fc.closest('label').style.display = 'none'; }
+  showTab('leads', true);
+}
+
+setupTagInput();
+// restore tab / dialog / leads filters from the URL hash
+(() => {
+  const raw = location.hash.replace('#', '');
+  if (raw === 'new') { openJobDialog(); return; }
+  if (raw.startsWith('draft/')) { openDraftById(+raw.split('/')[1]); return; }
+  const { tab, cloud } = readHash();
+  if (tab === 'leads') { showTab('leads', true); setTimeout(() => { const c = $('#fromcloud'); if (c && cloud) c.checked = true; loadLeads(true); }, 0); }
+})();
+async function openDraftById(id) {
+  try { const j = await api(`/api/jobs/${id}`); openJobDialog(j); }
+  catch { openJobDialog(); }
+}
+refresh();
+</script>
+</body>
+</html>
