@@ -126,6 +126,7 @@
   <nav class="tabs">
     <button class="tab active" id="tab-btn-scraper" onclick="showTab('scraper')">Scraper</button>
     <button class="tab" id="tab-btn-leads" onclick="showTab('leads')">All leads</button>
+    <button class="tab" id="tab-btn-settings" onclick="showTab('settings')">Settings</button>
     <button class="tab" id="tab-btn-admin" style="display:none" onclick="showTab('admin')">Admin</button>
   </nav>
   <span class="sub" style="margin-left:auto"><span id="whoami-email"></span> <span id="whoami-credits"></span> · <span id="health">…</span>
@@ -163,6 +164,35 @@
       <div class="msg" id="supa-status" style="margin:4px 0 4px"></div>
       <div class="toolbar" id="leads-filters" style="gap:6px 12px"></div>
       <div class="tbl" id="leads-tbl"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+</main>
+
+<!-- ── settings tab ───────────────────────────────────────────────────────── -->
+<main id="tab-settings" style="display:none;grid-template-columns:1fr">
+  <section>
+    <div class="card" style="max-width:760px">
+      <h2>Webhook</h2>
+      <p class="muted" style="font-size:12.5px">Every verified lead is POSTed here as JSON with an <code>X-Signature</code> HMAC-SHA256 header.</p>
+      <div style="display:flex;gap:8px"><input id="set-webhook" style="flex:1" placeholder="https://your-endpoint.example/hook">
+        <button class="btn-primary" onclick="saveSettings()">Save</button>
+        <button class="btn-ghost" onclick="testWebhook()">Send test</button></div>
+      <div class="muted" style="margin-top:6px;font-size:12.5px">Secret: <code id="set-secret"></code>
+        <a style="cursor:pointer;color:#2563eb" onclick="regenSecret()">regenerate</a></div>
+      <h3 style="margin-top:14px">Recent deliveries</h3><div class="tbl" id="deliveries-tbl"></div>
+      <h2 style="margin-top:20px">AI keys (yours, used server-side only)</h2>
+      <div style="display:flex;gap:8px;flex-direction:column;max-width:520px">
+        <input id="set-gemini" placeholder="Gemini API key">
+        <input id="set-openai" placeholder="OpenAI API key">
+        <div><button class="btn-primary" onclick="saveKeys()">Save keys</button> <span class="muted" id="keys-state" style="font-size:12.5px"></span></div>
+      </div>
+      <h2 style="margin-top:20px">Agent tokens</h2>
+      <p class="muted" style="font-size:12.5px">Run the scraper on your PC: <code>python -m webscraper agent --token &lt;token&gt;</code></p>
+      <button class="btn-primary" onclick="newToken()">New token</button>
+      <div class="tbl" id="tokens-tbl" style="margin-top:8px"></div>
+      <h2 style="margin-top:20px">Password</h2>
+      <div style="display:flex;gap:8px"><input id="set-pass" type="password" placeholder="new password" minlength="8">
+        <button class="btn-primary" onclick="changePass()">Change</button></div>
     </div>
   </section>
 </main>
@@ -441,13 +471,49 @@ window.showTab = (t, skipHash) => {
   $('#tab-scraper').style.display = t === 'scraper' ? 'grid' : 'none';
   $('#tab-leads').style.display = t === 'leads' ? 'grid' : 'none';
   $('#tab-admin').style.display = t === 'admin' ? 'grid' : 'none';
+  $('#tab-settings').style.display = t === 'settings' ? 'grid' : 'none';
   $('#tab-btn-scraper').classList.toggle('active', t === 'scraper');
   $('#tab-btn-leads').classList.toggle('active', t === 'leads');
   $('#tab-btn-admin').classList.toggle('active', t === 'admin');
+  $('#tab-btn-settings').classList.toggle('active', t === 'settings');
   if (!skipHash) writeHash(t);
   if (t === 'leads' && leadsRows === null) loadLeads();
   if (t === 'admin') loadMembers();
+  if (t === 'settings') loadSettings();
 };
+
+// ── settings ─────────────────────────────────────────────────────────────────
+async function loadSettings() {
+  const s = await authApi('/api/settings');
+  $('#set-webhook').value = s.webhook_url || '';
+  $('#set-secret').textContent = s.webhook_secret || '';
+  $('#keys-state').textContent = ['Gemini: ' + (s.gemini_key_masked || 'not set'),
+                                  'OpenAI: ' + (s.openai_key_masked || 'not set')].join(' · ');
+  const toks = await authApi('/api/agent-tokens');
+  $('#tokens-tbl').innerHTML = toks.length ? '<table><thead><tr><th>label</th><th>last seen</th><th>status</th><th></th></tr></thead><tbody>' +
+    toks.map(t => `<tr><td>${t.label||('#'+t.id)}</td><td>${t.last_seen_at||'never'}</td><td>${t.revoked?'revoked':'active'}</td>
+      <td>${t.revoked?'':`<a style="cursor:pointer;color:#2563eb" onclick="revokeToken(${t.id})">revoke</a>`}</td></tr>`).join('') +
+    '</tbody></table>' : '<div class="empty">no tokens yet</div>';
+  const dels = await authApi('/api/webhooks/deliveries').catch(()=>[]);
+  $('#deliveries-tbl').innerHTML = dels.length ? '<table><thead><tr><th>lead</th><th>status</th><th>attempts</th><th>error</th></tr></thead><tbody>' +
+    dels.map(d => `<tr><td>${d.lead_place_key}</td><td>${d.status}</td><td>${d.attempts}</td><td>${d.last_error||''}</td></tr>`).join('') +
+    '</tbody></table>' : '<div class="empty">no deliveries yet</div>';
+}
+window.saveSettings = async () => { await authApi('/api/settings', {method:'PUT', body: JSON.stringify({webhook_url: $('#set-webhook').value})}); loadSettings(); };
+window.saveKeys = async () => {
+  const b = {}; if ($('#set-gemini').value) b.gemini_key = $('#set-gemini').value;
+  if ($('#set-openai').value) b.openai_key = $('#set-openai').value;
+  await authApi('/api/settings', {method:'PUT', body: JSON.stringify(b)});
+  $('#set-gemini').value = ''; $('#set-openai').value = ''; loadSettings();
+};
+window.regenSecret = async () => { await authApi('/api/settings/webhook-secret', {method:'POST'}); loadSettings(); };
+window.newToken = async () => {
+  const t = await authApi('/api/agent-tokens', {method:'POST', body: JSON.stringify({label: prompt('Token label (e.g. office PC):')||null})});
+  prompt('Copy this token now — it is shown only once:', t.token); loadSettings();
+};
+window.revokeToken = async id => { await authApi(`/api/agent-tokens/${id}/revoke`, {method:'POST'}); loadSettings(); };
+window.changePass = async () => { await authApi('/api/me/password', {method:'POST', body: JSON.stringify({password: $('#set-pass').value})}); $('#set-pass').value=''; alert('changed'); };
+window.testWebhook = async () => { try { const r = await authApi('/api/webhooks/test', {method:'POST'}); alert(r.ok ? 'delivered ✓' : ('failed: ' + (r.error||''))); } catch (e) { alert(e.message); } };
 
 // ── admin: members ───────────────────────────────────────────────────────────
 async function loadMembers() {

@@ -15,3 +15,9 @@ def test_mask_long_shows_last4():
 
 def test_hash_token_is_sha256_hex():
     assert hash_token("tok") == hashlib.sha256(b"tok").hexdigest()
+
+
+def test_new_secret_len_and_uniqueness():
+    from _accounts import new_secret
+    a, b = new_secret(), new_secret()
+    assert a != b and len(a) >= 32
