@@ -343,6 +343,12 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                     quota_hit = True
                     break            # out of credits — retried on a later tick after top-up
             if not quota_hit:
+                # Send the real failure text, not the phase name. This used to pass
+                # row["phase"], so every failure reached the CRM as the literal string
+                # "failed" and the only way to find out what actually broke was to open
+                # data/agent.log on this PC. The Worker already stores the exception in
+                # jobs.message; fall back to the phase only when there is none.
+                failure = (row["message"] or "").strip() or f"failed during {row['phase']}"
                 cloud.done(cid, "done" if row["phase"] == "done" else "error",
-                           None if row["phase"] == "done" else row["phase"])
+                           None if row["phase"] == "done" else failure[:300])
                 store.update_job(row["id"], note="synced")

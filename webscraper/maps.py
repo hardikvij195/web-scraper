@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import quote_plus
 
-from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
+from playwright.sync_api import Error as PWError, Page, TimeoutError as PWTimeout, sync_playwright
 
 from webscraper.config import settings
 from webscraper.extractors import (
@@ -423,12 +423,50 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
         )
         if settings.maps_proxy:
             launch_kwargs["proxy"] = {"server": settings.maps_proxy}
-        ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
-        # images/fonts/media add nothing we read — skipping them cuts bandwidth ~80%
-        ctx.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),
-                  lambda route: route.abort())
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.set_default_timeout(20000)
+
+        def _open():
+            c = pw.chromium.launch_persistent_context(**launch_kwargs)
+            # images/fonts/media add nothing we read — skipping them cuts bandwidth ~80%
+            c.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),
+                    lambda route: route.abort())
+            pg = c.pages[0] if c.pages else c.new_page()
+            pg.set_default_timeout(20000)
+            return c, pg
+
+        ctx, page = _open()
+        # A headed run shares a desktop with a human, and Chrome also dies on its own
+        # (OOM, a crashed renderer, a Windows update). Losing the browser used to abort
+        # the whole job and throw away every place already collected - job #3 died exactly
+        # that way, mid-feed, with TargetClosedError. Relaunching costs one profile reload;
+        # the alternative is losing the run. Capped so a browser that cannot start at all
+        # still fails fast instead of looping.
+        relaunches = {"n": 0}
+        MAX_RELAUNCH = 3
+
+        def _recover(where: str) -> bool:
+            nonlocal ctx, page
+            if relaunches["n"] >= MAX_RELAUNCH:
+                return False
+            relaunches["n"] += 1
+            log.warning("browser died during %s — relaunching (%d/%d)",
+                        where, relaunches["n"], MAX_RELAUNCH)
+            emit("browser_restart", {"where": where, "attempt": relaunches["n"]})
+            try:
+                ctx.close()
+            except Exception:  # noqa: BLE001 — already gone; closing is best effort
+                pass
+            ctx, page = _open()
+            return True
+
+        def _is_closed(e: Exception) -> bool:
+            # Playwright has no stable exception class for this across versions, and the
+            # same condition surfaces as several messages depending on which call noticed.
+            m = str(e).lower()
+            return ("target page, context or browser has been closed" in m
+                    or "browser has been closed" in m
+                    or "target closed" in m
+                    or "connection closed" in m)
+
         try:
             zoom: float | None = None
             if radius_km and (center or location):
@@ -481,13 +519,25 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                                           "tiles": len(steps), "reason": "enough"})
                     break
                 wait_if_paused()
-                page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
-                          wait_until="domcontentloaded", timeout=60000)
-                _accept_consent(page)
-                time.sleep(random.uniform(2, 4))
                 want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
-                cards = collect_place_links(page, want,
-                                            on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
+                try:
+                    page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
+                              wait_until="domcontentloaded", timeout=60000)
+                    _accept_consent(page)
+                    time.sleep(random.uniform(2, 4))
+                    cards = collect_place_links(page, want,
+                                                on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
+                except PWError as e:
+                    if not _is_closed(e) or not _recover(f"tile {s_i}/{len(steps)}"):
+                        raise
+                    # Retry this one tile on the fresh browser. Everything already in
+                    # `merged` survives, so a mid-run crash costs one tile, not the job.
+                    page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
+                              wait_until="domcontentloaded", timeout=60000)
+                    _accept_consent(page)
+                    time.sleep(random.uniform(2, 4))
+                    cards = collect_place_links(page, want,
+                                                on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
                 for card in cards:
                     if card.key in merged:
                         continue
@@ -533,6 +583,13 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                         return saved
                 except PWTimeout:
                     emit("skip", {"href": href, "reason": "timeout"})
+                    continue
+                except PWError as e:
+                    # Same recovery as the tile loop: a dead browser costs this one place,
+                    # not the remaining list and not the places already saved.
+                    if not _is_closed(e) or not _recover(f"place {i}/{len(links)}"):
+                        raise
+                    emit("skip", {"href": href, "reason": "browser restarted"})
                     continue
                 # feed card values fill whatever the panel didn't expose
                 if place.name is None and card.name:
