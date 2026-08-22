@@ -163,7 +163,9 @@ def account_status(name: str) -> str:
 def verify_places(
     store: Store,
     rows: list[dict[str, Any]],
-    on_progress: Callable[[str, str], None] | None = None,
+    # (place_key, status, resolved_number|None) - the third arg has been passed since
+    # 4e00a3a; the annotation lagged behind it, which is how a 2-arg callback slipped in.
+    on_progress: Callable[[str, str, str | None], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     job_id: int | None = None,
 ) -> dict[str, int]:

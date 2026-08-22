@@ -396,7 +396,11 @@ class Worker(threading.Thread):
                                      message=f"checking {len(targets)} numbers on WhatsApp (paced)…")
                     vdone = {"n": 0}
 
-                    def on_wa(_pk: str, _s: str) -> None:
+                    # Third parameter is the resolved WhatsApp number. wa_verify has
+                    # passed it since 4e00a3a but this callback never accepted it, so the
+                    # first checked number raised TypeError and killed the whole job -
+                    # WhatsApp verification had never once completed.
+                    def on_wa(_pk: str, _s: str, _num: str | None = None) -> None:
                         vdone["n"] += 1
                         store.update_job(job_id, wa_verify_done=vdone["n"])
 
