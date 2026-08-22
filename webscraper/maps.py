@@ -392,12 +392,19 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                radius_km: float | None = None,
                wait_if_paused: Callable[[], None] | None = None,
                center: tuple[float, float] | None = None,
-               known_keys: set[str] | None = None) -> int:
+               known_keys: set[str] | None = None,
+               collect_until: float | None = None,
+               collect_target: int | None = None) -> int:
     """Scrape up to `max_places` (0 = unlimited) for (query, location) into `store`. Returns count saved.
     `should_stop` is polled between places; when it returns True the job is marked stopped.
     `radius_km` (needs `location`) centres the search there, tiles the circle when more than one
     Maps page of results is wanted, and skips farther places.
-    `wait_if_paused` is called between places and may block (run-time window)."""
+    `wait_if_paused` is called between places and may block (run-time window).
+    `collect_until` (time.monotonic deadline) caps the link-collection phase: a wide radius
+    tiles into thousands of sub-searches, and without a cap the job spends its whole time
+    budget collecting links and scrapes nothing at all.
+    `collect_target` stops collection once there are more links than the remaining time could
+    ever visit — past that point every extra tile is time stolen from actual scraping."""
     headless = settings.headless if headless is None else headless
     country = country or settings.default_country
     emit = on_event or (lambda kind, data: None)
@@ -450,9 +457,28 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
             skipped_far = skipped_known = 0
             # A job can carry several comma-separated keywords ("dentist, orthodontist"); each is
             # its own Maps search, all merged into one deduped lead set.
-            steps = [(qy, c) for qy in queries for c in centers]
+            # Centre-major, NOT query-major: a 50 km radius tiles into ~150 cells and a
+            # 52-keyword job is 7,800 searches, far more than any run finishes. Ordered by
+            # query it would collect every tile of keyword 1 and never reach keyword 2, so a
+            # truncated run returned one category. This way each centre sweeps all keywords,
+            # and cutting the phase short still leaves every keyword represented.
+            steps = [(qy, c) for c in centers for qy in queries]
+            budget_hit = False
             for s_i, (qy, c) in enumerate(steps, 1):
                 if should_stop() or len(merged) >= limit:
+                    break
+                # Stop collecting while there is still time left to actually scrape the
+                # places found. Without this the tile loop eats the entire time limit and
+                # the job ends with links but zero leads.
+                if collect_until is not None and time.monotonic() >= collect_until:
+                    budget_hit = True
+                    emit("links_budget", {"count": len(merged), "tile": s_i,
+                                          "tiles": len(steps), "reason": "time"})
+                    break
+                if collect_target is not None and len(merged) >= collect_target:
+                    budget_hit = True
+                    emit("links_budget", {"count": len(merged), "tile": s_i,
+                                          "tiles": len(steps), "reason": "enough"})
                     break
                 wait_if_paused()
                 page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
@@ -479,7 +505,8 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                 if len(steps) > 1:
                     time.sleep(random.uniform(1.5, 3.5))
             links = list(merged.values())[:limit]
-            emit("links_done", {"count": len(links), "skipped_far": skipped_far, "skipped_known": skipped_known})
+            emit("links_done", {"count": len(links), "skipped_far": skipped_far,
+                                "skipped_known": skipped_known, "budget_hit": budget_hit})
             known = store.known_place_keys(job_id)
             for i, card in enumerate(links, 1):
                 if saved >= limit:

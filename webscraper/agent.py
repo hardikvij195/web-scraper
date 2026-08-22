@@ -170,9 +170,12 @@ def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> 
     except httpx.HTTPError as e:
         log.warning("config fetch failed (continuing with local .env): %s", e)
     log.info("agent up (%s) — polling %s every %ss", kind, base, poll_sec)
+    # local job id -> highest places.rowid already streamed up. In memory only: after a
+    # restart it starts at 0 and re-sends that job's rows once, which upsert absorbs.
+    synced_upto: dict[int, int] = {}
     while True:
         try:
-            _tick(cloud, store, kind)
+            _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:
             log.warning("cloud unreachable: %s", e)
         time.sleep(poll_sec)
@@ -236,7 +239,8 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     log.info("re-verify #%s: %d checked", jid, len(collected))
 
 
-def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas") -> None:
+def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
+          synced_upto: dict[int, int] | None = None) -> None:
     mirrored = {r["cloud_id"] for r in store.conn.execute(
         "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=?", (kind,)).fetchall()}
     for cj in cloud.jobs():
@@ -279,6 +283,21 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas") -> None:
             "AND (note IS NULL OR note <> 'synced')", (kind,)).fetchall():
         cid = row["cloud_id"]
         if row["phase"] in ("scraping", "enriching", "queued", "waiting", "researching", "verifying_wa"):
+            # Stream leads up AS THEY LAND. Results used to be uploaded only once the job
+            # reached a terminal phase, so a job stopped by the user or by its time limit
+            # showed 0 leads in the CRM even though places had been scraped. Rows are
+            # upserted on (job_id, place_key), so the full sync at the end still overwrites
+            # these with their enriched/researched versions.
+            if synced_upto is not None:
+                fresh, top = store.places_after(row["id"], synced_upto.get(row["id"], 0))
+                if fresh:
+                    try:
+                        for i in range(0, len(fresh), 200):
+                            cloud.sync(cid, [_flat(f) for f in fresh[i:i + 200]])
+                        synced_upto[row["id"]] = top
+                        log.info("streamed %d new lead(s) to job #%s", len(fresh), cid)
+                    except httpx.HTTPError as e:
+                        log.warning("stream to #%s failed (will retry next tick): %s", cid, e)
             cancelled = cloud.progress(cid, row["phase"], _local_progress(row))
             if cancelled:
                 store.update_job(row["id"], stop_requested=1, note="synced")

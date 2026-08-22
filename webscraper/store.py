@@ -347,6 +347,25 @@ class Store:
         )
         self.conn.commit()
 
+    def places_after(self, job_id: int, after_rowid: int) -> tuple[list[dict[str, Any]], int]:
+        """Places saved since `after_rowid`, plus the new watermark.
+
+        Lets the agent stream leads to the CRM while a job is still running, so a job
+        that is stopped or hits its time limit has already delivered what it found
+        instead of surfacing zero. `places` has no surrogate key, so rowid is the
+        watermark; rows only ever get appended during scraping.
+        """
+        rows = self.conn.execute(
+            "SELECT rowid AS rid, * FROM places WHERE job_id=? AND rowid>? ORDER BY rowid",
+            (job_id, after_rowid)).fetchall()
+        out: list[dict[str, Any]] = []
+        top = after_rowid
+        for r in rows:
+            d = dict(r)
+            top = max(top, int(d.pop("rid")))
+            out.append(d)
+        return out, top
+
     def places(self, job_id: int | None = None, enrich_status: str | None = None) -> list[dict[str, Any]]:
         q = "SELECT * FROM places WHERE 1=1"
         args: list[Any] = []

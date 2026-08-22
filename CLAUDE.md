@@ -111,3 +111,10 @@ data/            gitignored: leads.db, browser-profile/, exports/
 2. Dockerfile + compose for the VPS (`cpus: 1`, `mem_limit: 2g`, off-peak cron or queue).
 3. Optional: Hunter/Apollo fallback for email when the crawl finds none; Justdial/IndiaMART
    sources; JS-render fallback for `thin` sites.
+
+## Open work
+
+Tracked in [`tasks.md`](./tasks.md) — **W1** push this repo to GitHub (no remote yet),
+**W2** split jobs into Maps-discovery then enrichment against one time budget, **W3** stream
+each lead to the CRM as it is found, **W4** emit an ETA for every phase. W2-W4 are the agent
+half of **T136** in `../hvt-ai-crm-live/tasks.md`.

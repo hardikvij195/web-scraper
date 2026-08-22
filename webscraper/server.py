@@ -148,6 +148,10 @@ class Worker(threading.Thread):
             # Time limit: deadline is computed from the moment the job actually starts.
             max_minutes = job["max_minutes"]
             deadline = (time.monotonic() + max_minutes * 60) if max_minutes else None
+            # Link collection gets at most 40% of the budget. A wide radius tiles into
+            # thousands of sub-searches, so without this split the collection phase burns
+            # the whole limit and the job finishes with links found but zero leads scraped.
+            collect_until = (time.monotonic() + max_minutes * 60 * 0.4) if max_minutes else None
             time_up = {"flag": False}
 
             def should_stop(s=store, j=job_id) -> bool:
@@ -196,6 +200,14 @@ class Worker(threading.Thread):
                 store.update_job(job_id, phase="scraping", status="running", message="opening Google Maps…",
                                  started_at=t0, scrape_started_at=t0)
                 pacing = Pacing(delay_sec=float(job["delay_sec"] or settings.delay_sec))
+                # How many places the remaining budget could realistically visit. Collecting
+                # links beyond that is pure loss - it is time taken away from scraping the
+                # ones already found. +30% headroom for links that turn out to be dupes or
+                # fall outside the radius on their exact coordinates.
+                collect_target = None
+                if max_minutes:
+                    scrape_seconds = max_minutes * 60 * 0.6
+                    collect_target = max(50, int(scrape_seconds / max(pacing.delay_sec, 1.0) * 1.3))
 
                 # Multi-location: a job can carry several {location, radius_km, lat, lng} areas.
                 # Each area is scraped in turn; counters accumulate; the (job_id, place_key) PK
@@ -237,6 +249,12 @@ class Worker(threading.Thread):
                         store.update_job(job_id, message=f"{pfx}Google captcha — backing off {data['backoff_sec']:.0f}s")
                     elif kind == "skip":
                         store.update_job(job_id, message=f"{pfx}skipped one ({data['reason']})")
+                    elif kind == "links_budget":
+                        why = ("collection time up" if data.get("reason") == "time"
+                               else "enough places for the time left")
+                        store.update_job(job_id, message=(
+                            f"{pfx}{why} at tile {data['tile']}/{data['tiles']} — "
+                            f"scraping the {data['count']} places found so far"))
                     elif kind == "abort":
                         store.update_job(job_id, message=f"{pfx}{data['reason']}")
 
@@ -250,7 +268,8 @@ class Worker(threading.Thread):
                                headless=bool(job["headless"]), country=job["country"],
                                on_event=on_event, should_stop=should_stop,
                                radius_km=area["radius_km"], wait_if_paused=wait_if_paused,
-                               center=area["center"], known_keys=known)
+                               center=area["center"], known_keys=known,
+                               collect_until=collect_until, collect_target=collect_target)
                     cur = store.get_job(job_id)
                     agg["scraped_base"] = int(cur["scraped_count"] or 0)
                     agg["links_total"] = int(cur["links_found"] or 0)
