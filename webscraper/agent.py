@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from webscraper import eta
 from webscraper import server as srv
 from webscraper.store import Store
 
@@ -119,11 +120,24 @@ def _flat(r: dict) -> dict:
     return _row(r)
 
 
-def _local_progress(row: Any) -> dict:
-    return {"scraped_count": row["scraped_count"], "links_found": row["links_found"],
-            "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"],
-            "research_done": row["research_done"], "research_total": row["research_total"],
-            "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
+def _local_progress(row: Any, store: Store | None = None) -> dict:
+    """Counters the CRM's progress bars read, plus the phase/ETA block (T136 W2+W4).
+
+    The ETA is computed here rather than CRM-side on purpose: only this machine knows
+    how fast it actually scrapes, and `eta.summarise` reads the rolling per-phase
+    averages out of the local SQLite. The CRM just renders what it is told, and shows
+    "estimating…" wherever `eta_sec` is null.
+    """
+    out = {"scraped_count": row["scraped_count"], "links_found": row["links_found"],
+           "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"],
+           "research_done": row["research_done"], "research_total": row["research_total"],
+           "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
+    s = eta.summarise(row, store)
+    out.update({"phases": s["phases"], "eta_sec": s["eta_sec"],
+                "phase_eta_sec": s["phase_eta_sec"], "estimating": s["estimating"],
+                "budget_left_sec": (round(s["budget_left_sec"])
+                                    if s["budget_left_sec"] is not None else None)})
+    return out
 
 
 def _requeue_orphans(store: Store, kind: str) -> int:
@@ -200,7 +214,23 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     src_by_pk = {r["place_key"]: r.get("whatsapp_source") for r in targets}
     if already:
         log.info("re-verify #%s: skipping %d already-verified", jid, already)
-    cloud.progress(jid, "verifying_wa", {"wa_verify_total": total, "wa_verify_done": 0})
+
+    # A re-verify has exactly one phase, so it gets its ETA straight from the rolling
+    # WhatsApp-check rate instead of the full job model. `None` (no history yet) is
+    # passed through untouched — the CRM renders "estimating…" for it.
+    started = time.monotonic()
+
+    def wa_progress(done: int) -> dict:
+        per = ((time.monotonic() - started) / done) if done >= 3 else store.phase_rate("verifying_wa")
+        eta_sec = round(max(0, total - done) * per) if per else None
+        return {"wa_verify_total": total, "wa_verify_done": done,
+                "eta_sec": eta_sec, "phase_eta_sec": eta_sec, "estimating": eta_sec is None,
+                "phases": [{"key": "verifying_wa", "label": eta.LABELS["verifying_wa"],
+                            "unit": eta.UNITS["verifying_wa"], "status": "running",
+                            "done": done, "total": total, "eta_sec": eta_sec,
+                            "estimating": eta_sec is None, "rate_source": "live" if done >= 3 else "history"}]}
+
+    cloud.progress(jid, "verifying_wa", wa_progress(0))
     collected: dict[str, str] = {}
 
     def onp(pk: str, status: str, num: str | None = None) -> None:
@@ -216,8 +246,7 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
             upd["whatsapp_source"] = None
         # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
         try:
-            cloud.progress(jid, "verifying_wa",
-                           {"wa_verify_total": total, "wa_verify_done": len(collected)})
+            cloud.progress(jid, "verifying_wa", wa_progress(len(collected)))
             cloud.set_wa(jid, [upd])
         except httpx.HTTPError as e:
             log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
@@ -233,6 +262,8 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         log.exception("re-verify #%s failed", jid)
         cloud.done(jid, "error", str(e)[:200])
         return
+    # Feed the rolling average so the next verify run can be estimated (W4).
+    store.record_phase_rate(None, "verifying_wa", len(collected), time.monotonic() - started)
     if collected:
         cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()])
     cloud.done(jid, "done")
@@ -298,7 +329,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                         log.info("streamed %d new lead(s) to job #%s", len(fresh), cid)
                     except httpx.HTTPError as e:
                         log.warning("stream to #%s failed (will retry next tick): %s", cid, e)
-            cancelled = cloud.progress(cid, row["phase"], _local_progress(row))
+            cancelled = cloud.progress(cid, row["phase"], _local_progress(row, store))
             if cancelled:
                 store.update_job(row["id"], stop_requested=1, note="synced")
         elif row["phase"] in ("done", "stopped", "failed"):

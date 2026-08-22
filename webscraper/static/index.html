@@ -250,12 +250,42 @@ const timing = j => {
     const parts = [];
     if (j.elapsed_sec != null) parts.push(`running for <b>${fmtDur(j.elapsed_sec)}</b>`);
     if (j.eta_sec != null) parts.push(`ETA <b>~${fmtDur(j.eta_sec)}</b>`);
-    if (j.time_left_sec != null) parts.push(`time limit: stops scraping in <b>${fmtDur(j.time_left_sec)}</b>`);
+    else if (j.estimating) parts.push(`ETA <b>estimating…</b>`);
+    // The Maps cap does not end the job — it hands over to the research phases.
+    if (j.time_left_sec != null) parts.push(
+      j.phase === 'scraping' ? `Maps cap: switches to research in <b>${fmtDur(j.time_left_sec)}</b>`
+                             : `research budget: <b>${fmtDur(j.time_left_sec)}</b> left`);
     else if (j.max_minutes && j.phase === 'queued') parts.push(`limit <b>${j.max_minutes} min</b> from start`);
     return parts.join(' · ') || 'waiting…';
   }
   return j.elapsed_sec != null ? `ran for <b>${fmtDur(j.elapsed_sec)}</b>` : '';
 };
+
+// One bar per phase the job will actually run, each with its own ETA. Driven by the
+// server's `phases` block (webscraper/eta.py) so the local UI and the CRM agree.
+// `eta_sec: null` means the rolling average has no data for that phase yet — we say
+// "estimating…" rather than print a number we know is wrong.
+const PHASE_COLOR = { scraping:'#2563eb', enriching:'#059669', researching:'#7c3aed', verifying_wa:'#14b8a6' };
+function phaseBars(j, scrapePct, enrichPct) {
+  const ph = j.phases;
+  if (!Array.isArray(ph) || !ph.length) {
+    // Older server / job row with no phase block — keep the previous two bars.
+    return `<div class="row" style="margin-top:8px">
+      <div><div class="msg">Scraping Google Maps — ${j.scraped_count||0} / ${j.links_found||'?'} places</div><div class="progress"><div style="width:${scrapePct}%"></div></div></div>
+      <div><div class="msg">Enriching websites — ${j.enrich_done||0} / ${j.enrich_total||0}</div><div class="progress green"><div style="width:${enrichPct}%"></div></div></div>
+    </div>`;
+  }
+  const cls = ph.length >= 3 ? 'row3' : 'row';
+  return `<div class="${cls}" style="margin-top:8px">` + ph.map(p => {
+    const pct = p.total ? Math.min(100, Math.round(100 * (p.done||0) / p.total))
+                        : (p.status === 'done' ? 100 : 0);
+    const eta = p.status === 'done' ? 'done'
+      : p.estimating ? 'estimating…'
+      : p.eta_sec != null ? `~${fmtDur(p.eta_sec)} left` : '';
+    return `<div><div class="msg">${esc(p.label)} — ${p.done||0} / ${p.total ?? '?'} ${esc(p.unit)}${eta?` · <b>${eta}</b>`:''}</div>
+      <div class="progress"><div style="width:${pct}%;background:${PHASE_COLOR[p.key]||'#2563eb'};opacity:${p.status==='pending'?0.35:1}"></div></div></div>`;
+  }).join('') + `</div>`;
+}
 
 let jobs = [], currentId = null, places = [], lastJob = null, pollTimer = null;
 // filter state on window so inline on* handlers mutate the SAME binding the render reads
@@ -583,11 +613,7 @@ function renderDetail(j) {
       ${isPending(j) ? `<button class="btn-danger" onclick="stopJob(${j.id})">Stop</button>` : `<button class="btn-ghost" onclick="deleteJob(${j.id})">Delete</button>`}
     </div>
     <div class="msg" id="timing" style="margin-top:6px">${timing(j)}${j.message ? ' · ' + esc(j.message) : ''}&nbsp;</div>
-    <div class="row${j.do_research?'3':''}" style="margin-top:8px">
-      <div><div class="msg">Scraping Google Maps — ${j.scraped_count||0} / ${j.links_found||'?'} places</div><div class="progress"><div style="width:${scrapePct}%"></div></div></div>
-      <div><div class="msg">Enriching websites — ${j.enrich_done||0} / ${j.enrich_total||0}</div><div class="progress green"><div style="width:${enrichPct}%"></div></div></div>
-      ${j.do_research?`<div><div class="msg">AI research — ${j.research_done||0} / ${j.research_total||0}</div><div class="progress" style="--x:0"><div style="width:${j.research_total?Math.round(100*(j.research_done||0)/j.research_total):(j.phase==='done'?100:0)}%;background:#7c3aed"></div></div></div>`:''}
-    </div>
+    ${phaseBars(j, scrapePct, enrichPct)}
     <div class="kpis">
       <div class="kpi"><b>${places.length}</b><span>leads</span></div>
       <div class="kpi"><b>${cnt(p=>p.phone)}</b><span>phone</span></div>

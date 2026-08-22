@@ -23,11 +23,38 @@ import time
 from datetime import datetime, timezone
 
 from webscraper import __version__
+from webscraper import eta as eta_mod
 from webscraper.config import settings
 from webscraper.store import Store, now_iso
 
 log = logging.getLogger("webscraper.server")
 STATIC = Path(__file__).parent / "static"
+
+
+def _record_rate(store: Store, job_id: int, phase: str, units: Any, started_at: Any) -> None:
+    """Bank "phase X did N units in T seconds" so future jobs can be estimated (W4).
+
+    Called as each phase ends. Silent no-op when the phase never started or did nothing —
+    `Store.record_phase_rate` drops those rather than let them skew the average.
+    """
+    try:
+        start = datetime.fromisoformat(started_at) if started_at else None
+    except (TypeError, ValueError):
+        start = None
+    if not start:
+        return
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    store.record_phase_rate(job_id, phase, int(units or 0),
+                            (datetime.now(timezone.utc) - start).total_seconds())
+
+
+def _wall(seconds_from_now: float | None) -> str | None:
+    """`n` seconds from now as an ISO instant, for a deadline other processes must see."""
+    if not seconds_from_now:
+        return None
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds_from_now)).isoformat(timespec="seconds")
 
 app = FastAPI(title="web-scraper", version=__version__)
 
@@ -145,13 +172,31 @@ class Worker(threading.Thread):
                 continue
             job_id = int(job["id"])
             self.current_job = job_id
-            # Time limit: deadline is computed from the moment the job actually starts.
+            # ── time budget ─────────────────────────────────────────────────────────
+            # `max_minutes` is the GOOGLE MAPS cap, not the whole job (settings.
+            # maps_budget_frac defaults to 1.0): "search leads on google maps for 30 mins
+            # and then stop that and start research on leads website and linkedin, insta,
+            # fb, whatsapp numbers, summary". So the discovery half stops at the cap and
+            # the research half then runs on a budget of its own (enrich_budget_frac).
+            # Set MAPS_BUDGET_FRAC + ENRICH_BUDGET_FRAC to make the cap cover everything.
             max_minutes = job["max_minutes"]
-            deadline = (time.monotonic() + max_minutes * 60) if max_minutes else None
-            # Link collection gets at most 40% of the budget. A wide radius tiles into
+            bud = eta_mod.budgets(max_minutes)
+            t_now = time.monotonic()
+            deadline = (t_now + bud["maps_sec"]) if bud["maps_sec"] else None
+            enrich_deadline = (t_now + bud["maps_sec"] + bud["enrich_sec"]) \
+                if (bud["maps_sec"] and bud["enrich_sec"]) else None
+            # Link collection gets at most 40% of the MAPS budget. A wide radius tiles into
             # thousands of sub-searches, so without this split the collection phase burns
             # the whole limit and the job finishes with links found but zero leads scraped.
-            collect_until = (time.monotonic() + max_minutes * 60 * 0.4) if max_minutes else None
+            collect_until = (t_now + bud["collect_sec"]) if bud["collect_sec"] else None
+            # Deadlines go into the row as wall-clock too: the ETA is computed in the API
+            # handler and in the agent loop, neither of which can see this thread's
+            # monotonic clock.
+            store.update_job(
+                job_id,
+                maps_deadline_at=_wall(bud["maps_sec"]),
+                enrich_deadline_at=(_wall((bud["maps_sec"] or 0) + bud["enrich_sec"])
+                                    if bud["enrich_sec"] else None))
             time_up = {"flag": False}
 
             def should_stop(s=store, j=job_id) -> bool:
@@ -160,9 +205,19 @@ class Worker(threading.Thread):
                 if deadline is not None and time.monotonic() >= deadline:
                     if not time_up["flag"]:
                         time_up["flag"] = True
-                        s.update_job(j, message=f"time limit ({max_minutes} min) reached — keeping what was collected")
+                        s.update_job(j, message=(
+                            f"Maps time limit ({max_minutes} min) reached — moving on to "
+                            f"research on what was found"))
                     return True
                 return False
+
+            def budget_up(s=store, j=job_id) -> bool:
+                """Stop predicate for the phases AFTER Maps: the user's Stop button, or
+                the second budget running out. Deliberately does NOT include `deadline` —
+                hitting the Maps cap is what *starts* these phases."""
+                if s.stop_requested(j):
+                    return True
+                return enrich_deadline is not None and time.monotonic() >= enrich_deadline
 
             w_start, w_end = job["window_start"], job["window_end"]
 
@@ -192,6 +247,7 @@ class Worker(threading.Thread):
                         store.update_job(job_id, enrich_done=done["n"])
 
                     asyncio.run(enrich_places(store, rows, None, job["country"], on_progress2, should_stop))
+                    _record_rate(store, job_id, "enriching", done["n"], t0)
                     final = "stopped" if should_stop() else "done"
                     store.update_job(job_id, phase=final, status=final, message=None, reenrich_only=0)
                     store.finish_job(job_id, final)
@@ -205,8 +261,8 @@ class Worker(threading.Thread):
                 # ones already found. +30% headroom for links that turn out to be dupes or
                 # fall outside the radius on their exact coordinates.
                 collect_target = None
-                if max_minutes:
-                    scrape_seconds = max_minutes * 60 * 0.6
+                if bud["maps_sec"]:
+                    scrape_seconds = bud["maps_sec"] - (bud["collect_sec"] or 0)
                     collect_target = max(50, int(scrape_seconds / max(pacing.delay_sec, 1.0) * 1.3))
 
                 # Multi-location: a job can carry several {location, radius_km, lat, lng} areas.
@@ -274,18 +330,28 @@ class Worker(threading.Thread):
                     agg["scraped_base"] = int(cur["scraped_count"] or 0)
                     agg["links_total"] = int(cur["links_found"] or 0)
 
-                # A user Stop ends the job here; a time limit only ends the *scraping* — what was
-                # collected still gets enriched so the leads are complete.
+                # Record how fast Maps actually went, so the NEXT job's ETA is grounded in
+                # this machine's real pace instead of a constant (W4).
+                _after_maps = store.get_job(job_id)
+                _record_rate(store, job_id, "scraping", _after_maps["scraped_count"],
+                             _after_maps["scrape_started_at"])
+
+                # A user Stop ends the job here; the Maps time limit only ends the *discovery*
+                # phase — this is the hand-off the user asked for: "search leads on google maps
+                # for 30 mins and then stop that and start research on leads website and
+                # linkedin, insta, fb, whatsapp numbers, summary". The research phases below
+                # therefore run on `budget_up`, never on `should_stop`.
                 if store.stop_requested(job_id):
                     store.update_job(job_id, phase="stopped", status="stopped")
                     continue
                 user_stop = lambda s=store, j=job_id: s.stop_requested(j)  # noqa: E731
 
-                if job["do_enrich"]:
+                if job["do_enrich"] and not budget_up():
                     rows = store.places(job_id, "pending")
                     store.update_job(job_id, phase="enriching", enrich_total=len(rows), enrich_done=0,
                                      enrich_started_at=now_iso(),
-                                     message=f"crawling {len(rows)} websites for email / socials / WhatsApp…")
+                                     message=f"researching {len(rows)} businesses — website, LinkedIn, "
+                                             f"Instagram, Facebook, WhatsApp…")
                     done = {"n": 0}
 
                     def on_progress(_r: dict[str, Any], _status: str) -> None:
@@ -293,13 +359,18 @@ class Worker(threading.Thread):
                         if done["n"] % 3 == 0 or done["n"] == len(rows):
                             store.update_job(job_id, enrich_done=done["n"])
 
-                    asyncio.run(enrich_places(store, rows, None, job["country"], on_progress, user_stop))
+                    asyncio.run(enrich_places(store, rows, None, job["country"], on_progress, budget_up))
                     store.update_job(job_id, enrich_done=done["n"])
+                    _record_rate(store, job_id, "enriching", done["n"], store.get_job(job_id)["enrich_started_at"])
+                    if budget_up() and not user_stop() and done["n"] < len(rows):
+                        store.update_job(job_id, message=(
+                            f"research time budget used up — enriched {done['n']} of {len(rows)}"))
 
-                if job["do_research"] and not user_stop():
+                if job["do_research"] and not budget_up():
                     from webscraper.research import research_places
                     targets = [p for p in store.places(job_id) if p.get("website")]
                     store.update_job(job_id, phase="researching", research_total=len(targets), research_done=0,
+                                     research_started_at=now_iso(),
                                      message=f"AI research on {len(targets)} businesses (summary / owner / team)…")
                     rdone = {"n": 0}
 
@@ -308,18 +379,20 @@ class Worker(threading.Thread):
                         if rdone["n"] % 2 == 0 or rdone["n"] == len(targets):
                             store.update_job(job_id, research_done=rdone["n"])
 
-                    rc = asyncio.run(research_places(store, targets, 3, on_research, user_stop))
+                    rc = asyncio.run(research_places(store, targets, 3, on_research, budget_up))
                     store.update_job(job_id, research_done=rdone["n"])
+                    _record_rate(store, job_id, "researching", rdone["n"],
+                                 store.get_job(job_id)["research_started_at"])
                     if rc.get("skipped") == len(targets) and targets:
                         store.update_job(job_id, message="AI research skipped — set GEMINI_API_KEY in .env")
 
-                if job["do_wa_verify"] and not user_stop():
+                if job["do_wa_verify"] and not budget_up():
                     from webscraper import wa_verify
                     targets = [p for p in store.places(job_id)
                                if (p.get("phone") or p.get("whatsapp_number"))
                                and p.get("wa_verified") not in ("yes", "no")]
                     store.update_job(job_id, phase="verifying_wa", wa_verify_total=len(targets),
-                                     wa_verify_done=0,
+                                     wa_verify_done=0, wa_started_at=now_iso(),
                                      message=f"checking {len(targets)} numbers on WhatsApp (paced)…")
                     vdone = {"n": 0}
 
@@ -328,7 +401,9 @@ class Worker(threading.Thread):
                         store.update_job(job_id, wa_verify_done=vdone["n"])
 
                     try:
-                        res = wa_verify.verify_places(store, targets, on_wa, user_stop, job_id=job_id)
+                        res = wa_verify.verify_places(store, targets, on_wa, budget_up, job_id=job_id)
+                        _record_rate(store, job_id, "verifying_wa", vdone["n"],
+                                     store.get_job(job_id)["wa_started_at"])
                         note = (f"WhatsApp: {res['yes']} on WA, {res['no']} not, "
                                 f"{res['unknown']} unknown")
                         if res["capped"]:
@@ -400,10 +475,6 @@ class JobIn(BaseModel):
     locations: Optional[list[dict[str, Any]]] = None
 
 
-PLACE_OVERHEAD_SEC = 3.5      # page load + parse on top of the configured delay
-ENRICH_SEC_PER_SITE = 0.9     # observed average at concurrency 5
-
-
 def _ts(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -413,8 +484,12 @@ def _ts(s: str | None) -> datetime | None:
         return None
 
 
-def _job_dict(r: Any) -> dict[str, Any]:
-    """Row → dict plus derived `running`, `elapsed_sec`, `eta_sec` (None when unknown)."""
+def _job_dict(r: Any, store: Store | None = None) -> dict[str, Any]:
+    """Row → dict plus derived `running`, `elapsed_sec`, and the phase/ETA block.
+
+    `store` is optional only so callers that already closed theirs still work; without
+    it there is no rate history, so every ETA comes back as "estimating".
+    """
     d = dict(r)
     phase = d.get("phase")
     d["running"] = phase in ("scraping", "enriching", "researching", "verifying_wa")
@@ -424,35 +499,17 @@ def _job_dict(r: Any) -> dict[str, Any]:
     finished = _ts(d.get("finished_at")) if phase in ("done", "stopped", "failed") else None
     d["elapsed_sec"] = round(((finished or now) - started).total_seconds()) if started else None
 
-    eta: float | None = None
-    delay = float(d.get("delay_sec") or settings.delay_sec)
-    per_place_guess = delay + PLACE_OVERHEAD_SEC
-    links = int(d.get("links_found") or 0)
-    scraped = int(d.get("scraped_count") or 0)
-    max_places = int(d.get("max_places") or 0)
-    enrich_on = bool(d.get("do_enrich"))
-    if phase in ("queued", "waiting"):
-        guess = max_places or 120       # unlimited: assume one Maps page until links are counted
-        eta = guess * per_place_guess + (guess * ENRICH_SEC_PER_SITE if enrich_on else 0)
-    elif phase == "scraping":
-        total = links or max_places or 120
-        ss = _ts(d.get("scrape_started_at"))
-        per = ((now - ss).total_seconds() / scraped) if (ss and scraped >= 2) else per_place_guess
-        eta = max(0, total - scraped) * per + (total * ENRICH_SEC_PER_SITE if enrich_on else 0)
-    elif phase == "enriching":
-        total = int(d.get("enrich_total") or 0)
-        done = int(d.get("enrich_done") or 0)
-        es = _ts(d.get("enrich_started_at"))
-        per = ((now - es).total_seconds() / done) if (es and done >= 3) else ENRICH_SEC_PER_SITE
-        eta = max(0, total - done) * per
-    # time limit: seconds left until scraping stops (None when no limit / not started)
-    d["time_left_sec"] = None
-    if d.get("max_minutes") and started and phase in ("scraping",):
-        left = d["max_minutes"] * 60 - (now - started).total_seconds()
-        d["time_left_sec"] = max(0, round(left))
-        if eta is not None:
-            eta = min(eta, max(0, left) + (int(d.get("links_found") or 0) * ENRICH_SEC_PER_SITE if enrich_on else 0))
-    d["eta_sec"] = round(eta) if eta is not None else None
+    # Phases + ETA come from the shared model (webscraper/eta.py) so the local UI, the
+    # SaaS cloud and the CRM all render the same figures from the same rolling averages.
+    summary = eta_mod.summarise(d, store, now)
+    d["phases"] = summary["phases"]
+    d["eta_sec"] = summary["eta_sec"]
+    d["phase_eta_sec"] = summary["phase_eta_sec"]
+    d["estimating"] = summary["estimating"]
+    # Seconds left on the budget capping the CURRENT phase — for scraping that is the
+    # Maps cap the user set, after which discovery hands over to the research phases.
+    d["time_left_sec"] = (round(summary["budget_left_sec"])
+                          if summary["budget_left_sec"] is not None else None)
     return d
 
 
@@ -494,7 +551,7 @@ def create_job(body: JobIn) -> dict[str, Any]:
                      locations=json.dumps(locs) if len(locs) > 1 else None,
                      message="draft" if body.draft else "queued",
                      status="draft" if body.draft else "running")
-        job = _job_dict(s.get_job(job_id))
+        job = _job_dict(s.get_job(job_id), s)
     finally:
         s.close()
     if not body.draft:
@@ -528,7 +585,7 @@ def update_draft(job_id: int, body: JobIn) -> dict[str, Any]:
                      center_lat=primary.get("lat") if has_center else None,
                      center_lng=primary.get("lng") if has_center else None,
                      max_minutes=body.max_minutes, unique_new=int(body.unique_new))
-        return _job_dict(s.get_job(job_id))
+        return _job_dict(s.get_job(job_id), s)
     finally:
         s.close()
 
@@ -546,7 +603,7 @@ def start_draft(job_id: int) -> dict[str, Any]:
         if r["radius_km"] and not (r["location"] or r["center_lat"] is not None):
             raise HTTPException(422, "radius needs a location")
         s.update_job(job_id, phase="queued", status="running", stop_requested=0, message="queued")
-        job = _job_dict(s.get_job(job_id))
+        job = _job_dict(s.get_job(job_id), s)
     finally:
         s.close()
     worker.wake.set()
@@ -557,7 +614,7 @@ def start_draft(job_id: int) -> dict[str, Any]:
 def list_jobs() -> list[dict[str, Any]]:
     s = Store()
     try:
-        return [_job_dict(r) for r in s.list_jobs()]
+        return [_job_dict(r, s) for r in s.list_jobs()]
     finally:
         s.close()
 
@@ -569,7 +626,7 @@ def get_job(job_id: int) -> dict[str, Any]:
         r = s.get_job(job_id)
         if not r:
             raise HTTPException(404, "no such job")
-        d = _job_dict(r)
+        d = _job_dict(r, s)
         d["places_count"] = s.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()[0]
         return d
     finally:
@@ -599,7 +656,7 @@ def stop_job(job_id: int) -> dict[str, Any]:
             s.update_job(job_id, phase="stopped", status="stopped", message="cancelled before start")
         else:
             s.update_job(job_id, stop_requested=1, message="stopping after current place…")
-        return _job_dict(s.get_job(job_id))
+        return _job_dict(s.get_job(job_id), s)
     finally:
         s.close()
 
@@ -619,7 +676,7 @@ def reenrich_job(job_id: int) -> dict[str, Any]:
             raise HTTPException(400, "nothing to re-enrich")
         s.update_job(job_id, phase="queued", status="running", reenrich_only=1, stop_requested=0,
                      message=f"queued: retry {n} websites")
-        job = _job_dict(s.get_job(job_id))
+        job = _job_dict(s.get_job(job_id), s)
     finally:
         s.close()
     worker.wake.set()

@@ -54,6 +54,26 @@ class Settings:
     # account as logged-out. On a headless VPS set WA_VERIFY_HEADLESS=true + run under
     # xvfb, or keep a headed display.
     wa_verify_headless: bool = _bool(os.getenv("WA_VERIFY_HEADLESS"), False)
+    # ── job time budget: how a job's `max_minutes` is divided between phases ──────
+    # Read the user's ask literally — "if the max time is 30 mins => search leads on
+    # google maps for 30 mins and then stop that and start research on leads website
+    # and linkedin, insta, fb, whatsapp numbers, summary". So `max_minutes` is the
+    # **Google Maps cap**, and the research/enrichment phases run *after* it on a
+    # budget of their own. A 30-minute job therefore spends up to 30 min on Maps and
+    # up to another 15 min (0.5x) enriching what it found.
+    #
+    # Both halves are configurable so the same code expresses the other reading:
+    # MAPS_BUDGET_FRAC=0.7 + ENRICH_BUDGET_FRAC=0.3 makes the 30 minutes cover the
+    # whole run (21 min Maps, 9 min enrichment).
+    maps_budget_frac: float = _float(os.getenv("MAPS_BUDGET_FRAC"), 1.0)
+    # Of `max_minutes`. 0 = the post-Maps phases are not time-capped at all.
+    enrich_budget_frac: float = _float(os.getenv("ENRICH_BUDGET_FRAC"), 0.5)
+    # Of the *Maps* budget — the W0 40/60 split between collecting links and opening
+    # each place. A wide radius tiles into thousands of sub-searches, so without this
+    # the collection step burns the whole cap and the job scrapes zero places.
+    collect_budget_frac: float = _float(os.getenv("COLLECT_BUDGET_FRAC"), 0.4)
+    # How many past runs of a phase feed its rolling seconds-per-unit average (W4).
+    eta_history_jobs: int = _int(os.getenv("ETA_HISTORY_JOBS"), 20)
 
 
 settings = Settings()

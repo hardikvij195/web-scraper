@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS wa_accounts (
   day TEXT,
   disabled INTEGER NOT NULL DEFAULT 0
 );
+-- One row per phase per finished job: how long it took and how many units it handled.
+-- The ETA (W4) is a rolling average over these, NOT a hardcoded constant, so the number
+-- shown reflects this machine, this network and this delay setting. Kept forever — it is
+-- a handful of bytes per job — and read newest-first with a LIMIT.
+CREATE TABLE IF NOT EXISTS phase_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER,
+  phase TEXT NOT NULL,           -- scraping | enriching | researching | verifying_wa
+  units INTEGER NOT NULL,        -- places scraped / sites crawled / numbers checked
+  seconds REAL NOT NULL,         -- wall-clock the phase spent on those units
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_phase_rates_phase ON phase_rates(phase, id DESC);
 """
 
 
@@ -142,6 +155,13 @@ class Store:
             ("enrich_started_at", "TEXT"),
             ("cloud_id", "INTEGER"),         # scrape_jobs.id when mirrored from the cloud queue
             ("cloud_kind", "TEXT"),          # 'saas' | 'crm' — which queue cloud_id belongs to
+            # Phase deadlines, written by the worker when the job starts. Persisted (not
+            # just held in the worker's memory) because the ETA is computed in the API
+            # request handler and by the agent loop, both of which open their own Store.
+            ("maps_deadline_at", "TEXT"),    # collect+scrape must stop by this instant
+            ("enrich_deadline_at", "TEXT"),  # enrich/research/WA must stop by this instant
+            ("research_started_at", "TEXT"),
+            ("wa_started_at", "TEXT"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
@@ -158,6 +178,38 @@ class Store:
         cols = ",".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", [*fields.values(), job_id])
         self.conn.commit()
+
+    # ── phase timing history (feeds the ETA; see eta.py) ─────────────────────
+    def record_phase_rate(self, job_id: int | None, phase: str, units: int, seconds: float) -> None:
+        """Remember that `phase` took `seconds` to handle `units` items.
+
+        Called once per phase as it ends. Zero-unit or negative-duration runs are
+        dropped: they carry no rate information and would poison the average
+        (a phase that found nothing is not evidence that the work is instant).
+        """
+        if units <= 0 or seconds <= 0:
+            return
+        self.conn.execute(
+            "INSERT INTO phase_rates(job_id, phase, units, seconds, recorded_at) VALUES (?,?,?,?,?)",
+            (job_id, phase, int(units), float(seconds), now_iso()))
+        self.conn.commit()
+
+    def phase_rate(self, phase: str, window: int | None = None) -> float | None:
+        """Rolling seconds-per-unit for `phase` over the last `window` recorded runs.
+
+        Weighted by units (total seconds / total units) rather than averaging each
+        run's rate, so a 3-place run cannot swing the estimate as hard as a 300-place
+        one. Returns None when there is no history at all — the caller must then show
+        "estimating…" instead of inventing a number.
+        """
+        window = window or settings.eta_history_jobs
+        row = self.conn.execute(
+            "SELECT SUM(units) AS u, SUM(seconds) AS s FROM "
+            "(SELECT units, seconds FROM phase_rates WHERE phase=? ORDER BY id DESC LIMIT ?)",
+            (phase, window)).fetchone()
+        if not row or not row["u"]:
+            return None
+        return float(row["s"]) / float(row["u"])
 
     def stop_requested(self, job_id: int) -> bool:
         r = self.conn.execute("SELECT stop_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
