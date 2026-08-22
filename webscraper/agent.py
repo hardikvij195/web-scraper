@@ -126,12 +126,39 @@ def _local_progress(row: Any) -> dict:
             "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
 
 
+def _requeue_orphans(store: Store, kind: str) -> int:
+    """Put jobs the last agent died mid-run back on the Worker's queue.
+
+    The Worker only picks up `phase IN ('queued','waiting')`, so a job killed
+    while scraping stays on 'scraping' for ever: nothing restarts it, `_tick`
+    keeps mirroring that phase up, and because those progress pings refresh
+    `updated_at` the CRM's 30-minute stale-reclaim never opens either. The job
+    reads "running" in the UI and does nothing at all.
+
+    Re-running is safe: places upsert on (job_id, place_key) locally and the CRM
+    upserts on the same pair, so a resumed job overwrites its own rows instead of
+    duplicating them. Jobs already synced or explicitly stopped are left alone.
+    """
+    rows = store.conn.execute(
+        "SELECT id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
+        "AND phase IN ('scraping','enriching','researching','verifying_wa') "
+        "AND (note IS NULL OR note <> 'synced') "
+        "AND COALESCE(stop_requested,0)=0", (kind,)).fetchall()
+    for r in rows:
+        store.update_job(int(r["id"]), phase="queued",
+                         message="resuming after agent restart")
+    return len(rows)
+
+
 def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
+    orphans = _requeue_orphans(store, kind)
+    if orphans:
+        log.info("requeued %d job(s) left mid-run by a previous agent", orphans)
     # Pull API keys from the cloud/CRM (Setup tab) — local .env always wins.
     import os
     try:
