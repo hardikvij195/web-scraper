@@ -13,6 +13,85 @@
 
 ---
 
+## Session 2026-08-23 — three concurrent lanes
+
+Design: [`docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md`](./docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md).
+CRM half = **T141-T143** in `../hvt-ai-crm-live/tasks.md`.
+
+### W5 - Discovery, enrichment and WhatsApp run at the same time  [~]
+Prompt: "in leads finder, can we do lead enrichment and whatsapp verify side by side of each
+lead => like 3 different widnows, leads window will pass leads as soon as they get the lead
+into the crm, then side by side as new leads come in, the enrichment will happen for leads
+that have come in and once lead enrichment is done for that lead, then find wa as well".
+`lanes.py` runs three threads against one job; **the `places` table is the queue** (B takes
+`enrich_status='pending'`, C takes rows whose enrichment resolved and whose `wa_verified` is
+undecided) rather than an in-memory handoff, which leaves `maps.py` alone and makes every
+lane restart-safe for free. Each lane owns its own `Store` - sqlite3 connections are not
+thread-safe - and lanes write **disjoint columns**, which is the property that makes three
+threads on one SQLite file safe. `max_minutes` now caps **discovery only**; enrichment and
+WhatsApp drain the backlog afterwards (user's call: a lead found at minute 29 is worth
+nothing unverified). AI research is folded into the enrichment lane so a lead reaches
+WhatsApp only once everything known about it is known.
+
+### W6 - Per-lane runtime, end reason and success  [~]
+Prompt: "also show info how much time time each ran, and the reason of end and was it
+successfull".
+Job #6 rendered `WhatsApp verification - 2 / 30 numbers` and then the word **done**. It was
+not done: enrichment + AI research had spent the shared ~2.5 min post-Maps budget and the
+lane exited after two checks. One `phase` column cannot describe three concurrent lanes, so
+each lane now writes its own `*_ended_at` / `*_ok` / `*_reason` (`completed`, `no_targets`,
+`maps_cap`, `stopped`, `wa_daily_cap`, `wa_not_logged_in`, `disabled`, `error:<detail>`);
+`ok` is 1 only for the first two. **A lane that gave up can no longer render as done.**
+
+### W7 - Job logs  [~]
+Prompt: "add a logs btn to show logs in ad dialog box for each job on that page".
+There was nothing to show: `jobs.message` holds only the latest line and is overwritten
+constantly, and the real log went to `data/agent.log` on the PC. New `job_logs` table +
+`Store.log()/logs()`, shipped to the CRM on each progress tick behind a `logs_synced_upto`
+watermark that only advances after the POST succeeds.
+
+### W8 - Crash recovery on every lane  [~]
+Prompt: "is there a backup logic, if chrome shuts down due to some error or any issues, will
+it open ?". Partly - **for discovery only**. `a544ae7` gave `maps.py` a relaunch-and-retry;
+WhatsApp had none, so a dead WhatsApp Chrome killed that lane. The mechanism moved to
+`browser_recovery.py` (`Relauncher`, `is_closed`, cap 3) and is now used by the WhatsApp lane
+and the enrichment 403 retry too. Process-level recovery already existed
+(`run-agent-loop.bat` + resetting stuck jobs to `queued` on startup).
+
+### W9 - Say WHY enrichment failed, and beat the 403  [~]
+Prompt: "why did enrichment failed for some leads => check job 6 once".
+Reproduced live: of job #6's 9 failures, **8 are WAF/Cloudflare 403s**
+(`lookers.co.uk`, `hrowen.co.uk` x3, `carluv.co.uk`, `mayfairmotorsolutions.com`,
+`maryleboneminicabs.co.uk`, `luxurycarsltd.co.uk`) and 1 is a dead domain
+(`atypesourcing.com`, `getaddrinfo failed`). `enrich_status='failed'` is set whenever
+`pages_fetched == 0` and the reason was never recorded, so a quarter of a London job looked
+arbitrarily broken. New `places.enrich_error` (`http_403` | `http_<code>` | `dns` | `timeout`
+| `non_html` | `no_pages`), and a block-shaped failure is retried **once through a real
+browser**. httpx stays the fast path - a browser is ~15x slower per site and that speed is
+why enrichment keeps up with discovery.
+
+### W11 - SaaS lead sync is broken on a missing column  [ ]  (pre-existing, found 2026-08-23)
+Surfaced by the live lane smoke, NOT caused by the lane work:
+`supabase push 400 {"code":"PGRST204", "message":"Could not find the 'wa_verified' column of
+'web_scraper_leads' in the schema cache"}`. `wa_verified` was added to the local `places`
+table when WhatsApp verification shipped, but **no migration ever added it to the cloud
+table** - `grep -rn wa_verified supabase_migrations/` returns nothing. So every
+`supa.push_job()` to the SaaS project fails outright and those leads never reach
+`web_scraper_leads`. The CRM path (`agent.py` -> `lead-finder-agent`) is unaffected; only the
+`web-scraper-leads.vercel.app` product is. Fix = a migration adding `wa_verified`
+(plus `whatsapp_source`, `enrich_error`, and the other columns added since) to
+`web_scraper_leads`, applied against Supabase `gfgkcnjxvxlusplwmvae`.
+
+### W10 - "Assumed Mobile" retired, and every WA number gets a `+`  [~]
+Prompt: "remove => Assumed Mobile tag => verify it and show the wa link tag, donot assume any
+wa link, also add + as well in front of all wa nos".
+A plain mobile number is a **candidate for verification, never a claim**. `assumed_mobile`
+becomes `unverified` and renders **no tag at all**; only `maps_link`/`wa_link` show "WA link"
+and only a real check shows "Verified". Numbers are stored and displayed E.164 with a leading
+`+`; `wa.me/` links strip it because that URL form wants bare digits.
+
+---
+
 ## Session 2026-08-22
 
 ### W1 — Push this repo to GitHub  [x]

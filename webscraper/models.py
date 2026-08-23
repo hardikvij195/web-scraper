@@ -37,7 +37,7 @@ class Place:
     youtube: str | None = None
     tiktok: str | None = None
     whatsapp_number: str | None = None
-    whatsapp_source: str | None = None   # maps_link | wa_link | assumed_mobile | none
+    whatsapp_source: str | None = None   # maps_link | wa_link | verified | unverified | none
     enrich_status: str = "pending"       # pending | done | no_website | failed | thin
     enriched_at: str | None = None
     scraped_at: str | None = None

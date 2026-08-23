@@ -50,6 +50,11 @@ class Cloud:
         r.raise_for_status()
         return r.json()
 
+    def logs(self, jid: int, rows: list[dict]) -> None:
+        """Ship job_logs lines up. The SaaS API may not implement this yet — a 404 here is
+        expected and handled by the caller, never fatal to the job."""
+        self.c.post(f"/api/agent/jobs/{jid}/logs", json={"rows": rows}).raise_for_status()
+
     def config(self) -> dict:
         return {}  # SaaS members set AI keys in their cloud Settings tab, not here
 
@@ -97,6 +102,16 @@ class CrmCloud:
         d = r.json()
         return {"accepted": d.get("accepted", 0), "rejected_quota": 0}
 
+    def logs(self, jid: int, rows: list[dict]) -> None:
+        """Append this job's new log lines to the CRM (`lead_gen_job_logs`).
+
+        Deliberately NOT folded into `progress`: progress is overwritten every tick, the
+        log is append-only, and a rejected log batch must be retried without also
+        re-sending (or losing) a progress update. The CRM side of this action may not be
+        deployed yet — the caller treats any failure as "retry next tick".
+        """
+        self._post(crm_payload("logs", job_id=jid, rows=rows)).raise_for_status()
+
     def config(self) -> dict:
         """API keys set on the CRM Lead Finder Setup tab (gemini_api_key, ...)."""
         r = self._post(crm_payload("config"))
@@ -120,24 +135,75 @@ def _flat(r: dict) -> dict:
     return _row(r)
 
 
+#: Log lines shipped per tick. Bounded so a job that logged for an hour while the CRM was
+#: unreachable cannot post a multi-megabyte body when it comes back; the rest goes next tick.
+LOG_BATCH = 200
+
+
 def _local_progress(row: Any, store: Store | None = None) -> dict:
-    """Counters the CRM's progress bars read, plus the phase/ETA block (T136 W2+W4).
+    """Counters the CRM's progress bars read, plus the phase/lane/ETA block (T136 W2+W4).
 
     The ETA is computed here rather than CRM-side on purpose: only this machine knows
     how fast it actually scrapes, and `eta.summarise` reads the rolling per-phase
     averages out of the local SQLite. The CRM just renders what it is told, and shows
     "estimating…" wherever `eta_sec` is null.
+
+    `lanes` is the truthful picture since the 2026-08-23 rewrite — three concurrent lanes,
+    each with its own runtime and end reason. It rides inside the same `progress` jsonb, so
+    the CRM needs no schema change; `phases` stays alongside it for the strip the CRM
+    already renders, and an older CRM that ignores `lanes` keeps working unchanged.
     """
     out = {"scraped_count": row["scraped_count"], "links_found": row["links_found"],
            "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"],
            "research_done": row["research_done"], "research_total": row["research_total"],
            "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
     s = eta.summarise(row, store)
-    out.update({"phases": s["phases"], "eta_sec": s["eta_sec"],
+    out.update({"phases": s["phases"], "lanes": s["lanes"], "eta_sec": s["eta_sec"],
                 "phase_eta_sec": s["phase_eta_sec"], "estimating": s["estimating"],
                 "budget_left_sec": (round(s["budget_left_sec"])
                                     if s["budget_left_sec"] is not None else None)})
     return out
+
+
+def _col(row: Any, key: str, default: Any = None) -> Any:
+    """Read a column that may not exist yet (sqlite3.Row raises IndexError, dict KeyError)."""
+    try:
+        v = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if v is None else v
+
+
+def _ship_logs(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
+    """Send this job's unsent `job_logs` lines up, then move the watermark.
+
+    Order matters: `jobs.logs_synced_upto` advances ONLY after the POST returned 2xx, so a
+    failed tick re-sends the same lines next time instead of dropping them silently. The
+    id of the last row in the batch is the watermark (ids are monotonic per SQLite
+    AUTOINCREMENT), which also means a partially-consumed batch is simply resent — the CRM
+    upserts, so a duplicate line is harmless where a lost one is not.
+
+    Failure is never fatal: the CRM's `logs` action may not be deployed yet (404), or the
+    network may be down. A job must not die because its diary could not be filed.
+    """
+    cid = _col(row, "cloud_id")
+    if not cid:
+        return
+    job_id = int(row["id"])
+    rows = store.logs(job_id, after_id=int(_col(row, "logs_synced_upto", 0) or 0),
+                      limit=LOG_BATCH)
+    if not rows:
+        return
+    try:
+        cloud.logs(int(cid), [{"ts": r["ts"], "lane": r["lane"], "level": r["level"],
+                               "message": r["message"]} for r in rows])
+    except Exception as e:                                       # noqa: BLE001
+        # Broad on purpose — see the docstring. httpx raises HTTPError, but a malformed
+        # response body or a JSON error would raise something else entirely.
+        log.warning("log ship to #%s failed (%d line(s) held for the next tick): %s",
+                    cid, len(rows), e)
+        return
+    store.update_job(job_id, logs_synced_upto=int(rows[-1]["id"]))
 
 
 def _requeue_orphans(store: Store, kind: str) -> int:
@@ -223,12 +289,30 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     def wa_progress(done: int) -> dict:
         per = ((time.monotonic() - started) / done) if done >= 3 else store.phase_rate("verifying_wa")
         eta_sec = round(max(0, total - done) * per) if per else None
+        src = "live" if done >= 3 else "history"
+        # A re-verify runs exactly one lane, so `lanes` is hand-built here rather than read
+        # off a jobs row — there is no local job row for it (the work is driven straight off
+        # the CRM's existing results). Same shape as eta.lanes() so the CRM renders it with
+        # the same code path; the two idle lanes are reported 'disabled', not 'pending'.
+        wa_lane = {"key": "whatsapp", "label": eta.LANE_LABELS["whatsapp"],
+                   "unit": eta.LANE_UNITS["whatsapp"], "status": "running",
+                   "done": done, "total": total, "total_is_min": False,
+                   "eta_sec": eta_sec, "estimating": eta_sec is None, "rate_source": src,
+                   "started_at": None, "ended_at": None, "ok": None, "reason": None,
+                   "ran_sec": round(time.monotonic() - started)}
+        idle = [{"key": k, "label": eta.LANE_LABELS[k], "unit": eta.LANE_UNITS[k],
+                 "status": "disabled", "done": 0, "total": None, "total_is_min": False,
+                 "eta_sec": None, "estimating": False, "rate_source": "done",
+                 "started_at": None, "ended_at": None, "ok": None, "reason": "disabled",
+                 "ran_sec": None} for k in ("discovery", "enrichment")]
         return {"wa_verify_total": total, "wa_verify_done": done,
                 "eta_sec": eta_sec, "phase_eta_sec": eta_sec, "estimating": eta_sec is None,
+                "lanes": idle + [wa_lane],
                 "phases": [{"key": "verifying_wa", "label": eta.LABELS["verifying_wa"],
                             "unit": eta.UNITS["verifying_wa"], "status": "running",
-                            "done": done, "total": total, "eta_sec": eta_sec,
-                            "estimating": eta_sec is None, "rate_source": "live" if done >= 3 else "history"}]}
+                            "done": done, "total": total, "total_is_min": False,
+                            "eta_sec": eta_sec, "lane": "whatsapp",
+                            "estimating": eta_sec is None, "rate_source": src}]}
 
     cloud.progress(jid, "verifying_wa", wa_progress(0))
     collected: dict[str, str] = {}
@@ -237,11 +321,13 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         collected[pk] = status
         upd: dict[str, Any] = {"place_key": pk, "wa_verified": status}
         # Confirmed hit -> promote the verified number + mark source 'verified' (drops an
-        # 'assumed_mobile' guess). Miss on a guessed number -> clear it.
+        # 'unverified' guess). Miss on a guessed number -> clear it.
+        # 'assumed_mobile' is the retired spelling of 'unverified' (2026-08-23); still
+        # accepted here so rows written before the migration still clear correctly.
         if status == "yes" and num:
             upd["whatsapp_number"] = num
             upd["whatsapp_source"] = "verified"
-        elif status == "no" and src_by_pk.get(pk) == "assumed_mobile":
+        elif status == "no" and src_by_pk.get(pk) in ("unverified", "assumed_mobile"):
             upd["whatsapp_number"] = None
             upd["whatsapp_source"] = None
         # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
@@ -313,6 +399,10 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             "SELECT * FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
             "AND (note IS NULL OR note <> 'synced')", (kind,)).fetchall():
         cid = row["cloud_id"]
+        # Diary first, in BOTH branches: a job that finished between two ticks still has
+        # its closing lines (lane reasons, the failure text) waiting to be shipped, and
+        # once the terminal branch marks it 'synced' this loop never looks at it again.
+        _ship_logs(cloud, store, row)
         if row["phase"] in ("scraping", "enriching", "queued", "waiting", "researching", "verifying_wa"):
             # Stream leads up AS THEY LAND. Results used to be uploaded only once the job
             # reached a terminal phase, so a job stopped by the user or by its time limit

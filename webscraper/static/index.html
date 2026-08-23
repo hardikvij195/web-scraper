@@ -70,7 +70,17 @@
   .empty { text-align:center; padding:40px; color:var(--muted); }
   .msg { font-size:12px; color:var(--muted); }
   .wa { font-size:11px; padding:1px 6px; border-radius:4px; background:#ecfdf5; color:#065f46; }
-  .wa.assumed { background:#fffbeb; color:#92400e; }
+  /* A number found via an explicit WhatsApp link is weaker evidence than one we actually
+     checked, so it gets its own (cooler) badge. An UNVERIFIED number gets no badge at all
+     — see waTag(): a badge reads as a claim, and nothing has been verified. */
+  .wa.link { background:#eff6ff; color:#1e40af; }
+  /* The three lanes run at the SAME time, so they sit side by side rather than as a
+     numbered list. A finished lane keeps its slot and shows how long it ran and why it
+     ended — "2 / 30 · done" with no explanation was the bug that started all this. */
+  .lane { min-width:0; }
+  .lane .why { font-size:11px; color:var(--muted); margin-top:2px; white-space:nowrap;
+               overflow:hidden; text-overflow:ellipsis; }
+  .lane .why.bad { color:var(--bad); }
   .locrow { display:flex; gap:6px; }
   .locrow input { flex:1; }
   .pin { font-size:11px; color:var(--ok); margin-top:4px; display:flex; gap:8px; align-items:center; }
@@ -245,45 +255,124 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const host = u => { try { return new URL(u).hostname.replace(/^www\./,''); } catch { return u; } };
 const fmtDur = s => { if (s == null) return '—'; s = Math.max(0, Math.round(s)); const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), x = s%60; return h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`; };
 const isPending = j => j.running || j.phase === 'queued' || j.phase === 'waiting' || j.phase === 'researching';
+
+// ── WhatsApp cell ────────────────────────────────────────────────────────────
+// Numbers are stored E.164 WITH the leading '+' (store.plus). wa.me wants bare digits, so
+// the href strips everything non-numeric while the visible text keeps the '+'.
+const waHref = n => `https://wa.me/${String(n).replace(/\D/g, '')}`;
+// Source badge. 'unverified' (and its retired spelling 'assumed_mobile') means "this looks
+// like a mobile, nobody has checked it" — that gets NO badge, because any badge next to a
+// number reads as a claim about it. Only real evidence is labelled.
+const WA_TAG = { verified: ['Verified', ''], maps_link: ['WA link', 'link'], wa_link: ['WA link', 'link'] };
+const waTag = src => { const t = WA_TAG[src]; return t ? ` <span class="${['wa', t[1]].filter(Boolean).join(' ')}">${t[0]}</span>` : ''; };
+const waCell = p => p.whatsapp_number
+  ? `<a href="${esc(waHref(p.whatsapp_number))}" target="_blank">${esc(p.whatsapp_number)}</a>${waTag(p.whatsapp_source)}`
+  : '<span class="muted">—</span>';
 const timing = j => {
   if (isPending(j)) {
     const parts = [];
     if (j.elapsed_sec != null) parts.push(`running for <b>${fmtDur(j.elapsed_sec)}</b>`);
     if (j.eta_sec != null) parts.push(`ETA <b>~${fmtDur(j.eta_sec)}</b>`);
     else if (j.estimating) parts.push(`ETA <b>estimating…</b>`);
-    // The Maps cap does not end the job — it hands over to the research phases.
-    if (j.time_left_sec != null) parts.push(
-      j.phase === 'scraping' ? `Maps cap: switches to research in <b>${fmtDur(j.time_left_sec)}</b>`
-                             : `research budget: <b>${fmtDur(j.time_left_sec)}</b> left`);
-    else if (j.max_minutes && j.phase === 'queued') parts.push(`limit <b>${j.max_minutes} min</b> from start`);
+    // The Maps cap ends DISCOVERY only. Enrichment and WhatsApp are already running beside
+    // it and keep draining the backlog afterwards, for as long as that takes.
+    if (j.time_left_sec != null) parts.push(`Maps search stops in <b>${fmtDur(j.time_left_sec)}</b>`);
+    else if (j.max_minutes && j.phase === 'queued') parts.push(`Maps limit <b>${j.max_minutes} min</b> from start`);
     return parts.join(' · ') || 'waiting…';
   }
   return j.elapsed_sec != null ? `ran for <b>${fmtDur(j.elapsed_sec)}</b>` : '';
 };
 
-// One bar per phase the job will actually run, each with its own ETA. Driven by the
-// server's `phases` block (webscraper/eta.py) so the local UI and the CRM agree.
-// `eta_sec: null` means the rolling average has no data for that phase yet — we say
-// "estimating…" rather than print a number we know is wrong.
-const PHASE_COLOR = { scraping:'#2563eb', enriching:'#059669', researching:'#7c3aed', verifying_wa:'#14b8a6' };
-function phaseBars(j, scrapePct, enrichPct) {
-  const ph = j.phases;
-  if (!Array.isArray(ph) || !ph.length) {
-    // Older server / job row with no phase block — keep the previous two bars.
+// ── lane strip ───────────────────────────────────────────────────────────────
+// Since 2026-08-23 a job runs THREE LANES AT ONCE (webscraper/lanes.py): discovery,
+// enrichment (AI research folded in) and WhatsApp. They are drawn side by side, not as a
+// numbered sequence, because more than one of them is genuinely running at any moment.
+// Each shows its own runtime and, once over, WHY it ended — a lane can finish early
+// (Maps cap, WhatsApp daily cap, not logged in) and used to be indistinguishable from
+// one that actually completed.
+const LANE_COLOR = { discovery:'#2563eb', enrichment:'#059669', whatsapp:'#14b8a6' };
+const REASON_TEXT = {
+  completed:'finished', no_targets:'nothing to do', maps_cap:'hit the time limit',
+  stopped:'stopped by you', wa_daily_cap:'daily WhatsApp cap reached',
+  wa_not_logged_in:'WhatsApp Web not logged in', disabled:'not requested',
+};
+const reasonText = r => !r ? '' : (REASON_TEXT[r] || (String(r).startsWith('error:') ? 'error — ' + String(r).slice(6) : r));
+
+// The columns each lane owns on the jobs row — the same disjoint sets lanes.py writes.
+const LANE_DEFS = [
+  { key:'discovery',  label:'Google Maps discovery',          unit:'places',
+    done:'scraped_count', total:'links_found',
+    s:'scrape_started_at', e:'disc_ended_at', ok:'disc_ok', why:'disc_reason' },
+  { key:'enrichment', label:'Websites, socials & AI research', unit:'businesses',
+    done:'enrich_done', total:'enrich_total',
+    s:'enrich_started_at', e:'enr_ended_at', ok:'enr_ok', why:'enr_reason' },
+  { key:'whatsapp',   label:'WhatsApp verification',           unit:'numbers',
+    done:'wa_verify_done', total:'wa_verify_total',
+    s:'wa_started_at', e:'wa_ended_at', ok:'wa_ok', why:'wa_reason' },
+];
+const TERMINAL_PHASES = ['done','stopped','failed','cancelled','error'];
+const secsSince = iso => { const t = Date.parse(iso); return isNaN(t) ? null : Math.max(0, (Date.now() - t) / 1000); };
+
+// Fallback for when the API response carries no `lanes` block: rebuild it from the raw
+// jobs columns, which `/api/jobs` returns verbatim. Same rules as webscraper/eta.py —
+// state comes from the lane's OWN stamps, never from a position in a list.
+function deriveLanes(j) {
+  const over = TERMINAL_PHASES.includes(j.phase);
+  const waOnly = !!j.wa_verify_only, reOnly = !!j.reenrich_only;
+  const on = { discovery: !waOnly && !reOnly,
+               enrichment: (j.do_enrich === undefined ? true : !!j.do_enrich) && !waOnly,
+               whatsapp: !!j.do_wa_verify || waOnly };
+  const st = d => {
+    if (j[d.e]) return j[d.ok] === 0 ? 'failed' : 'done';
+    if (over) return j.phase === 'done' ? 'done' : j.phase;   // old row: job is over
+    return j[d.s] ? 'running' : 'pending';
+  };
+  const raw = LANE_DEFS.map(d => {
+    const status = on[d.key] ? st(d) : 'disabled';
+    const start = j[d.s], end = j[d.e] || (over ? j.finished_at : null);
+    const ran = start ? (end ? (Date.parse(end) - Date.parse(start)) / 1000 : (status === 'running' ? secsSince(start) : null)) : null;
+    return { key:d.key, label:d.label, unit:d.unit, status,
+             done:j[d.done] || 0, total:j[d.total] || null, total_is_min:false,
+             eta_sec:null, estimating:false, reason: on[d.key] ? j[d.why] : 'disabled',
+             ran_sec: ran == null ? null : Math.max(0, Math.round(ran)) };
+  });
+  // Downstream lanes are still being fed while discovery runs, so their totals are floors.
+  const discOpen = on.discovery && ['running','pending'].includes(raw[0].status);
+  raw.slice(1).forEach(l => {
+    if (!l.total) l.total = j.enrich_total || j.links_found || j.scraped_count || j.max_places || null;
+    if (l.total && discOpen) l.total_is_min = true;
+  });
+  return raw;
+}
+
+function laneBars(j, scrapePct, enrichPct) {
+  const all = (Array.isArray(j.lanes) && j.lanes.length) ? j.lanes : deriveLanes(j);
+  const ls = all.filter(l => l.status !== 'disabled');
+  if (!ls.length) {
+    // Nothing to model (a draft, or a row so old it has no lane columns) — the old two bars.
     return `<div class="row" style="margin-top:8px">
       <div><div class="msg">Scraping Google Maps — ${j.scraped_count||0} / ${j.links_found||'?'} places</div><div class="progress"><div style="width:${scrapePct}%"></div></div></div>
       <div><div class="msg">Enriching websites — ${j.enrich_done||0} / ${j.enrich_total||0}</div><div class="progress green"><div style="width:${enrichPct}%"></div></div></div>
     </div>`;
   }
-  const cls = ph.length >= 3 ? 'row3' : 'row';
-  return `<div class="${cls}" style="margin-top:8px">` + ph.map(p => {
-    const pct = p.total ? Math.min(100, Math.round(100 * (p.done||0) / p.total))
-                        : (p.status === 'done' ? 100 : 0);
-    const eta = p.status === 'done' ? 'done'
-      : p.estimating ? 'estimating…'
-      : p.eta_sec != null ? `~${fmtDur(p.eta_sec)} left` : '';
-    return `<div><div class="msg">${esc(p.label)} — ${p.done||0} / ${p.total ?? '?'} ${esc(p.unit)}${eta?` · <b>${eta}</b>`:''}</div>
-      <div class="progress"><div style="width:${pct}%;background:${PHASE_COLOR[p.key]||'#2563eb'};opacity:${p.status==='pending'?0.35:1}"></div></div></div>`;
+  const cls = ls.length >= 3 ? 'row3' : 'row';
+  return `<div class="${cls}" style="margin-top:8px">` + ls.map(l => {
+    const pct = l.total ? Math.min(100, Math.round(100 * (l.done||0) / l.total))
+                        : (l.status === 'done' ? 100 : 0);
+    // `total_is_min` = discovery is still finding leads, so this total will grow: show "≥".
+    const tot = l.total == null ? '?' : `${l.total_is_min ? '≥' : ''}${l.total}`;
+    const eta = ['running','pending'].includes(l.status)
+      ? (l.estimating ? 'estimating…' : (l.eta_sec != null ? `~${fmtDur(l.eta_sec)} left` : ''))
+      : '';
+    // Runtime + end reason: the two facts that explain a lane which stopped early.
+    const bits = [];
+    if (l.ran_sec != null) bits.push(l.status === 'running' ? `running ${fmtDur(l.ran_sec)}` : `ran ${fmtDur(l.ran_sec)}`);
+    if (l.status === 'pending') bits.push('not started yet');
+    if (reasonText(l.reason)) bits.push(reasonText(l.reason));
+    const bad = l.status === 'failed' || l.ok === false;
+    return `<div class="lane"><div class="msg">${esc(l.label)} — ${l.done||0} / ${tot} ${esc(l.unit)}${eta?` · <b>${eta}</b>`:''}</div>
+      <div class="progress"><div style="width:${pct}%;background:${LANE_COLOR[l.key]||'#2563eb'};opacity:${l.status==='pending'?0.35:1}"></div></div>
+      <div class="why${bad?' bad':''}">${esc(bits.join(' · '))}&nbsp;</div></div>`;
   }).join('') + `</div>`;
 }
 
@@ -485,7 +574,7 @@ window.renderLeads = () => {
       <td class="muted">${i+1}</td>
       <td class="wrap"><b>${esc(p.name)}</b><div class="muted">${esc(p.category||'')}</div></td>
       <td>${p.phone?`<a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`:''}</td>
-      <td>${p.whatsapp_number?`<a href="https://wa.me/${esc(p.whatsapp_number)}" target="_blank">${esc(p.whatsapp_number)}</a>`:'<span class="muted">—</span>'}</td>
+      <td>${waCell(p)}</td>
       <td>${p.email?`<a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`:''}</td>
       <td>${p.website?`<a href="${esc(p.website)}" target="_blank">${esc(host(p.website))}</a>`:''}</td>
       <td class="soc">
@@ -576,7 +665,12 @@ async function loadDetail() {
   const j = await api(`/api/jobs/${currentId}`).catch(()=>null);
   if (!j || j.phase === 'draft') return;
   const newPlaces = await api(`/api/jobs/${currentId}/places`).catch(()=>[]);
+  // `jobs.phase` no longer moves while the lanes run (it sits on 'scraping' for the whole
+  // job), so the per-lane counters and end stamps have to be in the signature or the lane
+  // strip would never repaint — including the moment a lane finishes.
   const sig = JSON.stringify([j.id, j.phase, j.links_found, j.scraped_count, j.enrich_done, j.enrich_total, j.message, newPlaces.length,
+    j.wa_verify_done, j.wa_verify_total,
+    j.disc_ended_at, j.disc_reason, j.enr_ended_at, j.enr_reason, j.wa_ended_at, j.wa_reason,
     newPlaces.map(p => p.enrich_status + (p.email||'') + (p.whatsapp_number||'')).join('|')]);
   places = newPlaces; lastJob = j;
   if (sig !== lastSig) { lastSig = sig; renderDetail(j); }
@@ -613,7 +707,7 @@ function renderDetail(j) {
       ${isPending(j) ? `<button class="btn-danger" onclick="stopJob(${j.id})">Stop</button>` : `<button class="btn-ghost" onclick="deleteJob(${j.id})">Delete</button>`}
     </div>
     <div class="msg" id="timing" style="margin-top:6px">${timing(j)}${j.message ? ' · ' + esc(j.message) : ''}&nbsp;</div>
-    ${phaseBars(j, scrapePct, enrichPct)}
+    ${laneBars(j, scrapePct, enrichPct)}
     <div class="kpis">
       <div class="kpi"><b>${places.length}</b><span>leads</span></div>
       <div class="kpi"><b>${cnt(p=>p.phone)}</b><span>phone</span></div>
@@ -644,7 +738,7 @@ function renderDetail(j) {
         <td class="muted">${i+1}</td>
         <td class="wrap"><b>${esc(p.name)}</b><div class="muted">${esc(p.category||'')}</div></td>
         <td>${p.phone?`<a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`:''}</td>
-        <td>${p.whatsapp_number?`<a href="https://wa.me/${esc(p.whatsapp_number)}" target="_blank">${esc(p.whatsapp_number)}</a> <span class="wa ${p.whatsapp_source==='assumed_mobile'?'assumed':''}">${esc(p.whatsapp_source)}</span>`:'<span class="muted">—</span>'}</td>
+        <td>${waCell(p)}</td>
         <td>${p.email?`<a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`:''}${(p.emails||[]).length>1?`<div class="muted">+${p.emails.length-1} more</div>`:''}</td>
         <td>${p.website?`<a href="${esc(p.website)}" target="_blank">${esc(host(p.website))}</a>`:''}</td>
         <td class="soc">

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any
 
 from webscraper.config import settings
 from webscraper.models import Place
+
+log = logging.getLogger("webscraper.store")
 
 PLACE_COLS = [
     "job_id", "place_key", "name", "category", "address", "country", "phone", "phone_digits", "website", "domain",
@@ -70,11 +73,37 @@ CREATE TABLE IF NOT EXISTS phase_rates (
   recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_phase_rates_phase ON phase_rates(phase, id DESC);
+-- Per-job log history. `jobs.message` holds only the latest line (the progress bar reads
+-- it and it is overwritten constantly); this is what actually happened, in order, so the
+-- CRM's Logs dialog can show it without anyone opening data/agent.log on the PC.
+-- `lane` is discovery | enrichment | whatsapp | job.
+CREATE TABLE IF NOT EXISTS job_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL,
+  ts TEXT NOT NULL,
+  lane TEXT NOT NULL DEFAULT 'job',
+  level TEXT NOT NULL DEFAULT 'info',   -- info | warn | error
+  message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id, id);
 """
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def plus(number: str | None) -> str | None:
+    """E.164 with the leading '+' (user directive 2026-08-23: every WhatsApp number shows
+    one). Stored WITH the '+'; `wa.me/` links strip it again at render time because that
+    URL form wants bare digits. Idempotent, and leaves anything non-numeric alone."""
+    if not number:
+        return None
+    s = str(number).strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return None
+    return f"+{digits}"
 
 
 def fmt_team(team: Any) -> str:
@@ -122,7 +151,12 @@ class Store:
                          ("summary", "TEXT"), ("owner", "TEXT"), ("team", "TEXT"),
                          ("research_status", "TEXT"), ("researched_at", "TEXT"),
                          ("wa_verified", "TEXT"),        # 'yes' | 'no' | 'unknown'
-                         ("wa_verified_at", "TEXT"), ("wa_verify_account", "TEXT")):
+                         ("wa_verified_at", "TEXT"), ("wa_verify_account", "TEXT"),
+                         # WHY a crawl produced nothing: http_403 | http_<code> | dns |
+                         # timeout | non_html | no_pages. Without this, enrich_status
+                         # 'failed' is unexplainable — 8 of job #6's 9 failures were
+                         # plain WAF 403s and looked identical to a broken site.
+                         ("enrich_error", "TEXT")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
@@ -162,9 +196,26 @@ class Store:
             ("enrich_deadline_at", "TEXT"),  # enrich/research/WA must stop by this instant
             ("research_started_at", "TEXT"),
             ("wa_started_at", "TEXT"),
+            # ── per-lane outcome (2026-08-23) ───────────────────────────────────────
+            # The three lanes now run concurrently, so one `phase` column cannot say how
+            # each finished. Each lane writes ONLY its own three columns — that disjoint
+            # ownership is what makes three threads sharing this DB safe, so keep it that
+            # way when adding counters. `*_ok` is 1 only for a lane that genuinely ran out
+            # of work; `*_reason` is a token (completed | maps_cap | stopped | wa_daily_cap
+            # | wa_not_logged_in | no_targets | error:<detail>) the UI renders as prose.
+            # Lane starts reuse scrape_started_at / enrich_started_at / wa_started_at.
+            ("disc_ended_at", "TEXT"), ("disc_ok", "INTEGER"), ("disc_reason", "TEXT"),
+            ("enr_ended_at", "TEXT"), ("enr_ok", "INTEGER"), ("enr_reason", "TEXT"),
+            ("wa_ended_at", "TEXT"), ("wa_ok", "INTEGER"), ("wa_reason", "TEXT"),
+            ("logs_synced_upto", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+        # 'assumed_mobile' is retired (2026-08-23): a plain mobile number is a CANDIDATE for
+        # verification, never a claim that the business is on WhatsApp. Existing rows become
+        # 'unverified', which the UI deliberately renders with no tag at all.
+        self.conn.execute(
+            "UPDATE places SET whatsapp_source='unverified' WHERE whatsapp_source='assumed_mobile'")
         # jobs created by the CLI before `phase` existed: derive it from status so the UI can
         # label them; a stale 'running' (crashed run) becomes 'stopped'.
         self.conn.execute(
@@ -211,6 +262,100 @@ class Store:
             return None
         return float(row["s"]) / float(row["u"])
 
+    # ── job logs + per-lane bookkeeping (2026-08-23 lanes) ───────────────────────────
+    def log(self, job_id: int | None, lane: str, message: str, level: str = "info") -> None:
+        """Append one line to the job's log history. Never raises: a logging failure must
+        not take down the lane it is describing."""
+        if not job_id:
+            return
+        try:
+            self.conn.execute(
+                "INSERT INTO job_logs(job_id, ts, lane, level, message) VALUES (?,?,?,?,?)",
+                (job_id, now_iso(), lane, level, str(message)[:1000]))
+            self.conn.commit()
+        except sqlite3.Error:                                    # noqa: BLE001
+            log.debug("job_log write failed for job %s", job_id, exc_info=True)
+
+    def logs(self, job_id: int, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT id, ts, lane, level, message FROM job_logs WHERE job_id=? AND id>? "
+            "ORDER BY id LIMIT ?", (job_id, after_id, limit))]
+
+    #: lane key -> (started column, ended column, ok column, reason column)
+    LANE_COLS = {
+        "discovery": ("scrape_started_at", "disc_ended_at", "disc_ok", "disc_reason"),
+        "enrichment": ("enrich_started_at", "enr_ended_at", "enr_ok", "enr_reason"),
+        "whatsapp": ("wa_started_at", "wa_ended_at", "wa_ok", "wa_reason"),
+    }
+    #: reasons that mean the lane finished its work rather than gave up
+    OK_REASONS = ("completed", "no_targets")
+
+    def lane_start(self, job_id: int, lane: str) -> None:
+        started, ended, ok, reason = self.LANE_COLS[lane]
+        # Clear a previous run's outcome so a resumed job does not show a stale reason.
+        self.conn.execute(
+            f"UPDATE jobs SET {started}=?, {ended}=NULL, {ok}=NULL, {reason}=NULL WHERE id=?",
+            (now_iso(), job_id))
+        self.conn.commit()
+
+    def lane_end(self, job_id: int, lane: str, reason: str) -> None:
+        started, ended, ok, reason_col = self.LANE_COLS[lane]
+        self.conn.execute(
+            f"UPDATE jobs SET {ended}=?, {ok}=?, {reason_col}=? WHERE id=?",
+            (now_iso(), 1 if reason in self.OK_REASONS else 0, reason, job_id))
+        self.conn.commit()
+
+    def lanes(self, job_id: int) -> dict[str, dict[str, Any]]:
+        """Per-lane {started_at, ended_at, ok, reason} for the info dialog."""
+        r = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not r:
+            return {}
+        keys = r.keys()
+        out = {}
+        for lane, (s, e, ok, why) in self.LANE_COLS.items():
+            out[lane] = {
+                "started_at": r[s] if s in keys else None,
+                "ended_at": r[e] if e in keys else None,
+                "ok": None if (ok not in keys or r[ok] is None) else bool(r[ok]),
+                "reason": r[why] if why in keys else None,
+            }
+        return out
+
+    # ── lane input queues (the `places` table IS the queue) ──────────────────────────
+    @staticmethod
+    def _decode_json_cols(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """`emails`/`raw`/`team` are stored as JSON text. Consumers expect them decoded —
+        `enrich.resolve_short_wa` does `row["raw"].get("maps_wa_links")` and dies with
+        "'str' object has no attribute 'get'" on a raw row. Found by a live job, because
+        the lane queues below originally returned rows straight from `SELECT *`."""
+        for r in rows:
+            for c in _JSON_COLS:
+                try:
+                    r[c] = json.loads(r[c]) if r[c] else ({} if c == "raw" else [])
+                except (TypeError, json.JSONDecodeError):
+                    r[c] = {} if c == "raw" else []
+        return rows
+
+    def pending_enrichment(self, job_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        """Leads discovery has written that enrichment has not taken yet."""
+        return self._decode_json_cols([dict(r) for r in self.conn.execute(
+            "SELECT * FROM places WHERE job_id=? AND enrich_status='pending' "
+            "ORDER BY rowid LIMIT ?", (job_id, limit))])
+
+    def pending_wa_verify(self, job_id: int, limit: int = 25) -> list[dict[str, Any]]:
+        """Leads whose enrichment has RESOLVED (any outcome — a 403 site still has the
+        Maps phone) that carry a number and have no verdict yet. 'yes'/'no' are final:
+        re-checking them would burn the daily cap for nothing."""
+        return self._decode_json_cols([dict(r) for r in self.conn.execute(
+            "SELECT * FROM places WHERE job_id=? AND enrich_status <> 'pending' "
+            "AND (COALESCE(phone,'') <> '' OR COALESCE(whatsapp_number,'') <> '') "
+            "AND COALESCE(wa_verified,'') NOT IN ('yes','no') "
+            "ORDER BY rowid LIMIT ?", (job_id, limit))])
+
+    def count_places(self, job_id: int) -> int:
+        r = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()
+        return int(r[0] or 0)
+
     def stop_requested(self, job_id: int) -> bool:
         r = self.conn.execute("SELECT stop_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
         return bool(r and r[0])
@@ -230,13 +375,13 @@ class Store:
             "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=? WHERE job_id=? AND place_key=?",
             (status, now_iso(), account, job_id, place_key))
         # On a confirmed hit, promote the verified number into whatsapp_number and mark the
-        # source 'verified' (replacing an 'assumed_mobile' guess). On a miss, drop a guessed
-        # number so 'assumed_mobile' no longer implies a WhatsApp we couldn't confirm.
+        # source 'verified' (replacing an 'unverified' candidate). On a miss, drop the
+        # candidate so an unverified number never lingers as if it were a WhatsApp.
         if status == "yes" and wa_number:
             self.conn.execute(
                 "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
-                (wa_number, job_id, place_key))
-        elif status == "no" and prior_source == "assumed_mobile":
+                (plus(wa_number), job_id, place_key))
+        elif status == "no" and prior_source in ("unverified", "assumed_mobile"):
             self.conn.execute(
                 "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL WHERE job_id=? AND place_key=?",
                 (job_id, place_key))
@@ -456,7 +601,10 @@ class Store:
             "with_twitter_x": cnt("twitter_x IS NOT NULL"),
             "wa_maps_link": cnt("whatsapp_source='maps_link'"),
             "wa_link": cnt("whatsapp_source='wa_link'"),
-            "wa_assumed_mobile": cnt("whatsapp_source='assumed_mobile'"),
+            # 'assumed_mobile' was retired 2026-08-23 — an unverified number is a
+            # CANDIDATE for verification, never a claim that the business is on WhatsApp.
+            "wa_unverified": cnt("whatsapp_source='unverified'"),
+            "wa_verified": cnt("whatsapp_source='verified'"),
             "enrich_pending": cnt("enrich_status='pending'"),
             "enrich_done": cnt("enrich_status='done'"),
             "enrich_thin": cnt("enrich_status='thin'"),

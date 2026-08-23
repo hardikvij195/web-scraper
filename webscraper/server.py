@@ -24,7 +24,9 @@ from datetime import datetime, timezone
 
 from webscraper import __version__
 from webscraper import eta as eta_mod
+from webscraper import lanes as lanes_mod
 from webscraper.config import settings
+from webscraper.lanes import Lane, Pipeline
 from webscraper.store import Store, now_iso
 
 log = logging.getLogger("webscraper.server")
@@ -183,46 +185,51 @@ class Worker(threading.Thread):
             bud = eta_mod.budgets(max_minutes)
             t_now = time.monotonic()
             deadline = (t_now + bud["maps_sec"]) if bud["maps_sec"] else None
-            enrich_deadline = (t_now + bud["maps_sec"] + bud["enrich_sec"]) \
-                if (bud["maps_sec"] and bud["enrich_sec"]) else None
             # Link collection gets at most 40% of the MAPS budget. A wide radius tiles into
             # thousands of sub-searches, so without this split the collection phase burns
             # the whole limit and the job finishes with links found but zero leads scraped.
             collect_until = (t_now + bud["collect_sec"]) if bud["collect_sec"] else None
-            # Deadlines go into the row as wall-clock too: the ETA is computed in the API
-            # handler and in the agent loop, neither of which can see this thread's
+            # The deadline goes into the row as wall-clock too: the ETA is computed in the
+            # API handler and in the agent loop, neither of which can see this thread's
             # monotonic clock.
-            store.update_job(
-                job_id,
-                maps_deadline_at=_wall(bud["maps_sec"]),
-                enrich_deadline_at=(_wall((bud["maps_sec"] or 0) + bud["enrich_sec"])
-                                    if bud["enrich_sec"] else None))
+            #
+            # `enrich_deadline_at` is NO LONGER SET (2026-08-23). Under the lane model
+            # `max_minutes` caps discovery only and the other two lanes drain the backlog,
+            # so a second deadline would re-create exactly the bug the lanes fixed: on job
+            # #6 that budget expired and WhatsApp was cut off after 2 of 30 numbers. The
+            # column stays for old rows; nothing writes it any more.
+            store.update_job(job_id, maps_deadline_at=_wall(bud["maps_sec"]))
             time_up = {"flag": False}
+            # Which Store the discovery closures below talk to. It starts as the worker
+            # thread's, and `_discovery` swaps in the discovery LANE's the moment it starts
+            # running — because sqlite3 connections are bound to the thread that opened
+            # them, and these closures now execute on the lane thread, not this one.
+            # Binding `store` as a default argument (the previous shape) captured the
+            # worker's connection and raised
+            #   "SQLite objects created in a thread can only be used in that same thread"
+            # on the first stop check of every job.
+            disc = {"store": store}
 
-            def should_stop(s=store, j=job_id) -> bool:
+            def should_stop(j=job_id) -> bool:
+                """Discovery's stop predicate: the user's Stop button, or the Maps cap.
+                The other two lanes watch only Stop — see lanes.py."""
+                s = disc["store"]
                 if s.stop_requested(j):
                     return True
                 if deadline is not None and time.monotonic() >= deadline:
                     if not time_up["flag"]:
                         time_up["flag"] = True
                         s.update_job(j, message=(
-                            f"Maps time limit ({max_minutes} min) reached — moving on to "
-                            f"research on what was found"))
+                            f"Maps time limit ({max_minutes} min) reached — discovery stopped; "
+                            f"enrichment and WhatsApp keep going on what was found"))
                     return True
                 return False
 
-            def budget_up(s=store, j=job_id) -> bool:
-                """Stop predicate for the phases AFTER Maps: the user's Stop button, or
-                the second budget running out. Deliberately does NOT include `deadline` —
-                hitting the Maps cap is what *starts* these phases."""
-                if s.stop_requested(j):
-                    return True
-                return enrich_deadline is not None and time.monotonic() >= enrich_deadline
-
             w_start, w_end = job["window_start"], job["window_end"]
 
-            def wait_if_paused(s=store, j=job_id) -> None:
+            def wait_if_paused(j=job_id) -> None:
                 """Block between places while the run window is closed (checked every 30 s)."""
+                s = disc["store"]
                 paused = False
                 while not in_window(w_start, w_end) and not s.stop_requested(j):
                     if not paused:
@@ -273,6 +280,9 @@ class Worker(threading.Thread):
                 area_label = {"txt": ""}
 
                 def on_event(kind: str, data: dict[str, Any]) -> None:
+                    # Local rebind: every `store.…` below therefore uses the DISCOVERY
+                    # LANE's connection, since this callback fires on that thread.
+                    store = disc["store"]
                     pfx = area_label["txt"]
                     if kind == "center":
                         store.update_job(job_id, center_lat=data["lat"], center_lng=data["lng"],
@@ -314,107 +324,47 @@ class Worker(threading.Thread):
                     elif kind == "abort":
                         store.update_job(job_id, message=f"{pfx}{data['reason']}")
 
-                for idx, area in enumerate(areas):
-                    if should_stop():
-                        break
-                    area_label["txt"] = (f"area {idx + 1}/{len(areas)} ({area['location'] or 'anywhere'}): "
-                                         if len(areas) > 1 else "")
-                    known = store.all_place_keys() if job["unique_new"] else None
-                    run_scrape(store, job_id, job["query"], area["location"], int(job["max_places"]), pacing,
-                               headless=bool(job["headless"]), country=job["country"],
-                               on_event=on_event, should_stop=should_stop,
-                               radius_km=area["radius_km"], wait_if_paused=wait_if_paused,
-                               center=area["center"], known_keys=known,
-                               collect_until=collect_until, collect_target=collect_target)
-                    cur = store.get_job(job_id)
-                    agg["scraped_base"] = int(cur["scraped_count"] or 0)
-                    agg["links_total"] = int(cur["links_found"] or 0)
+                # ── the three lanes ─────────────────────────────────────────────────
+                # Discovery's body stays here (it needs these closures); enrichment and
+                # WhatsApp run beside it in their own threads, pulling leads out of the
+                # `places` table as discovery writes them. See lanes.py for why the table
+                # is the queue and why each lane owns its own Store.
+                def _discovery(lane: Lane) -> str | None:
+                    # This runs on the discovery lane's thread. Point every closure above
+                    # at that lane's own Store before touching the DB.
+                    disc["store"] = lane.store
+                    store = lane.store
+                    for idx, area in enumerate(areas):
+                        if should_stop():
+                            break
+                        area_label["txt"] = (f"area {idx + 1}/{len(areas)} ({area['location'] or 'anywhere'}): "
+                                             if len(areas) > 1 else "")
+                        known = store.all_place_keys() if job["unique_new"] else None
+                        run_scrape(store, job_id, job["query"], area["location"], int(job["max_places"]), pacing,
+                                   headless=bool(job["headless"]), country=job["country"],
+                                   on_event=on_event, should_stop=should_stop,
+                                   radius_km=area["radius_km"], wait_if_paused=wait_if_paused,
+                                   center=area["center"], known_keys=known,
+                                   collect_until=collect_until, collect_target=collect_target)
+                        cur = store.get_job(job_id)
+                        agg["scraped_base"] = int(cur["scraped_count"] or 0)
+                        agg["links_total"] = int(cur["links_found"] or 0)
 
-                # Record how fast Maps actually went, so the NEXT job's ETA is grounded in
-                # this machine's real pace instead of a constant (W4).
-                _after_maps = store.get_job(job_id)
-                _record_rate(store, job_id, "scraping", _after_maps["scraped_count"],
-                             _after_maps["scrape_started_at"])
+                    # Record how fast Maps actually went, so the NEXT job's ETA is grounded
+                    # in this machine's real pace instead of a constant (W4).
+                    _after_maps = store.get_job(job_id)
+                    _record_rate(store, job_id, "scraping", _after_maps["scraped_count"],
+                                 _after_maps["scrape_started_at"])
+                    if store.stop_requested(job_id):
+                        return lanes_mod.R_STOPPED
+                    # `time_up` is set by should_stop() the moment the Maps deadline passes,
+                    # which is the difference between "found everything" and "ran out of
+                    # clock" — previously indistinguishable in the UI.
+                    return lanes_mod.R_MAPS_CAP if time_up["flag"] else lanes_mod.R_COMPLETED
 
-                # A user Stop ends the job here; the Maps time limit only ends the *discovery*
-                # phase — this is the hand-off the user asked for: "search leads on google maps
-                # for 30 mins and then stop that and start research on leads website and
-                # linkedin, insta, fb, whatsapp numbers, summary". The research phases below
-                # therefore run on `budget_up`, never on `should_stop`.
-                if store.stop_requested(job_id):
-                    store.update_job(job_id, phase="stopped", status="stopped")
-                    continue
-                user_stop = lambda s=store, j=job_id: s.stop_requested(j)  # noqa: E731
-
-                if job["do_enrich"] and not budget_up():
-                    rows = store.places(job_id, "pending")
-                    store.update_job(job_id, phase="enriching", enrich_total=len(rows), enrich_done=0,
-                                     enrich_started_at=now_iso(),
-                                     message=f"researching {len(rows)} businesses — website, LinkedIn, "
-                                             f"Instagram, Facebook, WhatsApp…")
-                    done = {"n": 0}
-
-                    def on_progress(_r: dict[str, Any], _status: str) -> None:
-                        done["n"] += 1
-                        if done["n"] % 3 == 0 or done["n"] == len(rows):
-                            store.update_job(job_id, enrich_done=done["n"])
-
-                    asyncio.run(enrich_places(store, rows, None, job["country"], on_progress, budget_up))
-                    store.update_job(job_id, enrich_done=done["n"])
-                    _record_rate(store, job_id, "enriching", done["n"], store.get_job(job_id)["enrich_started_at"])
-                    if budget_up() and not user_stop() and done["n"] < len(rows):
-                        store.update_job(job_id, message=(
-                            f"research time budget used up — enriched {done['n']} of {len(rows)}"))
-
-                if job["do_research"] and not budget_up():
-                    from webscraper.research import research_places
-                    targets = [p for p in store.places(job_id) if p.get("website")]
-                    store.update_job(job_id, phase="researching", research_total=len(targets), research_done=0,
-                                     research_started_at=now_iso(),
-                                     message=f"AI research on {len(targets)} businesses (summary / owner / team)…")
-                    rdone = {"n": 0}
-
-                    def on_research(_r: dict[str, Any], _s: str) -> None:
-                        rdone["n"] += 1
-                        if rdone["n"] % 2 == 0 or rdone["n"] == len(targets):
-                            store.update_job(job_id, research_done=rdone["n"])
-
-                    rc = asyncio.run(research_places(store, targets, 3, on_research, budget_up))
-                    store.update_job(job_id, research_done=rdone["n"])
-                    _record_rate(store, job_id, "researching", rdone["n"],
-                                 store.get_job(job_id)["research_started_at"])
-                    if rc.get("skipped") == len(targets) and targets:
-                        store.update_job(job_id, message="AI research skipped — set GEMINI_API_KEY in .env")
-
-                if job["do_wa_verify"] and not budget_up():
-                    from webscraper import wa_verify
-                    targets = [p for p in store.places(job_id)
-                               if (p.get("phone") or p.get("whatsapp_number"))
-                               and p.get("wa_verified") not in ("yes", "no")]
-                    store.update_job(job_id, phase="verifying_wa", wa_verify_total=len(targets),
-                                     wa_verify_done=0, wa_started_at=now_iso(),
-                                     message=f"checking {len(targets)} numbers on WhatsApp (paced)…")
-                    vdone = {"n": 0}
-
-                    # Third parameter is the resolved WhatsApp number. wa_verify has
-                    # passed it since 4e00a3a but this callback never accepted it, so the
-                    # first checked number raised TypeError and killed the whole job -
-                    # WhatsApp verification had never once completed.
-                    def on_wa(_pk: str, _s: str, _num: str | None = None) -> None:
-                        vdone["n"] += 1
-                        store.update_job(job_id, wa_verify_done=vdone["n"])
-
-                    try:
-                        res = wa_verify.verify_places(store, targets, on_wa, budget_up, job_id=job_id)
-                        _record_rate(store, job_id, "verifying_wa", vdone["n"],
-                                     store.get_job(job_id)["wa_started_at"])
-                        note = (f"WhatsApp: {res['yes']} on WA, {res['no']} not, "
-                                f"{res['unknown']} unknown")
-                        if res["capped"]:
-                            note += " · daily cap hit — re-run to finish the rest"
-                        store.update_job(job_id, message=note)
-                    except wa_verify.WaNotLoggedIn as e:
-                        store.update_job(job_id, message=f"WhatsApp verify skipped — {e}")
+                pipe = Pipeline(job_id, dict(job), _discovery)
+                reasons = pipe.run()
+                log.info("job %s lanes finished: %s", job_id, reasons)
 
                 # push to Supabase (best-effort; no-op when not configured / table missing)
                 try:
@@ -426,9 +376,14 @@ class Worker(threading.Thread):
                 except Exception as e:  # noqa: BLE001
                     log.warning("supabase push error: %s", e)
 
-                final = "stopped" if user_stop() else "done"
-                note = f"time limit {max_minutes} min reached" if time_up["flag"] else None
+                # The job is 'stopped' only if the USER stopped it. A lane that hit the Maps
+                # cap, the WhatsApp daily cap or its own error still leaves a finished job —
+                # the per-lane reason says which, so "2 / 30 · done" can no longer happen.
+                user_stopped = store.stop_requested(job_id)
+                final = "stopped" if user_stopped else "done"
+                note = pipe.summary()
                 store.update_job(job_id, phase=final, status=final, message=note)
+                store.log(job_id, "job", f"job {final} — {note}")
                 store.finish_job(job_id, final, note)
             except Exception as e:  # noqa: BLE001 — keep the worker alive for the next job
                 log.exception("job %s failed", job_id)
@@ -507,6 +462,11 @@ def _job_dict(r: Any, store: Store | None = None) -> dict[str, Any]:
     # SaaS cloud and the CRM all render the same figures from the same rolling averages.
     summary = eta_mod.summarise(d, store, now)
     d["phases"] = summary["phases"]
+    # The three concurrent lanes, with each one's runtime, end reason and success flag.
+    # Forwarded so the page renders the SAME numbers the Python model computed — without
+    # this the UI falls back to re-deriving lanes from raw columns in JS, i.e. a second
+    # copy of this logic that can drift.
+    d["lanes"] = summary["lanes"]
     d["eta_sec"] = summary["eta_sec"]
     d["phase_eta_sec"] = summary["phase_eta_sec"]
     d["estimating"] = summary["estimating"]

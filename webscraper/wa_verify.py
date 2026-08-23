@@ -10,6 +10,13 @@ Careful by design — this drives a *real* WhatsApp account, so:
     (settings.wa_delay_min..max) between checks keep the traffic human-paced. Multiple
     accounts raise the ceiling: total/day = cap x number of enabled accounts.
   * Login is always headed (you must see the QR). Verification defaults to headless.
+  * A Chrome that dies mid-run (OOM, crashed renderer, Windows update, a human closing a
+    headed window) is relaunched on the SAME profile dir and the one number in flight is
+    retried - see `_check`. Before 2026-08-23 this step ran last in a sequence, so a dead
+    browser only cost the tail; it is now a long-lived concurrent lane, where the same
+    crash killed the whole lane.
+  * Numbers are BARE digits inside the send URL and carry a leading '+' everywhere they
+    are persisted or reported (user directive 2026-08-23).
 
 Ban risk is never zero - use a spare number, not your main business WhatsApp.
 """
@@ -21,11 +28,12 @@ import time
 from datetime import date
 from typing import Any, Callable
 
-from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
+from playwright.sync_api import Error as PWError, Page, TimeoutError as PWTimeout, sync_playwright
 
+from webscraper.browser_recovery import MAX_RELAUNCH, Relauncher, is_closed
 from webscraper.config import settings
 from webscraper.extractors import normalise_phone
-from webscraper.store import Store
+from webscraper.store import Store, plus
 
 log = logging.getLogger("webscraper.wa_verify")
 
@@ -48,7 +56,12 @@ def profile_dir(name: str):
 
 
 def _e164_digits(phone: str | None, wa_number: str | None, country: str | None) -> str | None:
-    """Best full international number (digits only, no +) for a place."""
+    """Best full international number for a place - BARE digits, deliberately no '+'.
+
+    web.whatsapp.com/send?phone= wants them bare, so this stays the URL-shaped form.
+    Anything that leaves this module for the DB or a progress callback goes through
+    `store.plus()` first (user directive 2026-08-23: every WA number shows a '+').
+    """
     if wa_number:
         d = "".join(ch for ch in wa_number if ch.isdigit())
         if 8 <= len(d) <= 15:
@@ -184,8 +197,53 @@ def verify_places(
     if not accounts:
         raise WaNotLoggedIn("no WhatsApp accounts - run `python -m webscraper wa-login <name>` first")
 
-    open_ctx: dict[str, Any] = {}   # name -> (pw_ctx, page)
+    open_ctx: dict[str, Any] = {}      # name -> (pw_ctx, page); all closed in `finally`
+    relaunchers: dict[str, Relauncher] = {}   # name -> its own relaunch budget
     pw = sync_playwright().start()
+
+    def _relaunch(name: str, where: str) -> bool:
+        """Rebuild `name`'s dead browser and refresh its handle. False once its cap is spent.
+
+        The rebuild reuses data/wa-profiles/<name>/ because the WhatsApp session lives in
+        that profile (IndexedDB, not cookies) - a fresh dir comes back as an unlinked
+        device demanding a QR, i.e. it would silently kill a perfectly good account.
+        """
+        rl = relaunchers.get(name)
+        if rl is None:
+            return False
+        try:
+            if not rl.recover(where):
+                return False
+        except WaNotLoggedIn:
+            open_ctx.pop(name, None)      # relaunched profile came back unlinked
+            raise
+        open_ctx[name] = rl.current
+        return True
+
+    def _check(name: str, num: str) -> str:
+        """One number on one account, retried on a fresh browser if Chrome dies.
+
+        A relaunch is NOT another check: `bump_wa_account` and the counters run once per
+        number in the caller, so a crash can never eat into the daily cap. Pacing is
+        untouched too - the caller's randomised sleep still happens once per number.
+        """
+        while True:
+            page = open_ctx[name][1]
+            try:
+                page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
+                st = _decide(page)
+                _dismiss_popup(page)
+                return st
+            except PWTimeout:                 # subclass of PWError - must stay above it
+                return "unknown"
+            except PWError as e:
+                # maps.py has had this since job #3 died mid-feed with TargetClosedError;
+                # the lanes split (2026-08-23) gave WhatsApp its own long-lived browser
+                # and no recovery at all, so one dead Chrome took the entire lane with it.
+                if not is_closed(e) or not _relaunch(name, f"number {num}"):
+                    raise
+                # loop: retry this ONE number on the relaunched browser.
+
     try:
         for r in rows:
             if should_stop():
@@ -208,7 +266,7 @@ def verify_places(
                 log.info("all accounts hit the daily cap (%d) - stopping; re-run tomorrow", cap)
                 break
 
-            page = _ensure_session(pw, open_ctx, name)
+            page = _ensure_session(pw, open_ctx, relaunchers, name)
             if page is None:      # account logged out — disable it and try the next row
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
                 store.conn.commit()
@@ -216,23 +274,28 @@ def verify_places(
                 continue
 
             try:
-                page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
-                status = _decide(page)
-                _dismiss_popup(page)
+                status = _check(name, num)
             except WaNotLoggedIn:
+                # Session dropped mid-run, or a relaunch found the profile unlinked.
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
                 store.conn.commit()
                 continue
-            except PWTimeout:
-                status = "unknown"
 
             store.bump_wa_account(name, today)
             counts[status] += 1
             counts["checked"] += 1
+            # Bare digits were only ever for the send URL; everything persisted or reported
+            # carries the '+' (directive 2026-08-23). plus() is idempotent. The cloud path
+            # (job_id=None) never touches set_wa_verify - agent.py writes the callback's
+            # number straight into whatsapp_number - so it has to be +'d here, not in store.
+            e164 = plus(num)
             if job_id is not None:
+                # prior_source flows through untouched: 'assumed_mobile' was retired on
+                # 2026-08-23 in favour of 'unverified', and set_wa_verify treats BOTH as
+                # candidates to clear on a 'no', so old and new rows behave the same.
                 store.set_wa_verify(job_id, pk, status, name,
-                                    wa_number=num, prior_source=r.get("whatsapp_source"))
-            on_progress(pk, status, num)
+                                    wa_number=e164, prior_source=r.get("whatsapp_source"))
+            on_progress(pk, status, e164)
             time.sleep(random.uniform(settings.wa_delay_min, settings.wa_delay_max))
     finally:
         for pw_ctx, _ in open_ctx.values():
@@ -244,18 +307,40 @@ def verify_places(
     return counts
 
 
-def _ensure_session(pw, open_ctx: dict[str, Any], name: str) -> Page | None:
-    """Return a live, logged-in page for `name`, launching its profile once. None if logged out."""
+def _ensure_session(pw, open_ctx: dict[str, Any],
+                    relaunchers: dict[str, Relauncher] | None, name: str) -> Page | None:
+    """Return a live, logged-in page for `name`, launching its profile once. None if logged out.
+
+    The launch closure is handed to a Relauncher so a later crash can rebuild *exactly*
+    this context - same persistent profile dir, same headless flag - without the caller
+    needing to know how the browser was built. One Relauncher per account: a flaky account
+    must not spend the relaunch budget of the others.
+    """
     if name in open_ctx:
         return open_ctx[name][1]
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir(name)), headless=settings.wa_verify_headless, locale="en",
-        viewport={"width": 1100, "height": 820},
-        args=["--disable-blink-features=AutomationControlled"])
-    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    page.goto("https://web.whatsapp.com/", timeout=60_000)
-    if not _is_logged_in(page):
-        ctx.close()
+
+    def _open() -> tuple[Any, Page]:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir(name)), headless=settings.wa_verify_headless, locale="en",
+            viewport={"width": 1100, "height": 820},
+            args=["--disable-blink-features=AutomationControlled"])
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://web.whatsapp.com/", timeout=60_000)
+        if not _is_logged_in(page):
+            # Raised, not returned: a relaunch happens deep inside `_check`, and this is
+            # its only way to report "profile came back unlinked" through Relauncher.open().
+            ctx.close()
+            raise WaNotLoggedIn(f"[{name}] profile has no live WhatsApp Web session")
+        return ctx, page
+
+    rl = Relauncher(_open, on_restart=lambda where, n: log.warning(
+        "[%s] WhatsApp browser died during %s - relaunching from %s (%d/%d)",
+        name, where, profile_dir(name), n, MAX_RELAUNCH))
+    try:
+        ctx, page = rl.open()
+    except WaNotLoggedIn:
         return None
+    if relaunchers is not None:
+        relaunchers[name] = rl
     open_ctx[name] = (ctx, page)
     return page

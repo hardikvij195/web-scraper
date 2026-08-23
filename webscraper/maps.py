@@ -24,6 +24,7 @@ from webscraper.extractors import (
     region_of_phone,
 )
 from webscraper.models import Place
+from webscraper.browser_recovery import Relauncher, is_closed
 from webscraper.store import Store, now_iso
 
 log = logging.getLogger("webscraper.maps")
@@ -433,39 +434,25 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
             pg.set_default_timeout(20000)
             return c, pg
 
-        ctx, page = _open()
         # A headed run shares a desktop with a human, and Chrome also dies on its own
         # (OOM, a crashed renderer, a Windows update). Losing the browser used to abort
         # the whole job and throw away every place already collected - job #3 died exactly
         # that way, mid-feed, with TargetClosedError. Relaunching costs one profile reload;
         # the alternative is losing the run. Capped so a browser that cannot start at all
         # still fails fast instead of looping.
-        relaunches = {"n": 0}
-        MAX_RELAUNCH = 3
+        # The mechanism moved to browser_recovery.py (2026-08-23) so the WhatsApp lane,
+        # which had none, gets the same treatment. Behaviour here is unchanged.
+        _relauncher = Relauncher(
+            _open, on_restart=lambda where, n: emit("browser_restart", {"where": where, "attempt": n}))
+        ctx, page = _relauncher.open()
+        _is_closed = is_closed
 
         def _recover(where: str) -> bool:
             nonlocal ctx, page
-            if relaunches["n"] >= MAX_RELAUNCH:
+            if not _relauncher.recover(where):
                 return False
-            relaunches["n"] += 1
-            log.warning("browser died during %s — relaunching (%d/%d)",
-                        where, relaunches["n"], MAX_RELAUNCH)
-            emit("browser_restart", {"where": where, "attempt": relaunches["n"]})
-            try:
-                ctx.close()
-            except Exception:  # noqa: BLE001 — already gone; closing is best effort
-                pass
-            ctx, page = _open()
+            ctx, page = _relauncher.current
             return True
-
-        def _is_closed(e: Exception) -> bool:
-            # Playwright has no stable exception class for this across versions, and the
-            # same condition surfaces as several messages depending on which call noticed.
-            m = str(e).lower()
-            return ("target page, context or browser has been closed" in m
-                    or "browser has been closed" in m
-                    or "target closed" in m
-                    or "connection closed" in m)
 
         try:
             zoom: float | None = None

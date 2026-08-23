@@ -824,6 +824,18 @@ async function loadDetail() {
 }
 window.rerender = () => lastJob && renderDetail(lastJob);
 
+// 'unverified' means "we have a phone number that looks like a mobile, and nobody has
+// checked it" — that gets NO badge, because any badge beside a number reads as a claim
+// about it. Only real evidence is labelled. ('assumed_mobile' retired 2026-08-23.)
+const WA_TAG = { verified: 'Verified', maps_link: 'WA link', wa_link: 'WA link' };
+// Numbers are stored +E.164; wa.me wants bare digits, so strip the '+' in the href only.
+const waCell = p => {
+  if (!p.whatsapp_number) return '<span class="muted">—</span>';
+  const shown = esc(p.whatsapp_number);
+  const digits = String(p.whatsapp_number).replace(/\D/g, '');
+  const tag = WA_TAG[p.whatsapp_source] ? ` <span class="wa">${WA_TAG[p.whatsapp_source]}</span>` : '';
+  return `<a href="https://wa.me/${digits}" target="_blank">${shown}</a>${tag}`;
+};
 function renderDetail(j) {
   const prevTbl = document.querySelector('#detail .tbl');
   const tblTop = prevTbl ? prevTbl.scrollTop : 0, tblLeft = prevTbl ? prevTbl.scrollLeft : 0;
@@ -888,7 +900,7 @@ function renderDetail(j) {
         <td class="muted">${i+1}</td>
         <td class="wrap"><b>${esc(p.name)}</b><div class="muted">${esc(p.category||'')}</div></td>
         <td>${p.phone?`<a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`:''}</td>
-        <td>${p.whatsapp_number?`<a href="https://wa.me/${esc(p.whatsapp_number)}" target="_blank">${esc(p.whatsapp_number)}</a> <span class="wa ${p.whatsapp_source==='assumed_mobile'?'assumed':''}">${esc(p.whatsapp_source)}</span>`:'<span class="muted">—</span>'}</td>
+        <td>${waCell(p)}</td>
         <td>${p.email?`<a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`:''}${(p.emails||[]).length>1?`<div class="muted">+${p.emails.length-1} more</div>`:''}</td>
         <td>${p.website?`<a href="${esc(p.website)}" target="_blank">${esc(host(p.website))}</a>`:''}</td>
         <td class="soc">

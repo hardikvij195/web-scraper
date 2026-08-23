@@ -10,7 +10,7 @@ proxies needed from a home IP at the default pace (~6 s per place).
 | From Google Maps | From the business website |
 |---|---|
 | name, category, address, phone (E.164), website, rating, lat/lng, plus code, place_id, maps URL, WhatsApp button link (if Maps shows one) | email(s), instagram, facebook, linkedin, twitter_x, youtube, tiktok, whatsapp (`wa.me` / `api.whatsapp.com` links) |
-| `reviews_count`, `price_range` — **only with `--no-headless`** (Google serves a lite panel to headless browsers) | `whatsapp_source` tells you how sure we are: `maps_link` > `wa_link` > `assumed_mobile` (phone is a mobile number) > `none` |
+| `reviews_count`, `price_range` — **only with `--no-headless`** (Google serves a lite panel to headless browsers) | `whatsapp_source` tells you how sure we are: `verified` (we checked it on WhatsApp) > `maps_link` > `wa_link` > `unverified` (a plain phone number — **not** a claim it is on WhatsApp, and it carries no tag in the UI) > `none` |
 
 ## Setup (Windows / any OS with Python 3.11+)
 

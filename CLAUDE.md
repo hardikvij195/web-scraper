@@ -76,7 +76,9 @@ data/            gitignored: leads.db, browser-profile/, exports/
 - Maps panel sometimes shows a WhatsApp button (`wa.me/…`, `api.whatsapp.com/send?phone=…`,
   or `wa.link/<slug>` short link). Captured into `raw.maps_wa_links`; `wa.link` is resolved
   by following the redirect during `enrich`. Source priority: `maps_link` > `wa_link` (site)
-  > `assumed_mobile` (phonenumbers says MOBILE) > `none`.
+  > `unverified` (a plain number we have NOT confirmed) > `none`. A real check promotes it to
+  `verified`; a miss clears the number. `assumed_mobile` was retired 2026-08-23 — never assume
+  a WhatsApp, and never render a tag for `unverified`. Numbers are stored `+E.164`.
 - Windows console is cp1252 — `__main__.py` reconfigures stdout/stderr to UTF-8; avoid `→`
   in typer help strings anyway.
 - Enrichment: one crawl per website **domain** (chains list 5–10 Maps entries on one site),
@@ -97,7 +99,18 @@ data/            gitignored: leads.db, browser-profile/, exports/
 ## Rules
 
 - Keep it slow by default (`SCRAPE_DELAY_SEC=6`). Never add concurrency to the Maps step
-  without a proxy pool; the enricher is the place for parallelism.
+  without a proxy pool; the enricher is the place for parallelism. **This still holds under
+  the lane model** — the three lanes run at once, but discovery itself is one thread.
+- **Lanes (2026-08-23, `lanes.py`): the `places` table is the queue.** Discovery, enrichment
+  and WhatsApp run concurrently; each owns its **own `Store`** (sqlite3 connections are not
+  thread-safe) and each writes **disjoint columns** (`disc_*` / `enr_*` / `wa_*` plus its own
+  counters). That disjointness is what makes three threads on one SQLite file safe — preserve
+  it when adding a counter, and never have two lanes write the same column.
+- `max_minutes` caps **discovery only**. Enrichment and WhatsApp drain the backlog afterwards.
+- A lane must never report success when it gave up: end every lane through
+  `Store.lane_end(job_id, lane, reason)` with a real reason token.
+- Browser crash recovery is shared — `browser_recovery.Relauncher` / `is_closed`. Any new
+  Playwright surface uses it rather than growing its own copy.
 - New extracted field = add to `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()` and
   `EXPORT_COLS` in `store.py`. Schema changes on an existing DB go through `_migrate()`.
 - Pure parsing goes in `extractors.py` with a test; Playwright code stays in `maps.py`.
@@ -114,7 +127,10 @@ data/            gitignored: leads.db, browser-profile/, exports/
 
 ## Open work
 
-Tracked in [`tasks.md`](./tasks.md) — **W1** push this repo to GitHub (no remote yet),
-**W2** split jobs into Maps-discovery then enrichment against one time budget, **W3** stream
-each lead to the CRM as it is found, **W4** emit an ETA for every phase. W2-W4 are the agent
-half of **T136** in `../hvt-ai-crm-live/tasks.md`.
+Tracked in [`tasks.md`](./tasks.md). **W0–W4 are done** (remote, budget split, live streaming,
+phased jobs, banked-rate ETAs). In flight as of 2026-08-23: **W5–W10** — three concurrent
+lanes, per-lane runtime/reason/success, job logs, crash recovery on every lane, recording
+*why* enrichment failed plus a browser retry for WAF 403s, and retiring the "Assumed Mobile"
+tag. Design:
+[`docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md`](./docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md).
+The CRM half is **T141–T143** in `../hvt-ai-crm-live/tasks.md`.
