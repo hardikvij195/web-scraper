@@ -94,6 +94,10 @@ class Lane(threading.Thread):
         try:
             if not self.enabled():
                 self.reason = R_DISABLED
+                # Record it, and wipe any stamp left by an earlier pass of this job.
+                # A re-run reuses the row, so yesterday's `scrape_started_at` would
+                # otherwise make a switched-off lane read as still running.
+                self.store.lane_disabled(self.job_id, self.key)
                 return
             self.store.lane_start(self.job_id, self.key)
             self.reason = self.work() or R_COMPLETED

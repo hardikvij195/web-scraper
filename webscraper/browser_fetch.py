@@ -38,8 +38,18 @@ log = logging.getLogger("webscraper.browser_fetch")
 #: Default ON - the whole point is that a blocked site stops being a dead lead.
 #: `ENRICH_BROWSER_FALLBACK=false` in `.env` turns the slow path off entirely.
 BROWSER_FALLBACK = _bool(os.getenv("ENRICH_BROWSER_FALLBACK"), True)
-#: Headless is fine here (unlike WhatsApp Web, which re-QRs a headless profile, and unlike
-#: Maps, which serves headless a lite panel) - a business site renders the same either way.
+#: Headless is fine for ordinary sites (unlike WhatsApp Web, which re-QRs a headless
+#: profile, and unlike Maps, which serves headless a lite panel) - a business site renders
+#: the same either way.
+#:
+#: It is NOT fine against a Cloudflare interactive challenge. Measured on job #7: the
+#: headless retry rescued some 403s (hrowen.co.uk, carluv.co.uk) but 15 remained, and
+#: those are the ones that want a real browser fingerprint. `ENRICH_BROWSER_HEADLESS=false`
+#: in `.env` trades a visible window on the agent PC for a materially better pass rate.
+#:
+#: What this project will NOT do: solve CAPTCHAs, spoof fingerprints, or rotate identities
+#: to defeat a challenge that is deliberately refusing automated access. A real browser
+#: making an ordinary request is the honest end of this; past that, the site has said no.
 HEADLESS = _bool(os.getenv("ENRICH_BROWSER_HEADLESS"), True)
 
 #: Its OWN profile dir: Chromium locks a user-data-dir, and a Maps scrape is usually still

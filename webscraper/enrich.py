@@ -57,8 +57,17 @@ def http_error(status_code: int) -> str:
 
 
 def is_block(error: str | None) -> bool:
-    """True for the failures a real browser has a chance against."""
-    return error in tuple(http_error(c) for c in BLOCK_CODES)
+    """True for the failures a real browser has a chance against.
+
+    `timeout` is in the list on evidence, not on principle: job #7 finished with 11
+    timeouts against 15 outright 403s, and a plain httpx timeout is often a host that
+    is slow, JS-gated or quietly throttling a non-browser client rather than a site
+    that is genuinely down — all cases a real browser page load can still win.
+
+    Deliberately NOT here: `dns` (the domain does not resolve — nothing to retry with)
+    and 404/400/500 (the server answered, and answered no).
+    """
+    return error == "timeout" or error in tuple(http_error(c) for c in BLOCK_CODES)
 
 
 #: getaddrinfo's message differs per platform; all of them mean the same dead domain.

@@ -302,6 +302,20 @@ class Store:
             (now_iso(), job_id))
         self.conn.commit()
 
+    def lane_disabled(self, job_id: int, lane: str) -> None:
+        """Mark a lane this job will not run, and CLEAR its stamps.
+
+        Clearing the start stamp is the point. On a re-run the row still carries the
+        start time from the job's original pass, so a lane that is now switched off
+        (Maps discovery during a re-enrich) looked "started but never ended" — i.e.
+        running for ever, with a spinner, on a job that had finished.
+        """
+        started, ended, ok, reason_col = self.LANE_COLS[lane]
+        self.conn.execute(
+            f"UPDATE jobs SET {started}=NULL, {ended}=NULL, {ok}=NULL, {reason_col}='disabled' "
+            f"WHERE id=?", (job_id,))
+        self.conn.commit()
+
     def lane_end(self, job_id: int, lane: str, reason: str) -> None:
         started, ended, ok, reason_col = self.LANE_COLS[lane]
         self.conn.execute(
