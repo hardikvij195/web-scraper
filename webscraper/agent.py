@@ -131,8 +131,26 @@ class CrmCloud:
 
 
 def _flat(r: dict) -> dict:
+    """One CRM `sync` row.
+
+    Keys whose value is None are DROPPED. Since 2026-08-23 the Edge Function treats sync
+    as a partial patch — absent key = leave the stored value alone, present-and-null =
+    deliberately clear it — so emitting every column unconditionally (what `_row` does for
+    the SaaS table) would wipe good CRM data with nulls the local row simply does not
+    carry. That is not theoretical: `wa_verified` and `whatsapp_source` are both in the
+    function's column list, so a re-enrich batch would have erased WhatsApp verification
+    results for every lead it touched.
+
+    Empty strings go too, for the same reason one step subtler: `fmt_team(None)` returns
+    `""`, not None, so `team` was present in EVERY row and would have overwritten a real
+    team list with blank on any partial sync.
+
+    Nothing is lost by dropping them: a brand-new lead's omitted columns take their column
+    defaults, and the only path that must genuinely clear a value — a WhatsApp miss — goes
+    through the `set_wa` action, never through `sync`.
+    """
     from webscraper.supa import _row
-    return _row(r)
+    return {k: v for k, v in _row(r).items() if v is not None and v != ""}
 
 
 #: Log lines shipped per tick. Bounded so a job that logged for an hour while the CRM was

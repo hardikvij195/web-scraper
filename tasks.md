@@ -2,7 +2,7 @@
 
 `[x]` done · `[~]` in progress · `[ ]` todo. Newest on top.
 
-> **State 2026-08-23: W0-W4 are all done.** Remote is `hardikvij195/web-scraper`, HEAD
+> **State 2026-08-23: W0-W10 are all done** (W11 open — a pre-existing SaaS-sync break found by the live smoke). Remote is `hardikvij195/web-scraper`, HEAD
 > `a544ae7`, tree clean, 0 unpushed. Cross-repo backlog index:
 > `../hvt-ai-crm-live/tasks.md` — the items below are the agent half of its **T136**
 > (closed); the CRM half (UI, ETA display, job phases in the DB) lives there.
@@ -18,7 +18,7 @@
 Design: [`docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md`](./docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md).
 CRM half = **T141-T143** in `../hvt-ai-crm-live/tasks.md`.
 
-### W5 - Discovery, enrichment and WhatsApp run at the same time  [~]
+### W5 - Discovery, enrichment and WhatsApp run at the same time  [x]
 Prompt: "in leads finder, can we do lead enrichment and whatsapp verify side by side of each
 lead => like 3 different widnows, leads window will pass leads as soon as they get the lead
 into the crm, then side by side as new leads come in, the enrichment will happen for leads
@@ -33,7 +33,7 @@ WhatsApp drain the backlog afterwards (user's call: a lead found at minute 29 is
 nothing unverified). AI research is folded into the enrichment lane so a lead reaches
 WhatsApp only once everything known about it is known.
 
-### W6 - Per-lane runtime, end reason and success  [~]
+### W6 - Per-lane runtime, end reason and success  [x]
 Prompt: "also show info how much time time each ran, and the reason of end and was it
 successfull".
 Job #6 rendered `WhatsApp verification - 2 / 30 numbers` and then the word **done**. It was
@@ -43,14 +43,14 @@ each lane now writes its own `*_ended_at` / `*_ok` / `*_reason` (`completed`, `n
 `maps_cap`, `stopped`, `wa_daily_cap`, `wa_not_logged_in`, `disabled`, `error:<detail>`);
 `ok` is 1 only for the first two. **A lane that gave up can no longer render as done.**
 
-### W7 - Job logs  [~]
+### W7 - Job logs  [x]
 Prompt: "add a logs btn to show logs in ad dialog box for each job on that page".
 There was nothing to show: `jobs.message` holds only the latest line and is overwritten
 constantly, and the real log went to `data/agent.log` on the PC. New `job_logs` table +
 `Store.log()/logs()`, shipped to the CRM on each progress tick behind a `logs_synced_upto`
 watermark that only advances after the POST succeeds.
 
-### W8 - Crash recovery on every lane  [~]
+### W8 - Crash recovery on every lane  [x]
 Prompt: "is there a backup logic, if chrome shuts down due to some error or any issues, will
 it open ?". Partly - **for discovery only**. `a544ae7` gave `maps.py` a relaunch-and-retry;
 WhatsApp had none, so a dead WhatsApp Chrome killed that lane. The mechanism moved to
@@ -58,7 +58,7 @@ WhatsApp had none, so a dead WhatsApp Chrome killed that lane. The mechanism mov
 and the enrichment 403 retry too. Process-level recovery already existed
 (`run-agent-loop.bat` + resetting stuck jobs to `queued` on startup).
 
-### W9 - Say WHY enrichment failed, and beat the 403  [~]
+### W9 - Say WHY enrichment failed, and beat the 403  [x]
 Prompt: "why did enrichment failed for some leads => check job 6 once".
 Reproduced live: of job #6's 9 failures, **8 are WAF/Cloudflare 403s**
 (`lookers.co.uk`, `hrowen.co.uk` x3, `carluv.co.uk`, `mayfairmotorsolutions.com`,
@@ -82,7 +82,7 @@ table** - `grep -rn wa_verified supabase_migrations/` returns nothing. So every
 (plus `whatsapp_source`, `enrich_error`, and the other columns added since) to
 `web_scraper_leads`, applied against Supabase `gfgkcnjxvxlusplwmvae`.
 
-### W10 - "Assumed Mobile" retired, and every WA number gets a `+`  [~]
+### W10 - "Assumed Mobile" retired, and every WA number gets a `+`  [x]
 Prompt: "remove => Assumed Mobile tag => verify it and show the wa link tag, donot assume any
 wa link, also add + as well in front of all wa nos".
 A plain mobile number is a **candidate for verification, never a claim**. `assumed_mobile`
