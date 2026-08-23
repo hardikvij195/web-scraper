@@ -38,6 +38,13 @@ _COLS = ["place_key", "name", "category", "phone", "whatsapp_number", "whatsapp_
          "wa_verified", "email", "emails", "website", "instagram", "facebook", "linkedin", "twitter_x",
          "youtube", "tiktok", "address", "country", "rating", "reviews_count", "price_range",
          "lat", "lng", "summary", "owner", "team", "maps_url", "place_id", "enrich_status",
+         # WHY a crawl found nothing (http_403 | dns | timeout | non_html | no_pages).
+         # Without it the CRM can show THAT enrichment failed but never why — the state
+         # that made job #6's 9 WAF-blocked leads look arbitrarily broken.
+         # ⚠ The SaaS `web_scraper_leads` table lacks this column AND `wa_verified` (no
+         # migration ever added them, see W11), so that push already 400s. The CRM's
+         # `lead_gen_results`, which is the path actually in use, has both.
+         "enrich_error",
          "scraped_at", "job_id", "job_query", "job_location"]
 
 
