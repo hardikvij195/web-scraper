@@ -172,6 +172,10 @@ class Store:
             ("headless", "INTEGER NOT NULL DEFAULT 1"),
             ("country", "TEXT"),
             ("reenrich_only", "INTEGER NOT NULL DEFAULT 0"),   # re-queued just to retry enrichment
+            # JSON array of place_key: a re-run scoped to exactly the leads the user
+            # had filtered in the CRM. NULL/absent = the whole job. Without this the
+            # CRM's "Re-enrich (24)" silently re-ran everything.
+            ("place_keys", "TEXT"),
             ("radius_km", "REAL"),           # optional: skip places farther than this from the centre
             ("center_lat", "REAL"), ("center_lng", "REAL"),   # resolved from Maps when the job starts
             ("window_start", "TEXT"), ("window_end", "TEXT"), # legacy clock window (API still honours it)
@@ -336,21 +340,47 @@ class Store:
                     r[c] = {} if c == "raw" else []
         return rows
 
+    def _scope_clause(self, job_id: int) -> tuple[str, list[Any]]:
+        """`AND place_key IN (...)` when the job is scoped to a subset, else nothing.
+
+        A re-run started from the CRM carries the place_keys the user had FILTERED in
+        the view. Ignoring it is not a cosmetic bug: "Re-enrich (24)" would re-crawl
+        every lead in the job.
+        """
+        keys = self.job_place_keys(job_id)
+        if not keys:
+            return "", []
+        return f" AND place_key IN ({','.join('?' * len(keys))})", list(keys)
+
     def pending_enrichment(self, job_id: int, limit: int = 10) -> list[dict[str, Any]]:
         """Leads discovery has written that enrichment has not taken yet."""
+        scope, args = self._scope_clause(job_id)
         return self._decode_json_cols([dict(r) for r in self.conn.execute(
-            "SELECT * FROM places WHERE job_id=? AND enrich_status='pending' "
-            "ORDER BY rowid LIMIT ?", (job_id, limit))])
+            "SELECT * FROM places WHERE job_id=? AND enrich_status='pending'" + scope
+            + " ORDER BY rowid LIMIT ?", (job_id, *args, limit))])
 
     def pending_wa_verify(self, job_id: int, limit: int = 25) -> list[dict[str, Any]]:
         """Leads whose enrichment has RESOLVED (any outcome — a 403 site still has the
         Maps phone) that carry a number and have no verdict yet. 'yes'/'no' are final:
         re-checking them would burn the daily cap for nothing."""
+        scope, args = self._scope_clause(job_id)
         return self._decode_json_cols([dict(r) for r in self.conn.execute(
             "SELECT * FROM places WHERE job_id=? AND enrich_status <> 'pending' "
             "AND (COALESCE(phone,'') <> '' OR COALESCE(whatsapp_number,'') <> '') "
-            "AND COALESCE(wa_verified,'') NOT IN ('yes','no') "
-            "ORDER BY rowid LIMIT ?", (job_id, limit))])
+            "AND COALESCE(wa_verified,'') NOT IN ('yes','no')" + scope
+            + " ORDER BY rowid LIMIT ?", (job_id, *args, limit))])
+
+    def job_place_keys(self, job_id: int) -> list[str] | None:
+        """The subset this job is scoped to, or None for "every lead in the job"."""
+        r = self.conn.execute("SELECT place_keys FROM jobs WHERE id=?", (job_id,)).fetchone()
+        raw = r["place_keys"] if r and "place_keys" in r.keys() else None
+        if not raw:
+            return None
+        try:
+            keys = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return [str(k) for k in keys] if isinstance(keys, list) and keys else None
 
     def count_places(self, job_id: int) -> int:
         r = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()

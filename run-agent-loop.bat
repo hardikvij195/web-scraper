@@ -13,7 +13,7 @@ if not exist "data" mkdir "data"
 
 :loop
 echo [%date% %time%] starting agent >> "data\agent.log"
-"%PY%" -m webscraper agent --crm --poll 15 >> "data\agent.log" 2>&1
+"%PY%" -m webscraper agent --crm --poll 5 >> "data\agent.log" 2>&1
 echo [%date% %time%] agent exited (code %errorlevel%) - restarting in 15s >> "data\agent.log"
 timeout /t 15 /nobreak >nul
 goto loop

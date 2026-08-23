@@ -248,7 +248,19 @@ def _requeue_orphans(store: Store, kind: str) -> int:
     return len(rows)
 
 
-def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> None:
+#: How long the loop waits after a tick that DID something. A user who just pressed
+#: "Re-verify" is watching the screen, so the next look must be almost immediate —
+#: re-runs used to sit at "queued" for up to a full poll interval (15s in the
+#: scheduled task) before anything visibly happened.
+BUSY_POLL_SEC = 1.0
+
+#: After work stops, stay in the fast lane this long before going back to the
+#: configured interval. Covers the common "finish one job, another is already
+#: queued behind it" case without polling hard forever.
+FAST_WINDOW_SEC = 30.0
+
+
+def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
     if not srv.worker.is_alive():
@@ -271,12 +283,37 @@ def run_agent(base: str, token: str, poll_sec: int = 20, kind: str = "saas") -> 
     # local job id -> highest places.rowid already streamed up. In memory only: after a
     # restart it starts at 0 and re-sends that job's rows once, which upsert absorbs.
     synced_upto: dict[int, int] = {}
+    # Adaptive polling. A flat interval meant a job the user had just created sat at
+    # "queued" for up to that whole interval before the agent even looked — with the
+    # scheduled task's `--poll 15`, pressing Re-verify did nothing visible for 15s.
+    # While there is work in flight (or just finished) we look every second; once
+    # everything is quiet we fall back to `poll_sec`.
+    ACTIVE_PHASES = ("queued", "waiting", "scraping", "enriching", "researching", "verifying_wa")
+    last_busy = 0.0
+
+    def _busy() -> bool:
+        """Anything running locally, or anything still waiting to run."""
+        if srv.worker.current_job is not None:
+            return True
+        row = store.conn.execute(
+            f"SELECT 1 FROM jobs WHERE phase IN ({','.join('?' * len(ACTIVE_PHASES))}) LIMIT 1",
+            ACTIVE_PHASES).fetchone()
+        return row is not None
+
     while True:
         try:
             _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:
             log.warning("cloud unreachable: %s", e)
-        time.sleep(poll_sec)
+        try:
+            if _busy():
+                last_busy = time.monotonic()
+        except Exception:                                  # noqa: BLE001
+            # A busy-check failure must never stop the loop; fall back to the
+            # configured interval, which is the old behaviour.
+            log.debug("busy check failed", exc_info=True)
+        fast = (time.monotonic() - last_busy) < FAST_WINDOW_SEC
+        time.sleep(BUSY_POLL_SEC if fast else poll_sec)
 
 
 def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
@@ -374,6 +411,45 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     log.info("re-verify #%s: %d checked", jid, len(collected))
 
 
+def _place_keys_json(cj: dict) -> str | None:
+    """The CRM's `place_keys` array as JSON text, or None for "the whole job"."""
+    keys = cj.get("place_keys")
+    if isinstance(keys, list) and keys:
+        import json as _j
+        return _j.dumps([str(k) for k in keys])
+    return None
+
+
+def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str) -> None:
+    """Re-arm an ALREADY-MIRRORED cloud job that the CRM has queued again.
+
+    Re-enrich / re-verify reuse the same cloud job id, so there is nothing new to
+    create — the local row just has to be pointed at the new scope and put back in
+    the queue. Without this the `mirrored` guard skipped it silently and the CRM
+    showed "queued" for ever.
+    """
+    row = store.conn.execute(
+        "SELECT id FROM jobs WHERE cloud_id=? AND cloud_kind=?", (cj["id"], kind)).fetchone()
+    if not row:
+        return
+    if cloud.claim(cj["id"]) is None:
+        return                                   # another agent got there first
+    local_id = int(row["id"])
+    store.update_job(
+        local_id,
+        phase="queued", status="running", note=None, finished_at=None,
+        stop_requested=0,
+        reenrich_only=int(bool(cj.get("reenrich_only", False))),
+        do_enrich=int(bool(cj.get("do_enrich", True))),
+        do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
+        place_keys=_place_keys_json(cj),
+        message="re-run requested from the CRM",
+    )
+    store.log(local_id, "job", f"re-run requested from the CRM (cloud job #{cj['id']})")
+    srv.worker.wake.set()                        # do not wait out the poll interval
+    log.info("cloud job #%s re-queued -> local job #%s", cj["id"], local_id)
+
+
 def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
           synced_upto: dict[int, int] | None = None) -> None:
     mirrored = {r["cloud_id"] for r in store.conn.execute(
@@ -389,6 +465,14 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             _reverify_wa(cloud, store, cj["id"])
             continue
         if cj["id"] in mirrored:
+            # ALREADY MIRRORED — but the CRM may have queued it AGAIN. "Re-enrich" and
+            # "Re-verify" re-queue the same cloud job rather than creating a new one, and
+            # this guard used to drop them on the floor: the job sat at "queued" in the UI
+            # for ever with an empty log, because nothing local ever started. (Observed on
+            # live jobs #6 and #7, 2026-08-23.) `wa_verify_only` had its own bypass above;
+            # every other re-run shape needs this one.
+            if str(cj.get("status") or "") == "queued":
+                _requeue_rerun(cloud, store, cj, kind)
             continue
         if cloud.claim(cj["id"]) is None:
             continue
@@ -410,6 +494,11 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         store.update_job(local_id, cloud_id=cj["id"], cloud_kind=kind,
                          do_research=int(bool(cj.get("do_research", False))),
                          do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
+                         # Carried from the very first mirror, not just on a re-run: a job
+                         # created as a scoped re-enrich would otherwise start a full Maps
+                         # scrape of everything.
+                         reenrich_only=int(bool(cj.get("reenrich_only", False))),
+                         place_keys=_place_keys_json(cj),
                          locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
     # mirror running/finished local state up

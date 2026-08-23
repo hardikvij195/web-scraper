@@ -241,24 +241,25 @@ class Worker(threading.Thread):
 
             try:
                 t0 = now_iso()
+                # A re-enrich used to short-circuit here into its own sequential crawl and
+                # `continue` — which meant it never reached the lane Pipeline, so WhatsApp
+                # verification could NOT run alongside it however the job was configured.
+                # Now it just prepares the rows and falls through: DiscoveryLane disables
+                # itself when `reenrich_only` is set (no Maps visit), while the enrichment
+                # and WhatsApp lanes run concurrently over the scoped leads.
                 if job["reenrich_only"]:
-                    # Retry the website crawl only (failed / thin / still-pending rows); no Maps visit.
-                    rows = [r for r in store.places(job_id) if r["enrich_status"] in ("failed", "thin", "pending")]
-                    store.update_job(job_id, phase="enriching", status="running", started_at=t0,
-                                     enrich_started_at=t0, enrich_total=len(rows), enrich_done=0,
-                                     message=f"re-crawling {len(rows)} websites…")
-                    done = {"n": 0}
-
-                    def on_progress2(_r: dict[str, Any], _status: str) -> None:
-                        done["n"] += 1
-                        store.update_job(job_id, enrich_done=done["n"])
-
-                    asyncio.run(enrich_places(store, rows, None, job["country"], on_progress2, should_stop))
-                    _record_rate(store, job_id, "enriching", done["n"], t0)
-                    final = "stopped" if should_stop() else "done"
-                    store.update_job(job_id, phase=final, status=final, message=None, reenrich_only=0)
-                    store.finish_job(job_id, final)
-                    continue
+                    # Hand the lane its work by resetting the rows worth retrying. Scoped to
+                    # `place_keys` when the CRM asked for a subset, so "Re-enrich (24)" is 24
+                    # leads and not the whole job.
+                    keys = store.job_place_keys(job_id)
+                    retry = [r for r in store.places(job_id)
+                             if r["enrich_status"] in ("failed", "thin")
+                             and (not keys or r["place_key"] in keys)]
+                    for r in retry:
+                        store.update_enrichment(job_id, r["place_key"], {"enrich_status": "pending"})
+                    store.log(job_id, "job",
+                              f"re-enrich queued for {len(retry)} lead(s)"
+                              + (f" (scoped to {len(keys)})" if keys else " (whole job)"))
 
                 store.update_job(job_id, phase="scraping", status="running", message="opening Google Maps…",
                                  started_at=t0, scrape_started_at=t0)
