@@ -185,8 +185,13 @@ class EnrichmentLane(Lane):
                 done["n"] += 1
                 store.update_job(self.job_id, enrich_done=seen + done["n"])
 
+            # Pass the job's window choice through: a re-enrich run headed ("Show window"
+            # in the CRM) must actually open a visible browser on a blocked site. `headless`
+            # is stored 1/0; None leaves the module default when the column is unset.
+            hl = self.job.get("headless")
             asyncio.run(enrich_places(store, batch, None, self.job.get("country"),
-                                      on_progress, self.stopped))
+                                      on_progress, self.stopped,
+                                      headless=None if hl is None else bool(hl)))
             still_pending = {r["place_key"] for r in
                              store.pending_enrichment(self.job_id, ENRICH_BATCH)}
             if before & still_pending:
@@ -199,8 +204,14 @@ class EnrichmentLane(Lane):
                 stuck = 0
 
             seen += done["n"]
+            # Total = what THIS run will process, not every place in the job. `seen` is this
+            # run's completed count and `count_pending_enrichment` is what is still queued
+            # (scoped to place_keys), so their sum tracks correctly for BOTH a fresh job
+            # (pending grows as discovery feeds it) and a re-enrich (a fixed subset). Using
+            # count_places here showed "5 / 180" for a 21-lead re-enrich — the "starting
+            # from 0" the user reported, because 137 already-done leads inflated the total.
             store.update_job(self.job_id, enrich_done=seen,
-                             enrich_total=store.count_places(self.job_id))
+                             enrich_total=seen + store.count_pending_enrichment(self.job_id))
             store.record_phase_rate(self.job_id, "enriching", done["n"], time.monotonic() - t0)
             self.note(f"enriched {seen} businesses so far")
 

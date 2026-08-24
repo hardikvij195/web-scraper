@@ -404,6 +404,16 @@ class Store:
         r = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()
         return int(r[0] or 0)
 
+    def count_pending_enrichment(self, job_id: int) -> int:
+        """How many leads still await enrichment — respecting the job's place_keys scope, so
+        a scoped re-enrich counts only its subset. This is what the enrichment lane's `total`
+        should measure against: on a 21-lead re-enrich the bar must read "/21", not "/180"."""
+        scope, args = self._scope_clause(job_id)
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status='pending'" + scope,
+            (job_id, *args)).fetchone()
+        return int(r[0] or 0)
+
     def stop_requested(self, job_id: int) -> bool:
         r = self.conn.execute("SELECT stop_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
         return bool(r and r[0])

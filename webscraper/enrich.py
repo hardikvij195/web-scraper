@@ -211,9 +211,16 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
 async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: int | None = None,
                         country: str | None = None,
                         on_progress: Callable[[dict[str, Any], str], None] | None = None,
-                        should_stop: Callable[[], bool] | None = None) -> dict[str, int]:
+                        should_stop: Callable[[], bool] | None = None,
+                        headless: bool | None = None) -> dict[str, int]:
     """Run crawl_site over `rows` (dicts from Store.places) and write results back.
-    `should_stop` is checked before each site; remaining rows stay `pending`."""
+    `should_stop` is checked before each site; remaining rows stay `pending`.
+
+    `headless` controls the browser SLOW PATH's window: None keeps the module default
+    (ENRICH_BROWSER_HEADLESS), False forces a visible window. This is how the CRM's
+    per-job "Show window" choice reaches the enrichment browser — without it the toggle
+    only ever affected Maps discovery, so a re-enrich (enrichment only) ran hidden no
+    matter what the user picked."""
     country = country or settings.default_country
     should_stop = should_stop or (lambda: False)
     sem = asyncio.Semaphore(concurrency or settings.enrich_concurrency)
@@ -270,7 +277,8 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                     if not BROWSER_FALLBACK:
                         browser["off"] = True
                         return None
-                    browser["fetcher"] = await asyncio.to_thread(BrowserFetcher)
+                    browser["fetcher"] = await asyncio.to_thread(
+                        lambda: BrowserFetcher(headless=headless))
                 except Exception as e:                # noqa: BLE001 — no browser, no retry
                     log.warning("browser fallback unavailable (%s) — blocked sites stay failed", e)
                     browser["off"] = True

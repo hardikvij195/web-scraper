@@ -13,6 +13,28 @@
 
 ---
 
+## Session 2026-08-24 (cont.) — re-enrich counter + headed-window fixes (from live job 11)
+
+Found by driving live job #11 (Clinics, Cambridge) — a `reenrich_only` re-run.
+
+### W14 — enrichment "starting from 0 / 180" + "Show window" ignored on re-run  [x]
+Two real bugs, both surfaced on job 11:
+1. **Counter**: `EnrichmentLane` set `enrich_total = count_places()` (all 180) while `enrich_done`
+   counted only THIS run — so a 21-lead re-enrich read "5 / 180", looking like it restarted from
+   scratch. Fixed: `enrich_total = seen + count_pending_enrichment(job)` (new store method, scoped
+   to `place_keys`) — tracks correctly for a fresh job (pending grows as discovery feeds) AND a
+   re-enrich (fixed subset → "5 / 21"). The agent's re-enrich reset itself was already correct
+   (server.py resets only `failed`/`thin` rows, scoped to place_keys).
+2. **Headed window**: the CRM's per-job "Show window" toggle (`job.headless`) never reached the
+   enrichment browser — `browser_fetch` read the `ENRICH_BROWSER_HEADLESS` env only, and the agent's
+   RE-RUN mirror dropped `headless` entirely. So a re-enrich asked to run headed ran hidden. Fixed:
+   `enrich_places(headless=…)` threads the flag to `BrowserFetcher`, `EnrichmentLane` passes
+   `job.headless`, and the agent re-run mirror now carries `headless`. Verified end-to-end headed on
+   job 11's real 403 site (injuryactive.com) — rescued `via=tls` with email+IG, browser launched
+   headed and alive. NOTE for the user: because TLS now rescues most 403s cheaply, the browser
+   rarely launches during enrichment, so a visible window is now rare-by-design (that is the fast
+   path working). 69 tests pass.
+
 ## Session 2026-08-24 (cont.) — stealth browser + proxy plumbing (anti-bot tier 2)
 
 Prompt: "do t158 … can't we use my system and run chrom on playwrite and bypass that?" User

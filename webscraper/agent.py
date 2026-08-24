@@ -443,6 +443,10 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         do_enrich=int(bool(cj.get("do_enrich", True))),
         do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
         place_keys=_place_keys_json(cj),
+        # Carry the re-run's window choice too. Without this the CRM's "Show window"
+        # toggle was dropped on every re-run — the local job kept its original headless
+        # value, so a re-enrich asked to run headed still ran hidden.
+        headless=int(bool(cj.get("headless", True))),
         message="re-run requested from the CRM",
     )
     store.log(local_id, "job", f"re-run requested from the CRM (cloud job #{cj['id']})")
