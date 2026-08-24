@@ -156,7 +156,11 @@ class Store:
                          # timeout | non_html | no_pages. Without this, enrich_status
                          # 'failed' is unexplainable — 8 of job #6's 9 failures were
                          # plain WAF 403s and looked identical to a broken site.
-                         ("enrich_error", "TEXT")):
+                         ("enrich_error", "TEXT"),
+                         # HOW the home page was finally fetched: httpx | tls | browser.
+                         # Shows which anti-bot tier rescued a lead — a 'tls'/'browser' value
+                         # is a site that plain httpx could not read on its own.
+                         ("enrich_via", "TEXT")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}

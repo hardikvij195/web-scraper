@@ -66,3 +66,4 @@ class Contacts:
     whatsapp_number: str | None = None
     pages_fetched: int = 0
     thin: bool = False                   # pages had almost no HTML/links (likely JS-only site)
+    via: str | None = None               # how the HOME page was fetched: httpx | tls | browser

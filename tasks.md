@@ -13,6 +13,34 @@
 
 ---
 
+## Session 2026-08-24 — TLS-impersonation fetch (anti-bot tier 1)
+
+Prompt (CRM session, ported here): "find best public repos on github on scraping which can
+bypass all types of securities … improve ur scraping code so that it can bypass any types of
+security". Brainstormed → scoped DOWN to the cheapest legitimate tier (user chose "TLS
+fingerprint only"): scraping public business marketing sites past Cloudflare/WAF for contact
+info, no proxies, no CAPTCHA solving, no identity rotation. The full stealth-browser +
+residential-proxy stack was explicitly deferred.
+
+### W12 — curl_cffi TLS-impersonation retry between httpx and the browser  [x]
+**Shipped + proven on real sites.** Smoke against job #7's own 403 domains: varianse.co.uk
+and sixt.co.uk (httpx 403) both read 200 via TLS impersonation (105 KB / 232 KB); e2e
+`crawl_site("varianse.com")` with NO browser returned `via=tls`, extracted an Instagram — a
+lead that would have stayed `http_403`. fullcarchecks + autocapital still block (JS challenge
+/ IP reputation → browser or proxies). ~50 % of fingerprint-403s recovered at httpx cost.
+67/67 tests pass. Below = the design as built:
+Many Cloudflare 403s reject on the TLS/HTTP2 handshake fingerprint alone; `curl_cffi`
+`AsyncSession(impersonate="chrome")` sends a real Chrome handshake and gets 200 with no
+browser (~0.3s vs the browser's ~5s). New fetch order in `crawl_site`:
+`httpx → curl_cffi impersonate → headless browser`. New module `impersonate_fetch.py`
+(lazy-imported, optional dep, degrades to today's behaviour if `curl_cffi` absent), a ~5-line
+insert in `enrich.py` mirroring the existing `browser_retry` slow-path, an `enrich_via`
+(httpx / tls / browser) tag so the rescue method is visible, `ENRICH_TLS_IMPERSONATE` env
+(default on), and `curl_cffi` in requirements. Measured target: the 15 http_403s on live job
+#7 (11 timeouts / 5 dns / 2 404 are not fingerprint-fixable). Overrides the old
+`browser_fetch.py:50-52` "will not spoof fingerprints" stance — by user directive, for
+public-data lead-gen only.
+
 ## Session 2026-08-23 — three concurrent lanes
 
 Design: [`docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md`](./docs/superpowers/specs/2026-08-23-lead-finder-lanes-design.md).

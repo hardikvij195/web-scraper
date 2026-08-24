@@ -19,6 +19,7 @@ from webscraper.extractors import (
     contact_page_links, extract_emails, extract_socials, extract_whatsapp, is_probably_mobile,
     normalise_wa, region_of_phone,
 )
+from webscraper.impersonate_fetch import impersonate_fetch
 from webscraper.models import Contacts
 from webscraper.store import Store, now_iso, plus
 
@@ -167,14 +168,25 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
             url, got = url_https, alt
         elif got.error is None:
             got = alt
+    via = "httpx" if got.html is not None else None
+    # TLS-impersonation retry: cheaper than the browser and beats the fingerprint-403s that
+    # make up most blocks (see impersonate_fetch). Sits BEFORE the browser so the ~5 s slow
+    # path is only paid for the JS challenges curl_cffi cannot pass. Self-gating and optional
+    # — a no-op if disabled or curl_cffi is absent — so this is a pure add to the fall-through.
+    if got.html is None and is_block(got.error):
+        html = await impersonate_fetch(url)
+        if html:
+            log.info("tls impersonate rescued %s (httpx said %s)", url, got.error)
+            got, via = Fetched(html=html), "tls"
     if got.html is None and is_block(got.error) and browser_retry is not None:
         html = await browser_retry(url)
         if html:
             log.info("browser retry rescued %s (httpx said %s)", url, got.error)
-            got = Fetched(html=html)
+            got, via = Fetched(html=html), "browser"
     if got.html is None:
         return c, got.error or "no_pages"
     home = got.html
+    c.via = via
     c.pages_fetched = 1
     _merge(c, home)
     if len(home) < 2_000:
@@ -338,6 +350,8 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                 # NULL again when the crawl worked, so a successful re-enrich clears a stale
                 # reason instead of leaving the lead looking blocked forever.
                 enrich_error=crawl_error(c.pages_fetched, reason),
+                # Which fetch tier read the home page (httpx | tls | browser); None on failure.
+                enrich_via=c.via,
                 email=c.emails[0] if c.emails else None,
                 emails=c.emails,
                 instagram=c.instagram, facebook=c.facebook, linkedin=c.linkedin,
