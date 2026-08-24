@@ -220,6 +220,13 @@ class BrowserFetcher:
             kw: dict[str, Any] = dict(
                 user_data_dir=str(PROFILE_DIR), headless=self._headless, locale="en-GB",
                 viewport={"width": 1366, "height": 850},
+                # Auto-proceed past cert warnings. Many small business sites have a misissued
+                # or wrong-CN certificate (newsquaredentist.com, camskinclinic.com on job 11
+                # both threw ERR_CERT_COMMON_NAME_INVALID) — a human would click "proceed",
+                # so the crawler does the same rather than stalling on the interstitial. We
+                # only ever READ a public page, so a bad cert is a data-quality signal, not a
+                # security decision.
+                ignore_https_errors=True,
                 args=["--disable-blink-features=AutomationControlled"],
             )
             # channel="chrome" = the machine's installed Google Chrome, not the bundled
