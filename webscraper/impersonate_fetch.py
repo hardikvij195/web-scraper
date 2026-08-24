@@ -25,7 +25,7 @@ import logging
 import os
 from typing import Any, Callable
 
-from webscraper.config import _bool
+from webscraper.config import _bool, settings
 
 log = logging.getLogger("webscraper.impersonate_fetch")
 
@@ -84,8 +84,13 @@ async def impersonate_fetch(url: str) -> str | None:
     session_cls = _session_factory()
     if session_cls is None:
         return None
+    # Route through the residential proxy when one is configured (ENRICH_PROXY). curl_cffi
+    # takes the requests-style {"http": url, "https": url} shape. Inert without it.
+    kw: dict[str, Any] = dict(impersonate=IMPERSONATE, timeout=NAV_TIMEOUT_SEC)
+    if settings.enrich_proxy:
+        kw["proxies"] = {"http": settings.enrich_proxy, "https": settings.enrich_proxy}
     try:
-        async with session_cls(impersonate=IMPERSONATE, timeout=NAV_TIMEOUT_SEC) as s:
+        async with session_cls(**kw) as s:
             r = await s.get(url, allow_redirects=True)
             if r.status_code >= 400:
                 log.debug("tls impersonate still refused %s: %s", url, r.status_code)

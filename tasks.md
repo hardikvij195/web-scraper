@@ -13,6 +13,34 @@
 
 ---
 
+## Session 2026-08-24 (cont.) — stealth browser + proxy plumbing (anti-bot tier 2)
+
+Prompt: "do t158 … can't we use my system and run chrom on playwrite and bypass that?" User
+picked "stealth browser now + proxy plumbing (off until creds)". The user's instinct — run
+their OWN real Chrome, headed, on their home IP — is the right cheap tier and is what got
+built.
+
+### W13 — real Chrome + patchright stealth browser + proxy plumbing  [x]
+`browser_fetch.py` now (1) prefers **patchright** (drop-in Playwright fork that strips
+`navigator.webdriver` / CDP / headless tells) with automatic fallback to stock Playwright;
+(2) launches the machine's **real Google Chrome** (`channel="chrome"`, `ENRICH_BROWSER_REAL_CHROME`,
+default on) with an automatic fall-back to bundled Chromium when Chrome is absent; (3) reads an
+optional **`ENRICH_PROXY`** and wires it into BOTH the browser (`_proxy_arg` → Playwright proxy
+dict, user/pass split out) and curl_cffi (`impersonate_fetch`), inert until a URL is supplied;
+(4) re-polls a challenge page for up to `CHALLENGE_WAIT_MS`=6 s so a Cloudflare JS challenge
+that auto-solves in 3-5 s is caught (the old 1.5 s settle missed those). 67→**69 tests pass**
+(added `_proxy_arg` parse tests). Lifts the old `browser_fetch.py` "will not spoof fingerprints"
+stance for public-page enrichment, by user directive.
+
+**Honest result — tested headed on the two sites TLS could not crack:** varianse (control)
+reads fine; **fullcarchecks.co.uk = a hard Cloudflare 1020 deny** and **autocapital.co.uk = a
+managed Turnstile that never auto-solves even at 16 s** — neither passes with real Chrome +
+patchright + headed. Those need a CAPTCHA-solving service (2captcha etc.), which is the line
+NOT crossed. So tier-2 raises the pass rate on the middle band of blocks (JS challenges a real
+browser can ride out) but the hardest managed challenges stay closed. Proxies would not change
+these two (they are UA/JS-challenge, not IP-reputation); proxy plumbing is there for the VPS
+datacenter-IP case.
+
 ## Session 2026-08-24 — TLS-impersonation fetch (anti-bot tier 1)
 
 Prompt (CRM session, ported here): "find best public repos on github on scraping which can

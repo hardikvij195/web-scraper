@@ -28,12 +28,22 @@ import re
 import threading
 from typing import Any, Callable
 
-from playwright.sync_api import Error as PWError, sync_playwright
-
 from webscraper.browser_recovery import Relauncher, is_closed
 from webscraper.config import _bool, settings
 
 log = logging.getLogger("webscraper.browser_fetch")
+
+# Prefer patchright — a drop-in Playwright fork that strips the automation tells
+# (`navigator.webdriver`, the CDP `Runtime.enable` leak, a handful of headless
+# giveaways) that Cloudflare fingerprints even a real Chrome by. API-identical, so the
+# rest of this file is unchanged. Falls back to stock Playwright when patchright is not
+# installed, so nothing breaks without it.
+try:
+    from patchright.sync_api import Error as PWError, sync_playwright  # type: ignore
+    STEALTH = True
+except Exception:  # noqa: BLE001 — patchright optional
+    from playwright.sync_api import Error as PWError, sync_playwright
+    STEALTH = False
 
 #: Default ON - the whole point is that a blocked site stops being a dead lead.
 #: `ENRICH_BROWSER_FALLBACK=false` in `.env` turns the slow path off entirely.
@@ -47,10 +57,20 @@ BROWSER_FALLBACK = _bool(os.getenv("ENRICH_BROWSER_FALLBACK"), True)
 #: those are the ones that want a real browser fingerprint. `ENRICH_BROWSER_HEADLESS=false`
 #: in `.env` trades a visible window on the agent PC for a materially better pass rate.
 #:
-#: What this project will NOT do: solve CAPTCHAs, spoof fingerprints, or rotate identities
-#: to defeat a challenge that is deliberately refusing automated access. A real browser
-#: making an ordinary request is the honest end of this; past that, the site has said no.
+#: Scope note (updated 2026-08-24, by user directive): the earlier "will not spoof
+#: fingerprints" stance is lifted for THIS use — reading a PUBLIC business page for
+#: contact info. The honest, cheap route the user asked for is "use my own machine": the
+#: user's REAL Chrome (`channel="chrome"`, not the bundled chromium), headed, from a home
+#: residential IP, with patchright hiding the automation flags. That looks like an
+#: ordinary person browsing and clears most Cloudflare without proxies or CAPTCHA solving.
+#: Still NOT done: solving CAPTCHAs, or attacking anything non-public.
 HEADLESS = _bool(os.getenv("ENRICH_BROWSER_HEADLESS"), True)
+
+#: Use the machine's real Google Chrome instead of Playwright's bundled Chromium. Real
+#: Chrome carries a real fingerprint (TLS, UA, feature flags) that Cloudflare trusts far
+#: more than headless-shell. Default ON; falls back to bundled Chromium automatically when
+#: Chrome is not installed. `ENRICH_BROWSER_REAL_CHROME=false` forces the bundle.
+USE_REAL_CHROME = _bool(os.getenv("ENRICH_BROWSER_REAL_CHROME"), True)
 
 #: Its OWN profile dir: Chromium locks a user-data-dir, and a Maps scrape is usually still
 #: running in the other lane on `settings.profile_dir`.
@@ -63,6 +83,11 @@ NAV_TIMEOUT_MS = 25_000
 #: Cloudflare's interstitial solves itself in JS and then swaps the document; without a
 #: settle the page we read is still the "Just a moment" challenge.
 SETTLE_MS = 1_500
+#: If the settle left a challenge page up, re-read for up to this long in these steps —
+#: a JS challenge that auto-solves usually does so within ~6 s; longer is a managed
+#: Turnstile / hard deny no browser passes, so we stop rather than wait forever.
+CHALLENGE_WAIT_MS = 6_000
+CHALLENGE_STEP_MS = 1_500
 BOOT_TIMEOUT_SEC = 90.0
 #: Generous because calls queue behind each other on the single worker thread.
 FETCH_TIMEOUT_SEC = 180.0
@@ -70,6 +95,26 @@ MAX_BYTES = 1_500_000
 
 _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking your browser",
                   "access denied", "error 1015", "request blocked", "are you a robot")
+
+
+def _proxy_arg() -> dict[str, str] | None:
+    """settings.enrich_proxy ('http://user:pass@host:port') as Playwright's proxy dict, or
+    None when no proxy is set. Playwright wants the credentials split out from the server."""
+    raw = settings.enrich_proxy
+    if not raw:
+        return None
+    from urllib.parse import urlsplit
+    u = urlsplit(raw)
+    if not u.hostname:
+        log.warning("ENRICH_PROXY is set but unparseable (%r) — ignoring", raw)
+        return None
+    server = f"{u.scheme or 'http'}://{u.hostname}" + (f":{u.port}" if u.port else "")
+    out: dict[str, str] = {"server": server}
+    if u.username:
+        out["username"] = u.username
+    if u.password:
+        out["password"] = u.password
+    return out
 
 
 def looks_blocked(html: str | None) -> bool:
@@ -169,12 +214,32 @@ class BrowserFetcher:
             self._drain()
 
     def _opener(self, pw: Any) -> Callable[[], tuple[Any, Any]]:
-        def _open() -> tuple[Any, Any]:
-            ctx = pw.chromium.launch_persistent_context(
+        proxy = _proxy_arg()
+
+        def _launch(use_chrome: bool) -> Any:
+            kw: dict[str, Any] = dict(
                 user_data_dir=str(PROFILE_DIR), headless=self._headless, locale="en-GB",
                 viewport={"width": 1366, "height": 850},
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            # channel="chrome" = the machine's installed Google Chrome, not the bundled
+            # chromium; a real fingerprint Cloudflare trusts. Omitted when Chrome is absent.
+            if use_chrome:
+                kw["channel"] = "chrome"
+            if proxy:
+                kw["proxy"] = proxy
+            return pw.chromium.launch_persistent_context(**kw)
+
+        def _open() -> tuple[Any, Any]:
+            try:
+                ctx = _launch(USE_REAL_CHROME)
+            except Exception as e:  # noqa: BLE001 — Chrome not installed / channel unusable
+                if not USE_REAL_CHROME:
+                    raise
+                log.info("real Chrome unavailable (%s) — falling back to bundled Chromium", e)
+                ctx = _launch(False)
+            log.debug("browser fetch launched (chrome=%s, stealth=%s, proxy=%s)",
+                      USE_REAL_CHROME, STEALTH, bool(proxy))
             ctx.route(_ASSETS, lambda route: route.abort())
             pg = ctx.pages[0] if ctx.pages else ctx.new_page()
             pg.set_default_timeout(NAV_TIMEOUT_MS)
@@ -190,8 +255,18 @@ class BrowserFetcher:
                 page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 page.wait_for_timeout(SETTLE_MS)
                 html = page.content()
+                # A Cloudflare JS challenge swaps the document for the real page once its
+                # script solves — but that can take 3-5 s, past the initial settle. Re-read
+                # a few times before giving up; a challenge that never clears (a managed
+                # Turnstile, or a hard 1020 deny) still bails at CHALLENGE_WAIT_MS instead
+                # of hanging. Auto-solvers are rescued; unsolvable walls cost a few seconds.
+                waited = 0
+                while looks_blocked(html) and waited < CHALLENGE_WAIT_MS:
+                    page.wait_for_timeout(CHALLENGE_STEP_MS)
+                    waited += CHALLENGE_STEP_MS
+                    html = page.content()
                 if looks_blocked(html):
-                    log.debug("browser fetch still blocked: %s", url)
+                    log.debug("browser fetch still blocked after %dms: %s", SETTLE_MS + waited, url)
                     return None
                 return html[:MAX_BYTES]
             except PWError as e:

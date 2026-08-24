@@ -37,3 +37,16 @@ def test_disabled_by_env(monkeypatch):
     monkeypatch.setattr(imp, "ENABLED", False)
     got = asyncio.run(imp.impersonate_fetch("https://example.test/"))
     assert got is None
+
+
+def test_proxy_arg_parses_credentials(monkeypatch):
+    # The browser proxy dict must split user/pass out of the URL for Playwright.
+    from webscraper import browser_fetch as bf
+    monkeypatch.setattr(bf.settings, "enrich_proxy", "http://u:p@gw.test:7777")
+    assert bf._proxy_arg() == {"server": "http://gw.test:7777", "username": "u", "password": "p"}
+
+
+def test_proxy_arg_none_when_unset(monkeypatch):
+    from webscraper import browser_fetch as bf
+    monkeypatch.setattr(bf.settings, "enrich_proxy", None)
+    assert bf._proxy_arg() is None

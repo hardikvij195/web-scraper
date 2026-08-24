@@ -39,6 +39,12 @@ class Settings:
     default_country: str = (os.getenv("DEFAULT_COUNTRY") or "IN").upper()
     headless: bool = _bool(os.getenv("HEADLESS"), True)
     maps_proxy: str | None = os.getenv("MAPS_PROXY") or None
+    # Residential/rotating proxy for the ENRICHMENT fetch paths (curl_cffi + the browser
+    # fallback). Off by default — set ENRICH_PROXY to a full URL, e.g.
+    # http://user:pass@gw.provider.com:7777 . This is the tier that beats IP-reputation
+    # blocks on a VPS (datacenter IP). On the user's own PC the home IP already looks
+    # residential, so this stays inert there; nothing changes without it.
+    enrich_proxy: str | None = os.getenv("ENRICH_PROXY") or None
     enrich_concurrency: int = _int(os.getenv("ENRICH_CONCURRENCY"), 5)
     db_path: Path = ROOT / (os.getenv("DB_PATH") or "data/leads.db")
     profile_dir: Path = ROOT / "data" / "browser-profile"
