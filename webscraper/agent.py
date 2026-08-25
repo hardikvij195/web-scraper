@@ -59,8 +59,23 @@ class Cloud:
         return {}  # SaaS members set AI keys in their cloud Settings tab, not here
 
 
+def _device_name() -> str:
+    """This machine's label, sent on every CRM call so the job can be pinned to it.
+    `LEAD_FINDER_DEVICE` overrides the hostname for a friendlier name ("Hardik-MacBook")."""
+    import os
+    import socket
+    name = os.getenv("LEAD_FINDER_DEVICE") or socket.gethostname() or "agent"
+    return name.strip()[:120]
+
+
+#: Computed once — the hostname does not change while the agent runs.
+DEVICE_NAME = _device_name()
+
+
 def crm_payload(action: str, **kw) -> dict:
-    return {"action": action, **kw}
+    # `device` rides on every call: it is both the heartbeat that puts this machine in the
+    # CRM's "Run on" list and the key the CRM uses to route a targeted job here.
+    return {"action": action, "device": DEVICE_NAME, **kw}
 
 
 class CrmCloud:

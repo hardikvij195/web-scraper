@@ -188,7 +188,12 @@ class EnrichmentLane(Lane):
             t0 = time.monotonic()
             done = {"n": 0}
 
-            def on_progress(_r: dict[str, Any], _status: str) -> None:
+            def on_progress(_r: dict[str, Any], status: str) -> None:
+                # A lead with no website is skipped, not enriched: it is outside the
+                # denominator (count_pending_enrichment ignores it too), so it must not
+                # move the numerator either — keeps done + outstanding = enrichable (T163).
+                if status == "no_website":
+                    return
                 done["n"] += 1
                 store.update_job(self.job_id, enrich_done=seen + done["n"])
 

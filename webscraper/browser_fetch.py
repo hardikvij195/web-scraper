@@ -97,23 +97,17 @@ _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking
                   "access denied", "error 1015", "request blocked", "are you a robot")
 
 
-def _proxy_arg() -> dict[str, str] | None:
-    """settings.enrich_proxy ('http://user:pass@host:port') as Playwright's proxy dict, or
-    None when no proxy is set. Playwright wants the credentials split out from the server."""
-    raw = settings.enrich_proxy
+def _proxy_arg(url: str | None = None) -> dict[str, str] | None:
+    """A proxy URL ('http://user:pass@host:port') as Playwright's proxy dict, or None when no
+    proxy is set. Defaults to `settings.enrich_proxy` (W13 behaviour); W15 callers pass the
+    proxy the pool picked. Playwright wants the credentials split out from the server."""
+    from webscraper.proxies import proxy_arg
+    raw = settings.enrich_proxy if url is None else url
     if not raw:
         return None
-    from urllib.parse import urlsplit
-    u = urlsplit(raw)
-    if not u.hostname:
-        log.warning("ENRICH_PROXY is set but unparseable (%r) — ignoring", raw)
-        return None
-    server = f"{u.scheme or 'http'}://{u.hostname}" + (f":{u.port}" if u.port else "")
-    out: dict[str, str] = {"server": server}
-    if u.username:
-        out["username"] = u.username
-    if u.password:
-        out["password"] = u.password
+    out = proxy_arg(raw)
+    if out is None:
+        log.warning("ENRICH_PROXY is set but unparseable — ignoring")
     return out
 
 
@@ -135,8 +129,11 @@ class BrowserFetcher:
     fetcher cannot keep the process alive, but the profile lock would linger.
     """
 
-    def __init__(self, headless: bool | None = None) -> None:
+    def __init__(self, headless: bool | None = None, proxy: str | None = None) -> None:
         self._headless = HEADLESS if headless is None else headless
+        #: Proxy URL for this browser (W15 pool pick); None = ENRICH_PROXY / direct. A
+        #: persistent context binds its proxy at launch, so rotation happens per launch.
+        self._proxy = proxy
         self._jobs: queue.Queue[tuple[str, list[str | None], threading.Event] | None] = queue.Queue()
         self._ready = threading.Event()
         self._boot_error: BaseException | None = None
@@ -214,7 +211,7 @@ class BrowserFetcher:
             self._drain()
 
     def _opener(self, pw: Any) -> Callable[[], tuple[Any, Any]]:
-        proxy = _proxy_arg()
+        proxy = _proxy_arg(self._proxy)
 
         def _launch(use_chrome: bool) -> Any:
             kw: dict[str, Any] = dict(
@@ -246,7 +243,7 @@ class BrowserFetcher:
                 log.info("real Chrome unavailable (%s) — falling back to bundled Chromium", e)
                 ctx = _launch(False)
             log.debug("browser fetch launched (chrome=%s, stealth=%s, proxy=%s)",
-                      USE_REAL_CHROME, STEALTH, bool(proxy))
+                      USE_REAL_CHROME, STEALTH, proxy["server"] if proxy else None)
             ctx.route(_ASSETS, lambda route: route.abort())
             pg = ctx.pages[0] if ctx.pages else ctx.new_page()
             pg.set_default_timeout(NAV_TIMEOUT_MS)

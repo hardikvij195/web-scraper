@@ -507,24 +507,23 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                     break
                 wait_if_paused()
                 want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
-                try:
-                    page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
-                              wait_until="domcontentloaded", timeout=60000)
-                    _accept_consent(page)
-                    time.sleep(random.uniform(2, 4))
-                    cards = collect_place_links(page, want,
-                                                on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
-                except PWError as e:
-                    if not _is_closed(e) or not _recover(f"tile {s_i}/{len(steps)}"):
-                        raise
-                    # Retry this one tile on the fresh browser. Everything already in
-                    # `merged` survives, so a mid-run crash costs one tile, not the job.
-                    page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
-                              wait_until="domcontentloaded", timeout=60000)
-                    _accept_consent(page)
-                    time.sleep(random.uniform(2, 4))
-                    cards = collect_place_links(page, want,
-                                                on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
+                # Retry this tile through the relauncher until it reads or the relaunch
+                # cap is spent. Everything already in `merged` survives, so a mid-run
+                # crash costs one tile, not the job. This used to be a single unguarded
+                # retry: job #13 (2026-08-24) relaunched once, the human closed the new
+                # window too, and the second TargetClosedError killed the whole lane.
+                while True:
+                    try:
+                        page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
+                                  wait_until="domcontentloaded", timeout=60000)
+                        _accept_consent(page)
+                        time.sleep(random.uniform(2, 4))
+                        cards = collect_place_links(page, want,
+                                                    on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
+                        break
+                    except PWError as e:
+                        if not _is_closed(e) or not _recover(f"tile {s_i}/{len(steps)}"):
+                            raise
                 for card in cards:
                     if card.key in merged:
                         continue

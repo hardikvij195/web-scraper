@@ -74,31 +74,57 @@ def _session_factory() -> Callable[..., Any] | None:
     return AsyncSession
 
 
-async def impersonate_fetch(url: str) -> str | None:
-    """HTML of `url` fetched with a Chrome fingerprint, or None if that did not get it either.
+def _classify_exception(e: Exception, proxied: bool) -> str:
+    """Map a curl_cffi failure onto a stored reason. With a proxy in play a connection-level
+    failure is blamed on the PROXY ('proxy_connect') so the pool can bench it; without one
+    it is the site's 'timeout' / 'network', same vocabulary as enrich.transport_error."""
+    msg = str(e).lower()
+    if proxied and any(m in msg for m in ("proxy", "connect", "tunnel", "curl: (5)", "curl: (7)",
+                                          "curl: (56)", "curl: (97)", "resolve")):
+        return "proxy_connect"
+    if "timed out" in msg or "timeout" in msg or "curl: (28)" in msg:
+        return "timeout"
+    return "network"
 
-    Never raises: a failure here just means the caller falls through to the browser path, so
-    every error becomes None, exactly like `browser_fetch.fetch`."""
+
+async def impersonate_fetch_ex(url: str, proxy: str | None = None) -> tuple[str | None, str | None]:
+    """(html, error) — html when the Chrome-fingerprint GET read the site, else the reason:
+    'http_<code>', 'proxy_407', 'proxy_connect', 'timeout', 'network', 'non_html', 'blocked'
+    (a 200 that was a challenge page), or 'off' when the feature is disabled / unavailable.
+
+    `proxy` overrides the W13 `ENRICH_PROXY` default (None = direct, "" = force direct).
+    Never raises: a failure here just means the caller falls through to the browser path."""
     if not ENABLED:
-        return None
+        return None, "off"
     session_cls = _session_factory()
     if session_cls is None:
-        return None
-    # Route through the residential proxy when one is configured (ENRICH_PROXY). curl_cffi
-    # takes the requests-style {"http": url, "https": url} shape. Inert without it.
+        return None, "off"
+    # Route through a proxy when one is configured. curl_cffi takes the requests-style
+    # {"http": url, "https": url} shape. Inert without one.
+    use_proxy = settings.enrich_proxy if proxy is None else (proxy or None)
     kw: dict[str, Any] = dict(impersonate=IMPERSONATE, timeout=NAV_TIMEOUT_SEC)
-    if settings.enrich_proxy:
-        kw["proxies"] = {"http": settings.enrich_proxy, "https": settings.enrich_proxy}
+    if use_proxy:
+        kw["proxies"] = {"http": use_proxy, "https": use_proxy}
     try:
         async with session_cls(**kw) as s:
             r = await s.get(url, allow_redirects=True)
+            if r.status_code == 407:
+                return None, "proxy_407"
             if r.status_code >= 400:
                 log.debug("tls impersonate still refused %s: %s", url, r.status_code)
-                return None
+                return None, f"http_{r.status_code}"
             ctype = (r.headers.get("content-type") or "").lower()
             if ctype and "html" not in ctype and "xml" not in ctype:
-                return None
-            return usable_html(r.text)
+                return None, "non_html"
+            html = usable_html(r.text)
+            return (html, None) if html else (None, "blocked")
     except Exception as e:  # noqa: BLE001 — fall through to the browser, never crash the run
         log.debug("tls impersonate failed %s: %s", url, e)
-        return None
+        return None, _classify_exception(e, bool(use_proxy))
+
+
+async def impersonate_fetch(url: str, proxy: str | None = None) -> str | None:
+    """HTML of `url` fetched with a Chrome fingerprint, or None if that did not get it either.
+    Thin wrapper over `impersonate_fetch_ex` for callers that only want the text."""
+    html, _ = await impersonate_fetch_ex(url, proxy)
+    return html

@@ -23,12 +23,15 @@ Usage:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable
 
 log = logging.getLogger("webscraper.browser_recovery")
 
 #: A browser that cannot start at all must fail fast rather than loop.
 MAX_RELAUNCH = 3
+#: Seconds to wait between closing the dead context and launching a fresh one.
+RELAUNCH_SETTLE_SEC = 2.0
 
 
 def is_closed(e: Exception) -> bool:
@@ -83,6 +86,10 @@ class Relauncher:
             except Exception:                                     # noqa: BLE001
                 log.debug("on_restart callback failed", exc_info=True)
         self.close()
+        # Let the dead Chrome release its persistent profile lock before the relaunch
+        # attaches to the same user_data_dir — an immediate relaunch can land on the
+        # still-exiting process and die again within seconds.
+        time.sleep(RELAUNCH_SETTLE_SEC)
         self.open()
         return True
 

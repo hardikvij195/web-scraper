@@ -407,10 +407,13 @@ class Store:
     def count_pending_enrichment(self, job_id: int) -> int:
         """How many leads still await enrichment — respecting the job's place_keys scope, so
         a scoped re-enrich counts only its subset. This is what the enrichment lane's `total`
-        should measure against: on a 21-lead re-enrich the bar must read "/21", not "/180"."""
+        should measure against: on a 21-lead re-enrich the bar must read "/21", not "/180".
+        Leads with no website are not enrichable and are left out (T163) — otherwise the CRM
+        card's done + outstanding never adds up to its total."""
         scope, args = self._scope_clause(job_id)
         r = self.conn.execute(
-            "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status='pending'" + scope,
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status='pending'"
+            " AND website IS NOT NULL AND website<>''" + scope,
             (job_id, *args)).fetchone()
         return int(r[0] or 0)
 

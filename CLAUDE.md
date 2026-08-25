@@ -16,7 +16,9 @@ webscraper/
                  into local jobs rows (jobs.cloud_id), reuses the same Worker, syncs results up
   static/index.html  vanilla-JS single page: form -> jobs list -> progress bars -> leads table -> downloads
   maps.py        Playwright: search URL -> scroll feed (FeedCard) -> per-place panel -> Place
-  enrich.py      async httpx: home + contact/about pages -> emails, socials, WhatsApp
+  enrich.py      async httpx: home + contact/about pages -> emails, socials, WhatsApp;
+                 fetch ladder httpx -> impersonate_fetch (curl_cffi) -> browser_fetch (Playwright)
+  proxies.py     W15 ProxyPool: ENRICH_PROXIES round-robin, quarantine/re-admit, redact()
   extractors.py  pure functions (regex/selectolax) — the only part with unit tests
   store.py       sqlite3 (jobs, places), stats, CSV/JSON export, tiny ALTER-TABLE migrate
   models.py      Place / Contacts dataclasses
@@ -95,6 +97,21 @@ data/            gitignored: leads.db, browser-profile/, exports/
 - First test numbers (Pune, 31 places across dentist / interior designer / cafe): phone 100%,
   website 96%, email ~50%, Instagram ~55%, Facebook ~50%, LinkedIn ~20%, X ~25%, explicit
   WhatsApp link ~32%, mobile-heuristic covers most of the rest. ~3.5 s/place at `--delay 3`.
+
+## Env — enrichment anti-bot tiers (all optional, inert when unset)
+
+| Var | Default | Effect |
+|---|---|---|
+| `ENRICH_TLS_IMPERSONATE` | `true` | W12: curl_cffi Chrome-fingerprint retry between httpx and the browser |
+| `ENRICH_BROWSER_FALLBACK` / `_HEADLESS` / `_REAL_CHROME` | `true` / `true` / `true` | W13: browser tier on/off, window, use installed Chrome |
+| `ENRICH_PROXY` | — | W13: ONE proxy URL for the curl_cffi + browser tiers (httpx stays direct) |
+| `ENRICH_PROXIES` | — | W15: comma/newline list (`user:pass@host:port` ok). **Supersedes `ENRICH_PROXY`.** Every tier: direct attempt, then if blocked one attempt via the pool's next proxy; a 407 / unreachable gateway earns one retry with the next proxy before the tier escalates |
+| `ENRICH_PROXY_FIRST` | `0` | W15: proxy before the own-IP attempt (VPS / datacenter IP) |
+| `ENRICH_PROXY_MAX_FAILURES` / `_COOLDOWN_SEC` | `3` / `300` | W15: consecutive proxy-blamed failures before a proxy is benched, and for how long |
+
+The proxy that read (or failed) a site shows up redacted (`host:port`, never credentials) as
+`enrich_via='tls@gw:7777'` / `enrich_error='http_403@gw:7777'`. The browser binds its proxy at
+launch (one pick per launch); httpx/curl_cffi rotate per attempt.
 
 ## Rules
 

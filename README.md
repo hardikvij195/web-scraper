@@ -85,6 +85,21 @@ Google `place_id` when known). Exports land in `data/exports/`. `data/` is gitig
 Push results into HVT CRM (`lead_gen_results` -> Leads import UI), wallet debit, move the
 same container to the VPS with CPU caps. See `CLAUDE.md`.
 
+## Run the CRM Lead Finder agent on a Mac (device-specific runs)
+
+A job created in the CRM can be pinned to a machine (**Run on** in the new-job form, shown
+once more than one agent has checked in). Each agent heartbeats its name on every call, so a
+Mac becomes pickable the moment its agent runs once.
+
+1. `git clone` this repo, `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`,
+   `.venv/bin/python -m playwright install chromium`.
+2. `.env`: `CRM_AGENT_TOKEN=wsk_…` (CRM → Lead Finder → Setup → Agent tokens) and optionally
+   `LEAD_FINDER_DEVICE=Hardik-MacBook` (defaults to the Mac's computer name).
+3. Start at login + keep alive: `bash scripts/install-agent-autostart-mac.sh`
+   (or one-off: `bash run-agent-loop.sh`). Log: `data/agent.log`.
+4. In the CRM, new job → **Run on: Hardik-MacBook**. Headed Chrome then opens on the Mac,
+   not on whichever PC's agent polled first.
+
 ## Run as a cloud member (Lead Finder Cloud)
 
 1. Sign in at https://web-scraper-leads.vercel.app (ask the admin for an account).

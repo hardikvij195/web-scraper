@@ -19,7 +19,9 @@ from webscraper.extractors import (
     contact_page_links, extract_emails, extract_socials, extract_whatsapp, is_probably_mobile,
     normalise_wa, region_of_phone,
 )
-from webscraper.impersonate_fetch import impersonate_fetch
+from webscraper.config import settings
+from webscraper.impersonate_fetch import impersonate_fetch_ex
+from webscraper.proxies import PROXY_ERRORS, ProxyPool, get_pool, redact
 from webscraper.models import Contacts
 from webscraper.store import Store, now_iso, plus
 
@@ -49,6 +51,18 @@ class Fetched:
 
     html: str | None = None
     error: str | None = None
+    #: W15: the proxy URL this attempt went through (None = direct). Redacted before it is
+    #: ever logged or stored — see `tag()`.
+    proxy: str | None = None
+    #: The URL that was actually fetched (the http→https switch may change it).
+    url: str | None = None
+
+    def tag(self, label: str | None) -> str | None:
+        """`label` suffixed with '@host:port' when a proxy was used ('tls@gw.test:7777'), so
+        the job log shows WHICH proxy read (or failed) a site; credentials never appear."""
+        if label is None:
+            return None
+        return f"{label}@{redact(self.proxy)}" if self.proxy else label
 
 
 def http_error(status_code: int) -> str:
@@ -68,6 +82,8 @@ def is_block(error: str | None) -> bool:
     Deliberately NOT here: `dns` (the domain does not resolve — nothing to retry with)
     and 404/400/500 (the server answered, and answered no).
     """
+    if error and "@" in error:
+        error = error.split("@", 1)[0]          # 'http_403@gw:7777' — the proxy tag (W15)
     return error == "timeout" or error in tuple(http_error(c) for c in BLOCK_CODES)
 
 
@@ -102,19 +118,40 @@ def crawl_error(pages_fetched: int, reason: str | None) -> str | None:
     return reason or "no_pages"
 
 
-async def _fetch_ex(client: httpx.AsyncClient, url: str, retries: int = 1) -> Fetched:
+async def _fetch_ex(client: httpx.AsyncClient, url: str, retries: int = 1,
+                    proxy: str | None = None) -> Fetched:
     """GET a page; one retry on transport errors (slow shared hosts time out sporadically).
-    Never raises — the failure comes back as `Fetched.error` so the caller can store it."""
+    Never raises — the failure comes back as `Fetched.error` so the caller can store it.
+
+    `proxy` (W15) routes this ONE fetch through a proxy: httpx binds the proxy per client, so
+    a short-lived client that borrows `client`'s headers/timeout is opened for it. A 407 or
+    a failure to reach the gateway is reported as a proxy error, not a site error."""
+    if proxy:
+        try:
+            async with httpx.AsyncClient(headers=client.headers, follow_redirects=True,
+                                         timeout=client.timeout, verify=False,
+                                         proxy=proxy) as pc:
+                got = await _fetch_ex(pc, url, retries)
+        except Exception as e:                       # noqa: BLE001 — bad proxy URL etc.
+            log.debug("proxied fetch could not start %s via %s: %s", url, redact(proxy), e)
+            got = Fetched(error="proxy_connect")
+        got.proxy = proxy
+        return got
     for attempt in range(retries + 1):
         try:
             r = await client.get(url)
             ctype = r.headers.get("content-type", "")
+            if r.status_code == 407:
+                return Fetched(error="proxy_407")
             if r.status_code >= 400:
                 return Fetched(error=http_error(r.status_code))
             if ctype and "html" not in ctype and "xml" not in ctype:
                 # A PDF/image/JSON "website" — a real response, just nothing to parse.
                 return Fetched(error="non_html")
             return Fetched(html=r.text[:MAX_BYTES])
+        except httpx.ProxyError as e:
+            log.debug("proxy failed for %s: %s", url, e)
+            return Fetched(error="proxy_connect")
         except httpx.TransportError as e:
             log.debug("fetch failed %s (attempt %d): %s", url, attempt + 1, e)
             if attempt < retries:
@@ -147,20 +184,15 @@ def _merge(into: Contacts, html: str) -> None:
         into.whatsapp_number = extract_whatsapp(html)
 
 
-async def crawl_site(client: httpx.AsyncClient, website: str,
-                     browser_retry: Callable[[str], Awaitable[str | None]] | None = None,
-                     ) -> tuple[Contacts, str | None]:
-    """Home page + up to 4 contact/about pages on the same domain.
-
-    Returns the contacts plus the reason nothing was fetched (None when something was).
-    `browser_retry`, when given, is the slow path from `browser_fetch.py`: it is offered the
-    home page URL once, and only when httpx was blocked rather than merely refused."""
-    c = Contacts()
+async def _fetch_home(client: httpx.AsyncClient, website: str,
+                      proxy: str | None = None) -> Fetched:
+    """The httpx tier: home page over http, then https when http gave nothing. The URL that
+    ends up in `Fetched.url` is the one the slower tiers should be pointed at."""
     url = website if "://" in website else "http://" + website
-    got = await _fetch_ex(client, url)
+    got = await _fetch_ex(client, url, proxy=proxy)
     if got.html is None and url.startswith("http://"):
         url_https = "https://" + url[7:]
-        alt = await _fetch_ex(client, url_https)
+        alt = await _fetch_ex(client, url_https, proxy=proxy)
         # Switch to https when it worked, and also when it is the half that got blocked —
         # that is the URL a browser retry should be pointed at (a plain-http fetch of an
         # https-only host fails for boring reasons that say nothing about the real site).
@@ -168,23 +200,116 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
             url, got = url_https, alt
         elif got.error is None:
             got = alt
-    via = "httpx" if got.html is not None else None
+    got.url = url
+    return got
+
+
+async def _with_proxies(attempt: Callable[[str | None], Awaitable[Fetched]],
+                        pool: ProxyPool | None, proxy_first: bool) -> Fetched:
+    """Run ONE tier of the ladder under the W15 proxy rules.
+
+    Direct first (default): the own-IP attempt, and only if it was BLOCKED one attempt via
+    the pool's next proxy; a proxy-blamed failure there (407 / cannot reach the gateway) earns
+    one retry with the next proxy before the tier gives up. `ENRICH_PROXY_FIRST=1` flips the
+    order: proxy (+ one rotation on a proxy error), then direct.
+
+    A proxy-blamed failure never becomes the tier's verdict on the SITE: the result handed
+    back is the site's own error so the next tier still runs. Successes and proxy failures
+    feed the pool's counters; a site 403 does not (the exit IP MAY be burned, but the site
+    may block everyone — that is not evidence against the proxy)."""
+    if not pool:
+        return await attempt(None)
+
+    async def via_pool() -> Fetched | None:
+        p = pool.next()
+        if p is None:
+            return None                      # every proxy benched — behave as if none
+        got = await attempt(p)
+        got.proxy = p
+        if got.html is not None:
+            pool.success(p)
+            return got
+        if got.error in PROXY_ERRORS:
+            pool.failure(p, got.error)
+            p2 = pool.next()
+            if p2 and p2 != p:
+                got2 = await attempt(p2)
+                got2.proxy = p2
+                if got2.html is not None:
+                    pool.success(p2)
+                elif got2.error in PROXY_ERRORS:
+                    pool.failure(p2, got2.error)
+                return got2
+        return got
+
+    if proxy_first:
+        got = await via_pool()
+        if got is not None and got.html is not None:
+            return got
+        direct = await attempt(None)
+        if direct.html is not None and got is not None and is_block(got.error):
+            # The site answered the own IP but blocked the proxy's: a 403 on a known-good
+            # page is the one case a site block IS evidence against the proxy.
+            pool.failure(got.proxy or "", f"{got.error} on known-good page")
+        if direct.html is not None or got is None or got.error in PROXY_ERRORS:
+            return direct
+        # Both failed on the site itself: keep the proxied verdict (it names the proxy)
+        # unless only the direct one is a block the next tier can still act on.
+        return got if is_block(got.error) or not is_block(direct.error) else direct
+    direct = await attempt(None)
+    if direct.html is not None or not is_block(direct.error):
+        return direct
+    got = await via_pool()
+    if got is None or got.error in PROXY_ERRORS:
+        return direct
+    return got
+
+
+async def crawl_site(client: httpx.AsyncClient, website: str,
+                     browser_retry: Callable[[str], Awaitable[Any]] | None = None,
+                     ) -> tuple[Contacts, str | None]:
+    """Home page + up to 4 contact/about pages on the same domain.
+
+    Returns the contacts plus the reason nothing was fetched (None when something was).
+    `browser_retry`, when given, is the slow path from `browser_fetch.py`: it is offered the
+    home page URL once, and only when httpx was blocked rather than merely refused. It may
+    return the HTML, or an `(html, proxy_url)` pair so the proxy shows in the report.
+
+    Fetch ladder: httpx → curl_cffi TLS impersonation → real browser, each tier under the W15
+    proxy rules of `_with_proxies` (direct first unless ENRICH_PROXY_FIRST). The tier and
+    the proxy that finally read the page land in `Contacts.via` ('tls@gw.test:7777'); on a
+    total failure the returned reason carries the same tag ('http_403@gw.test:7777')."""
+    c = Contacts()
+    pool = get_pool()
+    proxy_first = bool(settings.enrich_proxy_first)
+    got = await _with_proxies(lambda p: _fetch_home(client, website, p), pool, proxy_first)
+    url = got.url or (website if "://" in website else "http://" + website)
+    via = got.tag("httpx") if got.html is not None else None
     # TLS-impersonation retry: cheaper than the browser and beats the fingerprint-403s that
     # make up most blocks (see impersonate_fetch). Sits BEFORE the browser so the ~5 s slow
     # path is only paid for the JS challenges curl_cffi cannot pass. Self-gating and optional
     # — a no-op if disabled or curl_cffi is absent — so this is a pure add to the fall-through.
     if got.html is None and is_block(got.error):
-        html = await impersonate_fetch(url)
-        if html:
-            log.info("tls impersonate rescued %s (httpx said %s)", url, got.error)
-            got, via = Fetched(html=html), "tls"
+        async def tls(p: str | None) -> Fetched:
+            # "" = force direct: with a pool configured, ENRICH_PROXIES supersedes the
+            # single ENRICH_PROXY default that impersonate_fetch would otherwise apply.
+            html, err = await impersonate_fetch_ex(url, proxy=(p if p else ("" if pool else None)))
+            return Fetched(html=html, error=err)
+        t = await _with_proxies(tls, pool, proxy_first)
+        if t.html:
+            log.info("tls impersonate rescued %s (httpx said %s)%s", url, got.error,
+                     f" via {redact(t.proxy)}" if t.proxy else "")
+            got, via = t, t.tag("tls")
     if got.html is None and is_block(got.error) and browser_retry is not None:
-        html = await browser_retry(url)
+        res = await browser_retry(url)
+        html, bproxy = res if isinstance(res, tuple) else (res, None)
         if html:
-            log.info("browser retry rescued %s (httpx said %s)", url, got.error)
-            got, via = Fetched(html=html), "browser"
+            log.info("browser retry rescued %s (httpx said %s)%s", url, got.error,
+                     f" via {redact(bproxy)}" if bproxy else "")
+            got = Fetched(html=html, proxy=bproxy)
+            via = got.tag("browser")
     if got.html is None:
-        return c, got.error or "no_pages"
+        return c, got.tag(got.error) or "no_pages"
     home = got.html
     c.via = via
     c.pages_fetched = 1
@@ -265,25 +390,32 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
     browser: dict[str, Any] = {"fetcher": None, "off": False}
     browser_lock = asyncio.Lock()
 
-    async def browser_retry(url: str) -> str | None:
+    async def browser_retry(url: str) -> tuple[str | None, str | None]:
         async with browser_lock:
             if browser["fetcher"] is None:
                 if browser["off"]:
-                    return None
+                    return None, None
                 try:
                     # Imported here, not at module scope: this keeps Playwright out of the
                     # import graph of every enrich/research run that never needs it.
                     from webscraper.browser_fetch import BROWSER_FALLBACK, BrowserFetcher
                     if not BROWSER_FALLBACK:
                         browser["off"] = True
-                        return None
+                        return None, None
+                    # W15: a persistent context binds its proxy at launch, so the browser
+                    # takes the pool's next proxy once per launch (or runs direct when every
+                    # proxy is benched — "" beats the single-ENRICH_PROXY default). Without
+                    # a pool, None keeps the W13 ENRICH_PROXY behaviour.
+                    pool = get_pool()
+                    browser["proxy"] = (pool.next() or "") if pool else None
                     browser["fetcher"] = await asyncio.to_thread(
-                        lambda: BrowserFetcher(headless=headless))
+                        lambda: BrowserFetcher(headless=headless, proxy=browser["proxy"]))
                 except Exception as e:                # noqa: BLE001 — no browser, no retry
                     log.warning("browser fallback unavailable (%s) — blocked sites stay failed", e)
                     browser["off"] = True
-                    return None
-        return await asyncio.to_thread(browser["fetcher"].fetch, url)
+                    return None, None
+        html = await asyncio.to_thread(browser["fetcher"].fetch, url)
+        return html, (browser.get("proxy") or None)
 
     # One crawl per website domain, shared by every branch of the same business (chains list
     # 5–10 Maps entries on one site); plus a per-host cap so one slow server can't hog the

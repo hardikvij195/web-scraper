@@ -13,6 +13,61 @@
 
 ---
 
+## Session 2026-08-25 — closed-window crash + Mac agent (CRM T165)
+
+### W16 — discovery lane died on the 2nd closed window; Mac launcher  [x]
+Job #13 (CRM) / #28 (local): human closed the headed Chrome window, `Relauncher` relaunched
+once ("browser died during tile 1/1050"), the window was closed again 4 s later and the
+**retry inside the `except` was unguarded** (`maps.py` old line 526) → `TargetClosedError`
+killed the discovery lane, so enrichment + WhatsApp stopped too. Fix: the tile search is now
+a `while True` retry through `_recover()` until the relaunch cap (3) is spent; the place loop
+already skipped-and-continued. `Relauncher.recover()` now sleeps `RELAUNCH_SETTLE_SEC`=2 s
+between closing the dead context and relaunching on the same `user_data_dir`, so a relaunch
+can't attach to a still-exiting Chrome. Device targeting (`device` on every CRM call, from
+`LEAD_FINDER_DEVICE` or hostname) was already in `agent.py` uncommitted from 08-24; added
+the Mac twin of the Windows supervisor: `run-agent-loop.sh` + `scripts/install-agent-autostart-mac.sh`
+(launchd, RunAtLoad + KeepAlive) and a README section.
+
+## Session 2026-08-25 — proxy rotation (anti-bot tier 3 plumbing; CRM T163 half a)
+
+Prompt (CRM session, T163): "web-scraper: proxy ROTATION … `ENRICH_PROXIES` … a small
+`ProxyPool` … round-robin, per-proxy failure count, temporary quarantine after N consecutive
+failures, automatic re-admit after a cooldown … retry once with the next proxy before
+escalating tiers … direct (no-proxy) attempt first unless `ENRICH_PROXY_FIRST=1` … surface
+which proxy (redacted) … no CAPTCHA solving".
+
+### W15 — proxy rotation  [x]
+Builds on W13's single inert `ENRICH_PROXY`. New `proxies.py`: `parse_proxy_list`
+(comma/newline/whitespace, `user:pass@host:port`, scheme defaults to http, dedupe, junk
+skipped with a warning), `redact()` (`host:port` only — the ONLY shape that reaches logs or
+the DB), `proxy_arg()` (Playwright dict; `browser_fetch._proxy_arg` now delegates and takes
+an explicit pick), and `ProxyPool` — round-robin `next()`, `failure()`/`success()` streaks,
+bench after `ENRICH_PROXY_MAX_FAILURES` (3) consecutive proxy-blamed failures, re-admit after
+`ENRICH_PROXY_COOLDOWN_SEC` (300) with an injected clock so it is deterministic under test.
+`get_pool()` builds it from `ENRICH_PROXIES` only — **a lone `ENRICH_PROXY` builds no pool
+and behaves exactly as W13** (httpx direct, curl_cffi + browser via that proxy).
+
+Ladder (`enrich.crawl_site`): each tier (httpx → curl_cffi → browser) now runs under
+`_with_proxies`: direct attempt first; only if that was a BLOCK (403/429/503/timeout) one
+attempt via the pool's next proxy; a proxy-blamed failure there (`proxy_407`, or
+`proxy_connect` = gateway unreachable) earns ONE retry with the next proxy before the tier
+gives up. A proxy failure never becomes the verdict on the site — the tier hands back the
+site's own error so the next tier still runs. `ENRICH_PROXY_FIRST=1` flips to proxy → rotate
+→ direct; in that mode a proxied 403 followed by a direct 200 is "403 on a known-good page"
+and DOES count against the proxy (a bare 403 is ambiguous and does not). httpx gets a
+per-attempt short-lived proxied client (`_fetch_ex(proxy=…)`), curl_cffi takes
+`impersonate_fetch_ex(url, proxy)` (new; returns `(html, error)` with 407/connect classified),
+the browser binds the pool's pick at launch (persistent context = one proxy per launch).
+Reporting: `enrich_via='tls@gw.test:7777'`, `enrich_error='http_403@gw.test:7777'`
+(`Fetched.tag`, redacted; `is_block` strips the tag). Also closed the T163 denominator gap on
+the agent side: `count_pending_enrichment` and the lane's live `enrich_done` now skip
+site-less leads, so the CRM's live bar reads done / enrichable like its finished card.
+Tests: `tests/test_proxies.py` (+20: parsing, redaction, `_proxy_arg` delegation, rotation,
+quarantine/re-admit with a fake clock, all-benched, precedence, every ladder rule, crawl_site
+end-to-end with stubbed tiers, curl_cffi error classification). 69 → **89 pass**. Not
+exercised against a real proxy (none configured — inert until `ENRICH_PROXIES` is set).
+Docs: `.env.example` + `CLAUDE.md` env table.
+
 ## Session 2026-08-24 (cont.) — re-enrich counter + headed-window fixes (from live job 11)
 
 Found by driving live job #11 (Clinics, Cambridge) — a `reenrich_only` re-run.

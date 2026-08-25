@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,6 +31,12 @@ def _int(v: str | None, default: int) -> int:
         return default
 
 
+def _proxy_list(raw: str | None) -> list[str]:
+    # Local import: proxies.py must stay importable without config (and vice versa).
+    from webscraper.proxies import parse_proxy_list
+    return parse_proxy_list(raw)
+
+
 @dataclass
 class Settings:
     delay_sec: float = _float(os.getenv("SCRAPE_DELAY_SEC"), 6.0)
@@ -45,6 +51,17 @@ class Settings:
     # blocks on a VPS (datacenter IP). On the user's own PC the home IP already looks
     # residential, so this stays inert there; nothing changes without it.
     enrich_proxy: str | None = os.getenv("ENRICH_PROXY") or None
+    # W15: a LIST of proxies (comma/newline-separated, `user:pass@host:port` ok) rotated
+    # round-robin with per-proxy quarantine (see proxies.py). Supersedes ENRICH_PROXY when
+    # set; with only ENRICH_PROXY the pool holds that one URL and behaves as before.
+    enrich_proxies: list[str] = field(default_factory=lambda: _proxy_list(os.getenv("ENRICH_PROXIES")))
+    # Try a proxy BEFORE the direct (own-IP) attempt. Default off: on the user's PC the home
+    # IP is the best residential identity there is; on a VPS set this to 1.
+    enrich_proxy_first: bool = _bool(os.getenv("ENRICH_PROXY_FIRST"), False)
+    # Consecutive proxy-blamed failures (407 / connect error) before a proxy is benched, and
+    # for how long, in seconds, before it is offered again.
+    enrich_proxy_max_failures: int = _int(os.getenv("ENRICH_PROXY_MAX_FAILURES"), 3)
+    enrich_proxy_cooldown_sec: float = _float(os.getenv("ENRICH_PROXY_COOLDOWN_SEC"), 300.0)
     enrich_concurrency: int = _int(os.getenv("ENRICH_CONCURRENCY"), 5)
     db_path: Path = ROOT / (os.getenv("DB_PATH") or "data/leads.db")
     profile_dir: Path = ROOT / "data" / "browser-profile"
