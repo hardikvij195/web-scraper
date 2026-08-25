@@ -216,6 +216,9 @@ class Store:
             ("enr_ended_at", "TEXT"), ("enr_ok", "INTEGER"), ("enr_reason", "TEXT"),
             ("wa_ended_at", "TEXT"), ("wa_ok", "INTEGER"), ("wa_reason", "TEXT"),
             ("logs_synced_upto", "INTEGER NOT NULL DEFAULT 0"),
+            # Leads in flight RIGHT NOW per lane (batch size while a batch runs, 0 between),
+            # so the CRM can show done / in progress / queued instead of "1 / >= 1" (T170).
+            ("enrich_active", "INTEGER NOT NULL DEFAULT 0"), ("wa_active", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
@@ -426,6 +429,24 @@ class Store:
         r = self.conn.execute(
             "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status<>'pending'"
             " AND website IS NOT NULL AND website<>''" + scope,
+            (job_id, *args)).fetchone()
+        return int(r[0] or 0)
+
+    def count_wa_done(self, job_id: int) -> int:
+        """Numbers with a final WhatsApp verdict (yes/no) in scope."""
+        scope, args = self._scope_clause(job_id)
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND wa_verified IN ('yes','no')" + scope,
+            (job_id, *args)).fetchone()
+        return int(r[0] or 0)
+
+    def count_wa_pending(self, job_id: int) -> int:
+        """Same predicate as pending_wa_verify(), as a count: the WhatsApp lane's pipeline."""
+        scope, args = self._scope_clause(job_id)
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status <> 'pending' "
+            "AND (COALESCE(phone,'') <> '' OR COALESCE(whatsapp_number,'') <> '') "
+            "AND COALESCE(wa_verified,'') NOT IN ('yes','no')" + scope,
             (job_id, *args)).fetchone()
         return int(r[0] or 0)
 

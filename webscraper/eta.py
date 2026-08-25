@@ -150,6 +150,31 @@ REASON_TEXT = {
 
 
 
+
+def _live_counts(row: Any, store: Any) -> dict[str, tuple[int, int, int]]:
+    """{lane: (done, active, pending)} from the places table; {} without a store."""
+    if store is None:
+        return {}
+    jid = _get(row, "id")
+    if jid is None:
+        return {}
+    try:
+        places = int(store.count_places(jid))
+        links = int(_get(row, "links_found", 0) or 0)
+        enr_done = int(store.count_enriched(jid))
+        enr_active = int(_get(row, "enrich_active", 0) or 0)
+        enr_pending = max(0, int(store.count_pending_enrichment(jid)) - enr_active)
+        wa_done = int(store.count_wa_done(jid))
+        wa_active = int(_get(row, "wa_active", 0) or 0)
+        wa_pending = max(0, int(store.count_wa_pending(jid)) - wa_active)
+    except Exception:  # noqa: BLE001 — an old store without these helpers keeps the row counters
+        return {}
+    return {
+        "discovery": (places, 0, max(0, links - places)),
+        "enrichment": (enr_done, enr_active, enr_pending),
+        "whatsapp": (wa_done, wa_active, wa_pending),
+    }
+
 def _at_least(total: int | None, done: int) -> int | None:
     """A lane's total can lag its done count after a resume; never show 77 / 29."""
     return None if total is None else max(total, done)
@@ -317,12 +342,29 @@ def lanes(row: Any, store: Any = None, now: Optional[datetime] = None) -> list[d
     # moving target -- its `total` is a floor, not a forecast.
     disc_open = en["discovery"] and states["discovery"]["status"] in UNFINISHED
 
+    # Counts come from the STORE when one is at hand, not from the per-run counters on the
+    # job row. Those counters restart with every run, so a job resumed after an agent
+    # restart read "6 / 237 places" beside 83 leads and "1 / >= 1 businesses" beside 45
+    # emails (job #14, 2026-08-25). The rows are the truth: how many places exist, how many
+    # are past enrichment, how many numbers have a verdict — plus what is in flight now
+    # and what is still queued, so the UI can say done / in progress / queued.
+    live = _live_counts(row, store)
+
     out: list[dict[str, Any]] = []
     for key in LANE_ORDER:
         st = states[key]
         done_c, total_c = LANE_COUNTS[key]
         done = int(_get(row, done_c, 0) or 0)
         total: Optional[int] = int(_get(row, total_c, 0) or 0) or None
+        active: Optional[int] = None
+        pending: Optional[int] = None
+        lv = live.get(key)
+        if lv is not None:
+            done, active, pending = lv
+            if key == "discovery":
+                total = max(total or 0, done + pending) or None
+            else:
+                total = done + active + pending
         total_is_min = False
         if key in DOWNSTREAM:
             if total is None:
@@ -353,6 +395,10 @@ def lanes(row: Any, store: Any = None, now: Optional[datetime] = None) -> list[d
             "status": status,
             "done": done,
             "total": total,
+            # Leads being worked on right now / still queued behind them (None when the
+            # agent has no store to count from — the CRM then shows done / total only).
+            "active": active,
+            "pending": pending,
             # True = `total` is a lower bound (discovery is still feeding this lane).
             "total_is_min": total_is_min,
             "eta_sec": round(eta) if eta is not None else None,

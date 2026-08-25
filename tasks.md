@@ -15,6 +15,16 @@
 
 ## Session 2026-08-25 — closed-window crash + Mac agent (CRM T165)
 
+### W19 — store-derived lane counts + in-flight/queued per lane (CRM T170)  [x]
+`eta.lanes()` no longer trusts the per-run counters on the job row when it has a store:
+`_live_counts()` counts places (discovery done), `count_enriched` (enrichment done),
+`count_wa_done` (WA done), `count_pending_enrichment` / `count_wa_pending` (queued) and the
+new `jobs.enrich_active` / `jobs.wa_active` columns (batch in flight, set by the lanes
+around each batch, cleared on exit). Each lane dict gains `active` + `pending`; `total`
+= done + active + pending (discovery: max(links_found, done + pending)). Kills the
+"6 / 237 beside 83 leads" and "1 / ≥ 1 beside 45 emails" readings after a resume. No
+tests broke (89). Needs an agent restart to take effect.
+
 ### W18 — counters after an orphan re-queue  [x]
 Agent restarted mid-job #14 (W17 rollout) → the Worker re-queued it, but `links_found` is
 per-run while `scraped_count` is cumulative ("77 / 29"), and the enrichment lane set

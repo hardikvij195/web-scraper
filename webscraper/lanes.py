@@ -204,9 +204,13 @@ class EnrichmentLane(Lane):
             # in the CRM) must actually open a visible browser on a blocked site. `headless`
             # is stored 1/0; None leaves the module default when the column is unset.
             hl = self.job.get("headless")
-            asyncio.run(enrich_places(store, batch, None, self.job.get("country"),
-                                      on_progress, self.stopped,
-                                      headless=None if hl is None else bool(hl)))
+            store.update_job(self.job_id, enrich_active=len(batch))
+            try:
+                asyncio.run(enrich_places(store, batch, None, self.job.get("country"),
+                                          on_progress, self.stopped,
+                                          headless=None if hl is None else bool(hl)))
+            finally:
+                store.update_job(self.job_id, enrich_active=0)
             still_pending = {r["place_key"] for r in
                              store.pending_enrichment(self.job_id, ENRICH_BATCH)}
             if before & still_pending:
@@ -274,6 +278,17 @@ class WhatsAppLane(Lane):
         return bool(self.job.get("do_wa_verify")) or bool(self.job.get("wa_verify_only"))
 
     def work(self) -> str | None:
+        try:
+            return self._work()
+        finally:
+            # Whatever way the loop exits, nothing is in flight any more.
+            if self.store is not None:
+                try:
+                    self.store.update_job(self.job_id, wa_active=0)
+                except Exception:                                 # noqa: BLE001
+                    pass
+
+    def _work(self) -> str | None:
         from webscraper import wa_verify
 
         store = self.store
@@ -292,7 +307,7 @@ class WhatsAppLane(Lane):
 
             store.update_job(self.job_id,
                              wa_verify_total=checked + len(batch),
-                             wa_verify_done=checked)
+                             wa_verify_done=checked, wa_active=len(batch))
 
             def on_wa(_pk: str, _status: str, _num: str | None = None) -> None:
                 nonlocal checked
