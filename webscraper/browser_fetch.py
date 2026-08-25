@@ -85,6 +85,10 @@ CF_CLICK = settings.enrich_cf_click
 CF_CLICK_ATTEMPTS = 3
 CF_CLICK_WAIT_MS = 10_000
 _CF_FRAME_RE = re.compile(r"^https?://challenges\.cloudflare\.com/cdn-cgi/challenge-platform/")
+#: Google reCAPTCHA v2 checkbox iframe (anchor) and the image-challenge iframe (bframe).
+_RECAPTCHA_ANCHOR_RE = re.compile(r"/recaptcha/(api2|enterprise)/anchor", re.I)
+_RECAPTCHA_BFRAME_RE = re.compile(r"/recaptcha/(api2|enterprise)/bframe", re.I)
+_RECAPTCHA_HTML_RE = re.compile(r"g-recaptcha|grecaptcha|www\.google\.com/recaptcha|recaptcha/(api|enterprise)", re.I)
 _CF_CTYPE_RE = re.compile(r"cType:\s*'([a-z_-]+)'")
 _CF_TURNSTILE_RE = re.compile(r"<script[^>]+src=[\"'][^\"']*challenges\.cloudflare\.com/turnstile/v", re.I)
 
@@ -132,7 +136,10 @@ FETCH_TIMEOUT_SEC = 180.0
 MAX_BYTES = 1_500_000
 
 _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking your browser",
-                  "access denied", "error 1015", "request blocked", "are you a robot")
+                  "access denied", "error 1015", "request blocked", "are you a robot",
+                  # Google reCAPTCHA interstitial (osbournepinner.com etc., 2026-08-25)
+                  "verifying that you are not a robot", "i'm not a robot", "bot verification",
+                  "exceeding recaptcha")
 #: The headless UA with "Headless" stripped, learned on the first launch (process-wide).
 _HEADLESS_UA: dict[str, str | None] = {}
 
@@ -175,12 +182,18 @@ def detect_cloudflare(html: str | None) -> str | None:
         return m.group(1)
     if _CF_TURNSTILE_RE.search(html):
         return "embedded"
+    # Google reCAPTCHA is a different wall (not Cloudflare) but handled on the same path:
+    # a checkbox we can press, an image challenge we cannot (no solver — the line we drew).
+    if _RECAPTCHA_HTML_RE.search(html):
+        return "recaptcha"
     return None
 
 
 def cf_error(kind: str | None) -> str:
     """The stored reason for a wall that stayed up: 'cf_managed', 'cf_non_interactive', … or
     plain 'blocked' when it was a deny/challenge page of no known Cloudflare class."""
+    if kind == "recaptcha":
+        return "recaptcha"
     return f"cf_{kind.replace('-', '_')}" if kind else "blocked"
 
 
@@ -406,6 +419,11 @@ class BrowserFetcher:
                         # The click DID trigger the document swap and a read raced it: the
                         # wall is still the verdict, not a transport failure.
                         log.debug("turnstile click errored on %s: %s", url, e)
+                elif looks_blocked(html) and kind == "recaptcha" and CF_CLICK:
+                    try:
+                        html = self._click_recaptcha(page, url) or html
+                    except PWError as e:
+                        log.debug("recaptcha click errored on %s: %s", url, e)
                 if looks_blocked(html):
                     log.debug("browser fetch still blocked (%s) after %dms: %s",
                               cf_error(kind), SETTLE_MS + waited, url)
@@ -454,6 +472,60 @@ class BrowserFetcher:
                 html = self._content_or_none(page)
             if html and not looks_blocked(html):
                 log.info("turnstile cleared on click %d: %s", n + 1, url)
+                return html
+        return None
+
+    def _click_recaptcha(self, page: Any, url: str) -> str | None:
+        """Press the reCAPTCHA v2 "I'm not a robot" checkbox in the anchor iframe. With a real
+        Chrome + a residential IP the checkbox often passes with no image challenge; if the
+        image (bframe) challenge appears we STOP — solving it is the line we do not cross
+        (ENRICH_CF_CLICK gates this, same as Turnstile). Returns the cleared HTML or None."""
+        for n in range(CF_CLICK_ATTEMPTS):
+            frame = next((f for f in page.frames if _RECAPTCHA_ANCHOR_RE.search(f.url or "")), None)
+            if frame is None:
+                page.wait_for_timeout(CHALLENGE_STEP_MS)
+                continue
+            box = None
+            try:
+                box = frame.locator("#recaptcha-anchor, .recaptcha-checkbox").first.bounding_box()
+            except PWError:
+                box = None
+            if not box:
+                try:
+                    fb = frame.frame_element().bounding_box()
+                    if fb:
+                        box = {"x": fb["x"] + 30, "y": fb["y"] + fb["height"] / 2, "width": 0, "height": 0}
+                except PWError:
+                    box = None
+            if not box:
+                page.wait_for_timeout(CHALLENGE_STEP_MS)
+                continue
+            x = box["x"] + (box["width"] / 2 if box["width"] else 0)
+            y = box["y"] + (box["height"] / 2 if box["height"] else 0)
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(100, 200))
+            page.mouse.up()
+            try:
+                page.wait_for_load_state("networkidle", timeout=CF_CLICK_WAIT_MS)
+            except PWError:
+                pass
+            # If an image challenge opened, we cannot proceed — bail immediately (no solver).
+            try:
+                bf = next((f for f in page.frames if _RECAPTCHA_BFRAME_RE.search(f.url or "")), None)
+                if bf is not None and bf.locator("body").count():
+                    log.info("recaptcha image challenge on %s — not solving", url)
+                    return None
+            except PWError:
+                pass
+            waited = 0
+            html = self._content_or_none(page)
+            while (html is None or looks_blocked(html)) and waited < CF_CLICK_WAIT_MS:
+                page.wait_for_timeout(CHALLENGE_STEP_MS)
+                waited += CHALLENGE_STEP_MS
+                html = self._content_or_none(page)
+            if html and not looks_blocked(html):
+                log.info("recaptcha cleared on click %d: %s", n + 1, url)
                 return html
         return None
 

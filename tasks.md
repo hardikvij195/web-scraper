@@ -23,6 +23,15 @@ scraper starts and wa scraper starts side by side => make sure to check all nos 
 verification => the number we have got from google maps and all numbers we have got from
 website".
 
+### W28 — Google reCAPTCHA handling (was slipping through / not clicked)  [x]
+`osbournepinner.com` served a Google reCAPTCHA "I'm not a robot" checkbox (NOT Cloudflare
+Turnstile, which is all `_click_turnstile` handled). It slipped past `looks_blocked` (no
+matching marker) so the challenge HTML was returned as a "page" with no contacts, and the
+checkbox was never pressed. Added: reCAPTCHA markers to `_BLOCK_MARKERS`; `detect_cloudflare`
+returns `recaptcha`; `cf_error`/`is_block` treat it as a block; `_click_recaptcha` presses
+the anchor-iframe checkbox (same `ENRICH_CF_CLICK` gate) and BAILS if the image (bframe)
+challenge appears — no solver crossed. 117 tests pass.
+
 ### W27 — installers take the CRM's Supabase URL (clone tenants)  [x]
 `install-agent.sh --crm-url` / `install-agent.ps1 -CrmUrl` write `VITE_SUPABASE_URL` into the
 agent `.env`, which `cli._crm_base()` already prefers over the HVT default — so the launcher a

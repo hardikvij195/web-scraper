@@ -122,7 +122,7 @@ def is_block(error: str | None) -> bool:
     """
     if error and "@" in error:
         error = error.split("@", 1)[0]          # 'http_403@gw:7777' — the proxy tag (W15)
-    if error and (error.startswith("cf_") or error == "blocked"):
+    if error and (error.startswith("cf_") or error in ("blocked", "recaptcha")):
         # W22: a Cloudflare wall classified by the browser tier (cf_non_interactive /
         # cf_managed / cf_interactive / cf_embedded) or a 200 whose body was an
         # interstitial — a block by definition, and what the next tier exists for.
