@@ -417,6 +417,18 @@ class Store:
             (job_id, *args)).fetchone()
         return int(r[0] or 0)
 
+    def count_enriched(self, job_id: int) -> int:
+        """Enrichable leads already past 'pending' in this job's scope — the enrichment
+        lane's starting `done`. A lane that resumes after an agent restart (orphan re-queue)
+        used to start its numerator at 0 while the results kept every lead the interrupted
+        run had enriched: job #14 (2026-08-25) read "1 / ≥ 1" beside 45 emails found."""
+        scope, args = self._scope_clause(job_id)
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status<>'pending'"
+            " AND website IS NOT NULL AND website<>''" + scope,
+            (job_id, *args)).fetchone()
+        return int(r[0] or 0)
+
     def stop_requested(self, job_id: int) -> bool:
         r = self.conn.execute("SELECT stop_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
         return bool(r and r[0])

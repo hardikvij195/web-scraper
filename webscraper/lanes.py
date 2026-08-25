@@ -158,15 +158,18 @@ class EnrichmentLane(Lane):
 
         store = self.store
         assert store is not None
-        seen = 0
+        # Start from what is ALREADY enriched in scope, not 0: a lane resumed after an
+        # agent restart keeps the interrupted run's work in the numerator (job #14 showed
+        # "1 / ≥ 1" beside 45 emails). Fresh job → 0; scoped re-enrich → its subset was
+        # reset to pending, so also 0. Same denominator rule as before.
+        seen = store.count_enriched(self.job_id)
         stuck = 0
         # Set the total BEFORE the first lead is touched, not just after the first batch
         # finishes. Otherwise `enrich_total` keeps the previous run's value (e.g. 180) and
         # the bar reads "3 / 180" while the 9 fixable leads process, flipping to "9 / 9"
-        # only at the very end — the "starting from 0 / 180" the user reported. At the
-        # start `seen` is 0, so this is simply the count of work queued for this run.
-        store.update_job(self.job_id, enrich_done=0,
-                         enrich_total=store.count_pending_enrichment(self.job_id))
+        # only at the very end — the "starting from 0 / 180" the user reported.
+        store.update_job(self.job_id, enrich_done=seen,
+                         enrich_total=seen + store.count_pending_enrichment(self.job_id))
         while True:
             if self.stopped():
                 return R_STOPPED

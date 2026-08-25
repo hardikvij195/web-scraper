@@ -15,6 +15,15 @@
 
 ## Session 2026-08-25 — closed-window crash + Mac agent (CRM T165)
 
+### W18 — counters after an orphan re-queue  [x]
+Agent restarted mid-job #14 (W17 rollout) → the Worker re-queued it, but `links_found` is
+per-run while `scraped_count` is cumulative ("77 / 29"), and the enrichment lane set
+`enrich_done=0` at start, hiding the interrupted run's work ("1 / ≥ 1" beside 45 emails).
+`eta._at_least()` keeps every lane's total ≥ done; `Store.count_enriched()` (scope-aware,
+website-only, `enrich_status<>'pending'`) seeds the lane's `seen`. Fresh jobs and scoped
+re-enrich runs are unchanged (both start at 0). Rule learnt: never stop/start the agent
+while a job is running — check `data/agent.log` first.
+
 ### W17 — self-check + one-click installers (CRM T168)  [x]
 `webscraper/healthcheck.py`: 11 cheap checks (python, crm_token, playwright, chromium,
 real_chrome*, curl_cffi*, patchright*, wa_session*, ai_keys*, disk, autostart; * = optional,

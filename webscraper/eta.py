@@ -149,6 +149,11 @@ REASON_TEXT = {
 }
 
 
+
+def _at_least(total: int | None, done: int) -> int | None:
+    """A lane's total can lag its done count after a resume; never show 77 / 29."""
+    return None if total is None else max(total, done)
+
 def _get(row: Any, key: str, default: Any = None) -> Any:
     """Read a column from an sqlite3.Row or a plain dict without blowing up on absence.
 
@@ -378,9 +383,12 @@ def phases(row: Any, store: Any = None, now: Optional[datetime] = None) -> list[
     disc_open = lane_en["discovery"] and lane_st["discovery"]["status"] in UNFINISHED
 
     counts = {
+        # total never below done: after an orphan re-queue `links_found` restarts with the
+        # new run while `scraped_count` keeps every place saved so far ("77 / 29", job #14).
         "scraping": (int(_get(row, "scraped_count", 0) or 0),
-                     int(_get(row, "links_found", 0) or 0)
-                     or int(_get(row, "max_places", 0) or 0) or None),
+                     _at_least(int(_get(row, "links_found", 0) or 0)
+                               or int(_get(row, "max_places", 0) or 0) or None,
+                               int(_get(row, "scraped_count", 0) or 0))),
         "enriching": (int(_get(row, "enrich_done", 0) or 0),
                       int(_get(row, "enrich_total", 0) or 0) or None),
         "researching": (int(_get(row, "research_done", 0) or 0),
