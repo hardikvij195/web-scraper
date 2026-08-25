@@ -15,6 +15,20 @@
 
 ## Session 2026-08-25 — closed-window crash + Mac agent (CRM T165)
 
+### W17 — self-check + one-click installers (CRM T168)  [x]
+`webscraper/healthcheck.py`: 11 cheap checks (python, crm_token, playwright, chromium,
+real_chrome*, curl_cffi*, patchright*, wa_session*, ai_keys*, disk, autostart; * = optional,
+degrades a lane, not the agent) → `{ok, os, version, git, python, checks{name:{ok,detail,fix}}}`.
+`CrmCloud.jobs()` attaches it every `CHECKS_EVERY_SEC`=300 s; the CRM stores it in
+`lead_gen_agents.checks` and renders the Setup tab "Agent health" panel. `python -m webscraper
+doctor` prints the same report (exit 1 when a required check fails). `scripts/install-agent.sh`
+(mac/linux) + `scripts/install-agent.ps1` (windows): idempotent full install — tools via
+brew/winget when missing, clone/pull to `~/hvt-lead-finder-agent`, venv, deps, playwright
+chromium, `.env` CRM_AGENT_TOKEN + LEAD_FINDER_DEVICE, autostart, start, doctor. The CRM's
+"Install agent on this computer" button mints a token and downloads a `.command`/`.bat` that
+curls these from `raw.githubusercontent.com/.../main/scripts/` — **needs the repo public**.
+89 tests still pass.
+
 ### W16 — discovery lane died on the 2nd closed window; Mac launcher  [x]
 Job #13 (CRM) / #28 (local): human closed the headed Chrome window, `Relauncher` relaunched
 once ("browser died during tile 1/1050"), the window was closed again 4 s later and the

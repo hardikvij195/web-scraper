@@ -258,5 +258,20 @@ def wa_verify_cmd(job_id: int = typer.Argument(..., help="Verify the numbers of 
 
 
 @app.command()
+def doctor() -> None:
+    """Check this machine can run every Lead Finder lane (same report the CRM Setup tab shows)."""
+    from .healthcheck import run_checks
+    rep = run_checks()
+    console.print(f"agent {rep['version']} ({rep['git'] or 'no git'}) on {rep['os']}")
+    for name, c in rep["checks"].items():
+        mark = "[green]OK  [/]" if c["ok"] else ("[yellow]opt [/]" if c.get("optional") else "[red]FAIL[/]")
+        console.print(f"{mark} {name:12} {c['detail']}")
+        if not c["ok"] and c["fix"]:
+            console.print(f"       -> {c['fix']}")
+    console.print("[green]ready[/]" if rep["ok"] else "[red]not ready - fix the FAIL lines above[/]")
+    raise typer.Exit(0 if rep["ok"] else 1)
+
+
+@app.command()
 def version() -> None:
     console.print(__version__)

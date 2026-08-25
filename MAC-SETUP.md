@@ -20,7 +20,16 @@ Read this first in the Mac session. The Mac needs ONLY this repo (`web-scraper`)
   Edge Function are **already applied/deployed on prod** (`fyfhkjxewzbyxdwspkuc`) — verified
   2026-08-25 (`HARDIK-PC` row present). Nothing DB-side to do on the Mac.
 
-## Mac setup (one time)
+## Mac setup — one click (preferred once the repo is public)
+
+CRM → Lead Finder → **Setup** tab → *Install agent on this computer* → type a name (e.g.
+`Hardik-MacBook`) → **Download installer (Mac)**. Then in Terminal: `bash ~/Downloads/install-lead-finder-agent.command`
+(or paste the one-liner the CRM shows). It installs Python deps, writes `.env`, registers launchd
+and starts the agent; the **Agent health** panel on the same tab goes green within ~10 s.
+Delete the downloaded file afterwards (it embeds the token). `python -m webscraper doctor`
+prints the same report locally. WhatsApp lane still needs a one-time `wa-login` on the Mac.
+
+## Mac setup — manual (fallback)
 
 ```bash
 # 1. prerequisites

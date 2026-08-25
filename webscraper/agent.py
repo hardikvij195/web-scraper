@@ -90,8 +90,21 @@ class CrmCloud:
     def _post(self, payload: dict) -> httpx.Response:
         return self.c.post(self.url, json=payload)
 
+    #: Self-check cadence. The checks are cheap but there is no point re-sending an
+    #: unchanged picture every second while a job is busy.
+    CHECKS_EVERY_SEC = 300.0
+    _checks_sent_at = 0.0
+
     def jobs(self) -> list[dict]:
-        r = self._post(crm_payload("jobs"))
+        extra: dict = {}
+        if time.monotonic() - self._checks_sent_at >= self.CHECKS_EVERY_SEC:
+            try:
+                from .healthcheck import run_checks
+                extra["checks"] = run_checks()
+            except Exception:                                     # noqa: BLE001
+                log.debug("self-check failed", exc_info=True)
+            self._checks_sent_at = time.monotonic()
+        r = self._post(crm_payload("jobs", **extra))
         r.raise_for_status()
         return r.json()
 
