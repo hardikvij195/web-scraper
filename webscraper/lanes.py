@@ -6,7 +6,9 @@ job #6 is the proof: `WhatsApp verification 2 / 30 numbers` labelled *done*, bec
 enrichment and AI research had spent the shared post-Maps budget and the lane exited after
 two checks. Running the lanes at the same time removes the race instead of re-tuning it.
 
-    Lane A  discovery    Maps Chrome, single-threaded (the proxy-pool rule stands)
+    Lane A  discovery    Maps Chrome ×2 since W26: a COLLECTOR tab tiles the search and
+       │                 writes stub places rows (detail_status='pending') per tile; an
+       │                 OPENER tab reads each panel and fills the row (detail_status='done')
        │  writes places rows with enrich_status='pending'
        ▼
     Lane B  enrichment   httpx site+socials, then the AI summary for that same lead
@@ -15,8 +17,9 @@ two checks. Running the lanes at the same time removes the race instead of re-tu
     Lane C  whatsapp     WhatsApp Web Chrome, existing pacing + per-account daily cap
 
 **The `places` table is the queue.** Lanes hand each other nothing in memory: B selects
-`enrich_status='pending'`, C selects rows whose enrichment has resolved and whose
-`wa_verified` is still undecided. That was chosen over a `queue.Queue` for two reasons —
+`enrich_status='pending'` rows whose panel has been read (`detail_status='done'`), C selects
+NUMBERS without a verdict in `wa_checks` — the Maps phone the moment the opener writes it,
+the website's numbers once enrichment has resolved (W26). That was chosen over a `queue.Queue` for two reasons —
 it leaves `maps.py` alone, and it makes every lane restart-safe for free, which is what the
 supervisor restart already depends on.
 
@@ -82,10 +85,18 @@ def _enrich_line(r: dict, status: str, f: dict) -> str:
     return f"{name} · {site} → {status}{via} · {tail}"
 
 
-def _wa_line(r: dict, status: str, num: str | None) -> str:
+#: Where a checked number came from, as the log line says it (W26).
+WA_SOURCE_LABEL = {"maps": "maps", "wa_link": "whatsapp link", "site": "website"}
+
+
+def _wa_line(r: dict, status: str, num: str | None, source: str | None = None) -> str:
+    """'Name · +44… (maps|website) → ON WhatsApp ✓ / not on WhatsApp ✗'."""
     name = (r.get("name") or r.get("place_key") or "?")[:50]
-    verdict = {"yes": "ON WhatsApp ✓", "no": "not on WhatsApp ✗", "unknown": "no number to check"}.get(status, status)
-    return f"{name} · {num or '—'} → {verdict}"
+    verdict = {"yes": "ON WhatsApp ✓", "no": "not on WhatsApp ✗",
+               "unknown": "could not decide" if num else "no number to check"}.get(status, status)
+    label = WA_SOURCE_LABEL.get(source or "", source)
+    src = f" ({label})" if (num and label) else ""
+    return f"{name} · {num or '—'}{src} → {verdict}"
 
 
 class Lane(threading.Thread):
@@ -345,8 +356,10 @@ class WhatsAppLane(Lane):
                 time.sleep(IDLE_POLL_SEC)
                 continue
 
+            # Units are NUMBERS (W26): a business with a Maps phone, a wa.me link and two
+            # numbers on its site is four checks, and the bar counts all four.
             store.update_job(self.job_id,
-                             wa_verify_total=checked + len(batch),
+                             wa_verify_total=checked + store.count_wa_pending(self.job_id),
                              wa_verify_done=checked, wa_active=len(batch))
 
             by_pk = {r["place_key"]: r for r in batch}
@@ -355,13 +368,14 @@ class WhatsAppLane(Lane):
                            f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
                            + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
 
-            def on_wa(pk: str, status: str, num: str | None = None) -> None:
+            def on_wa(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
                 nonlocal checked
                 checked += 1
                 store.update_job(self.job_id, wa_verify_done=checked)
                 try:
                     r = by_pk.get(pk, {})
-                    self.store.log(self.job_id, "whatsapp", _wa_line(r, status, num or r.get("whatsapp_number") or r.get("phone")))
+                    self.store.log(self.job_id, "whatsapp",
+                                   _wa_line(r, status, num or r.get("number"), source or r.get("source")))
                 except Exception:                                 # noqa: BLE001
                     pass
 
@@ -373,8 +387,10 @@ class WhatsAppLane(Lane):
                 return R_WA_LOGIN
             store.record_phase_rate(self.job_id, "verifying_wa", checked,
                                     time.monotonic() - t0)
+            store.update_job(self.job_id, wa_verify_done=checked,
+                             wa_verify_total=checked + store.count_wa_pending(self.job_id))
             self.note(f"WhatsApp: {res['yes']} on WA, {res['no']} not, "
-                      f"{res['unknown']} unknown ({checked} checked)")
+                      f"{res['unknown']} unknown ({checked} numbers checked)")
             if res.get("capped"):
                 return R_WA_CAP
 

@@ -45,6 +45,10 @@ _COLS = ["place_key", "name", "category", "phone", "whatsapp_number", "whatsapp_
          # migration ever added them, see W11), so that push already 400s. The CRM's
          # `lead_gen_results`, which is the path actually in use, has both.
          "enrich_error",
+         # W26: [{number, source, verdict}] per checked number. The CRM Edge Function
+         # ignores keys outside its LEAD_COLS, so this is harmless there until the CRM
+         # adds the column; the SaaS table lacks it too (already 400s — W11).
+         "wa_numbers",
          "scraped_at", "job_id", "job_query", "job_location"]
 
 
@@ -73,6 +77,12 @@ def _row(r: dict[str, Any]) -> dict[str, Any]:
             v = "; ".join(r.get("emails") or []) if isinstance(r.get("emails"), list) else v
         elif c == "team":
             v = fmt_team(r.get("team"))
+        elif c == "wa_numbers" and isinstance(v, str):
+            import json as _json
+            try:
+                v = _json.loads(v)
+            except (TypeError, ValueError):
+                v = None
         out[c] = v
     return out
 

@@ -19,9 +19,9 @@ PLACE_COLS = [
     "rating", "reviews_count", "price_range", "lat", "lng", "distance_km", "maps_url", "plus_code", "place_id",
     "email", "emails", "instagram", "facebook", "linkedin", "twitter_x", "youtube", "tiktok",
     "whatsapp_number", "whatsapp_source", "enrich_status", "enriched_at", "scraped_at",
-    "summary", "owner", "team", "research_status", "researched_at", "raw",
+    "summary", "owner", "team", "research_status", "researched_at", "detail_status", "site_phones", "raw",
 ]
-_JSON_COLS = {"emails", "raw", "team"}
+_JSON_COLS = {"emails", "raw", "team", "site_phones"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -99,7 +99,94 @@ CREATE TABLE IF NOT EXISTS job_links (
   opened INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (job_id, key)
 );
+
+-- W26: one WhatsApp verdict PER NUMBER. A business has up to three kinds of number —
+-- the Google Maps phone (`maps`), a wa.me link on Maps or its site (`wa_link`) and the
+-- numbers its website lists (`site`) — and the user wants every one of them checked.
+-- `places.wa_verified` / `whatsapp_number` are AGGREGATED from here (see
+-- `record_wa_check`). Numbers are E.164 with the '+'.
+CREATE TABLE IF NOT EXISTS wa_checks (
+  job_id INTEGER NOT NULL,
+  place_key TEXT NOT NULL,
+  number TEXT NOT NULL,
+  source TEXT NOT NULL,                 -- maps | wa_link | site
+  verdict TEXT NOT NULL,                -- yes | no | unknown
+  checked_at TEXT NOT NULL,
+  account TEXT,
+  PRIMARY KEY (job_id, place_key, number)
+);
 """
+
+#: WhatsApp number sources, in the order a verified hit is promoted into `whatsapp_number`.
+WA_SOURCE_ORDER = ("wa_link", "maps", "site")
+
+
+def _digits_only(number: str | None) -> str:
+    return "".join(ch for ch in str(number or "") if ch.isdigit())
+
+
+def wa_candidates(row: dict[str, Any], region: str | None = None) -> list[tuple[str, str]]:
+    """Every distinct number a place can be checked on, as (E.164 '+digits', source).
+
+    Order = promotion priority (`WA_SOURCE_ORDER`): an explicit WhatsApp link beats the Maps
+    phone beats a number scraped off the website. Distinct = same digits, so the
+    'unverified' candidate enrichment writes into `whatsapp_number` (which IS the Maps
+    phone) collapses into the `maps` entry instead of being checked twice.
+
+    Site numbers are only offered once enrichment has RESOLVED — before that the list is
+    empty by construction, and `whatsapp_number` from a website `wa_link` does not exist
+    yet either — so the Maps phone is checkable from the moment the opener writes it."""
+    from webscraper.extractors import normalise_phone
+    region = (region or row.get("country") or settings.default_country or "IN").upper()
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(num: str | None, source: str) -> None:
+        d = _digits_only(num)
+        if not (8 <= len(d) <= 15) or d in seen:
+            return
+        seen.add(d)
+        out.append((f"+{d}", source))
+
+    src = row.get("whatsapp_source")
+    if row.get("whatsapp_number") and src in ("maps_link", "wa_link", "verified"):
+        add(row["whatsapp_number"], "wa_link")
+    if row.get("phone"):
+        e164, digits = normalise_phone(row["phone"], region)
+        add(e164 or digits, "maps")
+    elif row.get("phone_digits"):
+        add(row["phone_digits"], "maps")
+    if row.get("whatsapp_number") and src == "unverified":
+        add(row["whatsapp_number"], "maps")            # same number as the Maps phone
+    enriched = str(row.get("enrich_status") or "pending") != "pending"
+    if enriched:
+        phones = row.get("site_phones")
+        if isinstance(phones, str):
+            try:
+                phones = json.loads(phones)
+            except (TypeError, json.JSONDecodeError):
+                phones = []
+        for n in phones or []:
+            add(n, "site")
+    return out
+
+
+def aggregate_wa(checks: list[dict[str, Any]]) -> tuple[str, str | None]:
+    """(wa_verified, whatsapp_number) for a place from its per-number verdicts.
+
+    'yes' if ANY number is on WhatsApp — and the number promoted is the first 'yes' in
+    `WA_SOURCE_ORDER`; 'no' only when every checked number said no; 'unknown' otherwise
+    (nothing checked yet, or a check that could not decide). An empty list is 'unknown'."""
+    if not checks:
+        return "unknown", None
+    yes = [c for c in checks if c.get("verdict") == "yes"]
+    if yes:
+        rank = {s: i for i, s in enumerate(WA_SOURCE_ORDER)}
+        best = min(yes, key=lambda c: rank.get(c.get("source"), len(rank)))
+        return "yes", plus(best.get("number"))
+    if all(c.get("verdict") == "no" for c in checks):
+        return "no", None
+    return "unknown", None
 
 
 def now_iso() -> str:
@@ -140,7 +227,8 @@ def fmt_team(team: Any) -> str:
 
 class Store:
     EXPORT_COLS = [
-        "name", "category", "phone", "whatsapp_number", "whatsapp_source", "wa_verified", "email", "emails", "website",
+        "name", "category", "phone", "whatsapp_number", "whatsapp_source", "wa_verified", "wa_numbers",
+        "site_phones", "email", "emails", "website",
         "instagram", "facebook", "linkedin", "twitter_x", "youtube", "tiktok",
         "address", "country", "rating", "reviews_count", "price_range", "lat", "lng", "distance_km",
         "summary", "owner", "team", "maps_url", "place_id", "enrich_status", "job_id",
@@ -173,9 +261,17 @@ class Store:
                          # HOW the home page was finally fetched: httpx | tls | browser.
                          # Shows which anti-bot tier rescued a lead — a 'tls'/'browser' value
                          # is a site that plain httpx could not read on its own.
-                         ("enrich_via", "TEXT")):
+                         ("enrich_via", "TEXT"),
+                         # W26: 'pending' while the row is a feed-card stub (name, rating,
+                         # coords) the opener has not filled yet; 'done' once the place
+                         # panel was read. Enrichment waits for 'done' — a stub has no
+                         # website to crawl. Existing rows were all opened → 'done'.
+                         ("detail_status", "TEXT"),
+                         ("site_phones", "TEXT"),      # JSON list, E.164 '+' (W26)
+                         ("wa_numbers", "TEXT")):      # JSON [{number, source, verdict}] (W26)
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
+        self.conn.execute("UPDATE places SET detail_status='done' WHERE detail_status IS NULL")
         # `changed_at` bumps on EVERY update to a place (enrichment verdict, socials, WA
         # result), so the agent can stream updates to the CRM mid-job instead of only new
         # rows — the CRM showed "64 / 248" while the agent had enriched 116 (job #14). The
@@ -247,6 +343,9 @@ class Store:
             # Leads in flight RIGHT NOW per lane (batch size while a batch runs, 0 between),
             # so the CRM can show done / in progress / queued instead of "1 / >= 1" (T170).
             ("enrich_active", "INTEGER NOT NULL DEFAULT 0"), ("wa_active", "INTEGER NOT NULL DEFAULT 0"),
+            # W26: 1 while the discovery OPENER has a place panel in flight (the collector
+            # thread's tiling does not count — it produces links, not places).
+            ("disc_active", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
@@ -405,19 +504,85 @@ class Store:
         """Leads discovery has written that enrichment has not taken yet."""
         scope, args = self._scope_clause(job_id)
         return self._decode_json_cols([dict(r) for r in self.conn.execute(
-            "SELECT * FROM places WHERE job_id=? AND enrich_status='pending'" + scope
+            "SELECT * FROM places WHERE job_id=? AND enrich_status='pending'"
+            " AND COALESCE(detail_status,'done')='done'" + scope
             + " ORDER BY rowid LIMIT ?", (job_id, *args, limit))])
 
-    def pending_wa_verify(self, job_id: int, limit: int = 25) -> list[dict[str, Any]]:
-        """Leads whose enrichment has RESOLVED (any outcome — a 403 site still has the
-        Maps phone) that carry a number and have no verdict yet. 'yes'/'no' are final:
-        re-checking them would burn the daily cap for nothing."""
+    def _wa_unchecked(self, job_id: int, limit: int | None) -> list[dict[str, Any]]:
+        """NUMBERS without a verdict yet (W26), as the place row plus `number` + `source`.
+
+        The Maps phone is offered as soon as the opener has written it — no waiting for
+        enrichment — and the website's numbers (wa.me link, listed phones) join once
+        `enrich_status` has resolved. A number with ANY row in `wa_checks` (yes / no /
+        unknown) is not offered again in this run: re-checking an 'unknown' every poll
+        would loop the lane for ever; the CRM's Re-verify is the deliberate retry."""
         scope, args = self._scope_clause(job_id)
-        return self._decode_json_cols([dict(r) for r in self.conn.execute(
-            "SELECT * FROM places WHERE job_id=? AND enrich_status <> 'pending' "
-            "AND (COALESCE(phone,'') <> '' OR COALESCE(whatsapp_number,'') <> '') "
-            "AND COALESCE(wa_verified,'') NOT IN ('yes','no')" + scope
-            + " ORDER BY rowid LIMIT ?", (job_id, *args, limit))])
+        rows = self.conn.execute(
+            "SELECT p.*, (SELECT group_concat(number, ' ') FROM wa_checks w "
+            "  WHERE w.job_id=p.job_id AND w.place_key=p.place_key) AS _checked "
+            "FROM places p WHERE p.job_id=? "
+            "AND (COALESCE(p.phone,'') <> '' OR COALESCE(p.whatsapp_number,'') <> '' "
+            "     OR COALESCE(p.site_phones,'') NOT IN ('', '[]'))" + scope
+            + " ORDER BY p.rowid", (job_id, *args)).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            checked = {_digits_only(x) for x in (d.pop("_checked") or "").split()}
+            for number, source in wa_candidates(d):
+                if _digits_only(number) in checked:
+                    continue
+                item = dict(d)
+                item["number"], item["source"] = number, source
+                out.append(item)
+                if limit is not None and len(out) >= limit:
+                    return self._decode_json_cols(out)
+        return self._decode_json_cols(out)
+
+    def pending_wa_verify(self, job_id: int, limit: int = 25) -> list[dict[str, Any]]:
+        """Numbers to check next: (place row + `number` + `source`) tuples, feed order."""
+        return self._wa_unchecked(job_id, limit)
+
+    def wa_checks(self, job_id: int, place_key: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT number, source, verdict, checked_at, account FROM wa_checks "
+            "WHERE job_id=? AND place_key=? ORDER BY rowid", (job_id, place_key))]
+
+    def record_wa_check(self, job_id: int, place_key: str, number: str, source: str,
+                        verdict: str, account: str | None = None) -> tuple[str, str | None]:
+        """One number's verdict, then re-derive the place-level picture (W26).
+
+        `wa_verified` = 'yes' if any number is on WhatsApp, 'no' if all checked are not,
+        'unknown' otherwise; `whatsapp_number` = the first 'yes' in wa_link > maps > site
+        order (source 'verified'). When everything checked said 'no', a guessed
+        ('unverified') candidate is cleared so it never lingers as if it were a WhatsApp;
+        a Maps/site WhatsApp link that failed the check is kept as the link it is.
+        Returns the new (wa_verified, whatsapp_number)."""
+        e164 = plus(number)
+        self.conn.execute(
+            "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
+            "source=excluded.source, verdict=excluded.verdict, checked_at=excluded.checked_at, "
+            "account=excluded.account",
+            (job_id, place_key, e164, source, verdict, now_iso(), account))
+        checks = self.wa_checks(job_id, place_key)
+        agg, wa_num = aggregate_wa(checks)
+        summary = json.dumps([{"number": c["number"], "source": c["source"], "verdict": c["verdict"]}
+                              for c in checks], ensure_ascii=False)
+        self.conn.execute(
+            "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=?, wa_numbers=? "
+            "WHERE job_id=? AND place_key=?",
+            (agg, now_iso(), account, summary, job_id, place_key))
+        if agg == "yes" and wa_num:
+            self.conn.execute(
+                "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
+                (wa_num, job_id, place_key))
+        elif agg == "no":
+            self.conn.execute(
+                "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL "
+                "WHERE job_id=? AND place_key=? AND whatsapp_source IN ('unverified','assumed_mobile')",
+                (job_id, place_key))
+        self.conn.commit()
+        return agg, wa_num
 
     def job_place_keys(self, job_id: int) -> list[str] | None:
         """The subset this job is scoped to, or None for "every lead in the job"."""
@@ -450,6 +615,51 @@ class Store:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM job_links WHERE job_id=? AND opened=0 ORDER BY rowid", (job_id,))]
 
+    def next_pending_link(self, job_id: int) -> dict[str, Any] | None:
+        """The oldest unopened feed link — what the opener thread takes next (W26)."""
+        r = self.conn.execute(
+            "SELECT * FROM job_links WHERE job_id=? AND opened=0 ORDER BY rowid LIMIT 1", (job_id,)).fetchone()
+        return dict(r) if r else None
+
+    def count_unopened_links(self, job_id: int) -> int:
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM job_links WHERE job_id=? AND opened=0", (job_id,)).fetchone()
+        return int(r[0] or 0)
+
+    # ── W26: stub places written by the collector, filled by the opener ─────────
+    def save_stub_places(self, job_id: int, cards: list[Any], country: str | None = None) -> int:
+        """Insert a minimal `places` row per feed card so the CRM sees the business the
+        moment Maps lists it ("adds whatever info it has"). Never touches an existing row —
+        a place already opened (or enriched) keeps everything. Returns rows inserted."""
+        n = 0
+        ts = now_iso()
+        for c in cards:
+            cur = self.conn.execute(
+                "INSERT INTO places(job_id, place_key, name, rating, reviews_count, lat, lng, maps_url, "
+                "country, enrich_status, detail_status, scraped_at, emails, team, site_phones, raw) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'pending','pending',?,'[]','[]','[]','{}') "
+                "ON CONFLICT(job_id, place_key) DO NOTHING",
+                (job_id, c.key, c.name, c.rating, c.reviews_count, c.lat, c.lng, c.href, country, ts))
+            n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        self.conn.commit()
+        return n
+
+    def drop_stub(self, job_id: int, place_key: str) -> bool:
+        """Remove a stub the opener decided not to keep (exact coords outside the radius).
+        Only ever removes a row still at detail_status='pending'."""
+        cur = self.conn.execute(
+            "DELETE FROM places WHERE job_id=? AND place_key=? AND detail_status='pending'",
+            (job_id, place_key))
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def count_places_detailed(self, job_id: int) -> int:
+        """Places whose panel was actually read (stubs excluded) — the discovery lane's done."""
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND COALESCE(detail_status,'done')='done'",
+            (job_id,)).fetchone()
+        return int(r[0] or 0)
+
     def link_counts(self, job_id: int) -> tuple[int, int]:
         """(offered, opened) for the discovery stats."""
         r = self.conn.execute(
@@ -469,6 +679,7 @@ class Store:
         scope, args = self._scope_clause(job_id)
         r = self.conn.execute(
             "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status='pending'"
+            " AND COALESCE(detail_status,'done')='done'"
             " AND website IS NOT NULL AND website<>''" + scope,
             (job_id, *args)).fetchone()
         return int(r[0] or 0)
@@ -486,22 +697,15 @@ class Store:
         return int(r[0] or 0)
 
     def count_wa_done(self, job_id: int) -> int:
-        """Numbers with a final WhatsApp verdict (yes/no) in scope."""
+        """NUMBERS checked on WhatsApp in scope (any verdict) — the WA lane's done (W26)."""
         scope, args = self._scope_clause(job_id)
         r = self.conn.execute(
-            "SELECT COUNT(*) FROM places WHERE job_id=? AND wa_verified IN ('yes','no')" + scope,
-            (job_id, *args)).fetchone()
+            "SELECT COUNT(*) FROM wa_checks WHERE job_id=?" + scope, (job_id, *args)).fetchone()
         return int(r[0] or 0)
 
     def count_wa_pending(self, job_id: int) -> int:
-        """Same predicate as pending_wa_verify(), as a count: the WhatsApp lane's pipeline."""
-        scope, args = self._scope_clause(job_id)
-        r = self.conn.execute(
-            "SELECT COUNT(*) FROM places WHERE job_id=? AND enrich_status <> 'pending' "
-            "AND (COALESCE(phone,'') <> '' OR COALESCE(whatsapp_number,'') <> '') "
-            "AND COALESCE(wa_verified,'') NOT IN ('yes','no')" + scope,
-            (job_id, *args)).fetchone()
-        return int(r[0] or 0)
+        """Same predicate as pending_wa_verify(), as a count: numbers still to check."""
+        return len(self._wa_unchecked(job_id, None))
 
     def stop_requested(self, job_id: int) -> bool:
         r = self.conn.execute("SELECT stop_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -600,6 +804,7 @@ class Store:
         for r in rows:
             r = dict(r)
             r["emails"] = "; ".join(r.get("emails") or []); r["team"] = fmt_team(r.get("team"))
+            r["site_phones"] = "; ".join(r.get("site_phones") or []) if isinstance(r.get("site_phones"), list) else r.get("site_phones")
             ws.append([r.get(c) for c in self.EXPORT_COLS])
         widths = {"name": 34, "address": 50, "website": 32, "email": 30, "emails": 36, "maps_url": 18,
                   "instagram": 30, "facebook": 30, "linkedin": 30, "twitter_x": 26, "youtube": 26}
@@ -647,6 +852,11 @@ class Store:
     def known_place_keys(self, job_id: int) -> set[str]:
         return {r[0] for r in self.conn.execute("SELECT place_key FROM places WHERE job_id=?", (job_id,))}
 
+    def detailed_place_keys(self, job_id: int) -> set[str]:
+        """Places of this job whose panel has been read (W26 stubs excluded)."""
+        return {r[0] for r in self.conn.execute(
+            "SELECT place_key FROM places WHERE job_id=? AND COALESCE(detail_status,'done')='done'", (job_id,))}
+
     def all_place_keys(self) -> set[str]:
         """Every place ever scraped, across all jobs — used by 'only new businesses' jobs."""
         return {r[0] for r in self.conn.execute("SELECT DISTINCT place_key FROM places")}
@@ -678,7 +888,12 @@ class Store:
         row = p.to_row()
         vals = [json.dumps(row[c], ensure_ascii=False) if c in _JSON_COLS else row[c] for c in PLACE_COLS]
         placeholders = ",".join("?" for _ in PLACE_COLS)
-        updates = ",".join(f"{c}=excluded.{c}" for c in PLACE_COLS if c not in ("job_id", "place_key"))
+        # COALESCE: a NULL in the fresh scrape must not wipe a value the row already has —
+        # the W26 stub carries the feed card's rating / review count / coords, which the
+        # headless place panel does not always expose, and the opener's row would have
+        # nulled them. Non-null values still overwrite (a re-scrape is authoritative).
+        updates = ",".join(f"{c}=COALESCE(excluded.{c}, places.{c})"
+                           for c in PLACE_COLS if c not in ("job_id", "place_key"))
         self.conn.execute(
             f"INSERT INTO places({','.join(PLACE_COLS)}) VALUES ({placeholders}) "
             f"ON CONFLICT(job_id, place_key) DO UPDATE SET {updates}",
@@ -688,8 +903,9 @@ class Store:
 
     def update_enrichment(self, job_id: int, place_key: str, fields: dict[str, Any]) -> None:
         fields = dict(fields)
-        if "emails" in fields and not isinstance(fields["emails"], str):
-            fields["emails"] = json.dumps(fields["emails"], ensure_ascii=False)
+        for jc in ("emails", "site_phones"):
+            if jc in fields and not isinstance(fields[jc], str):
+                fields[jc] = json.dumps(fields[jc], ensure_ascii=False)
         cols = ",".join(f"{k}=?" for k in fields)
         self.conn.execute(
             f"UPDATE places SET {cols} WHERE job_id=? AND place_key=?",
@@ -812,6 +1028,7 @@ class Store:
                 for r in rows:
                     r = dict(r)
                     r["emails"] = "; ".join(r.get("emails") or []); r["team"] = fmt_team(r.get("team"))
+                    r["site_phones"] = "; ".join(r.get("site_phones") or []) if isinstance(r.get("site_phones"), list) else r.get("site_phones")
                     w.writerow({c: r.get(c) for c in cols})
         else:
             from openpyxl import Workbook
@@ -827,6 +1044,7 @@ class Store:
             for r in rows:
                 r = dict(r)
                 r["emails"] = "; ".join(r.get("emails") or []); r["team"] = fmt_team(r.get("team"))
+                r["site_phones"] = "; ".join(r.get("site_phones") or []) if isinstance(r.get("site_phones"), list) else r.get("site_phones")
                 ws.append([r.get(c) for c in cols])
             for i, c in enumerate(cols, 1):
                 ws.column_dimensions[get_column_letter(i)].width = {"name": 34, "address": 50, "website": 32,
@@ -853,6 +1071,7 @@ class Store:
                 for r in rows:
                     r = dict(r)
                     r["emails"] = "; ".join(r.get("emails") or []); r["team"] = fmt_team(r.get("team"))
+                    r["site_phones"] = "; ".join(r.get("site_phones") or []) if isinstance(r.get("site_phones"), list) else r.get("site_phones")
                     w.writerow({c: r.get(c) for c in self.EXPORT_COLS})
         return out
 

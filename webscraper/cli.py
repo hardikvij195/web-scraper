@@ -251,7 +251,8 @@ def wa_verify_cmd(job_id: int = typer.Argument(..., help="Verify the numbers of 
     from webscraper import wa_verify
     from webscraper.store import Store
     s = Store()
-    rows = [p for p in s.places(job_id) if (p.get("phone") or p.get("whatsapp_number"))]
+    # W26: one entry per unchecked NUMBER (Maps phone, WhatsApp link, website numbers).
+    rows = s.pending_wa_verify(job_id, limit=10**9)
     console.print(f"verifying {len(rows)} numbers for job {job_id}…")
     res = wa_verify.verify_places(s, rows, job_id=job_id)
     console.print(res)

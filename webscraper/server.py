@@ -336,6 +336,17 @@ class Worker(threading.Thread):
                         store.update_job(job_id, message=f"{pfx}Google captcha — backing off {data['backoff_sec']:.0f}s")
                     elif kind == "skip":
                         store.update_job(job_id, message=f"{pfx}skipped one ({data['reason']})")
+                    elif kind == "tile":
+                        # W26 collector: one line per tile so the log shows links landing
+                        # while the opener is already working through the earlier ones.
+                        store.log(job_id, "discovery",
+                                  f"tile {data['tile']}/{data['tiles']}: +{data['added']} links, total {data['total']}")
+                    elif kind == "collect_failed":
+                        store.log(job_id, "discovery",
+                                  f"link collection stopped: {data['error']} — opening what was found", "warn")
+                    elif kind == "browser_restart":
+                        store.log(job_id, "discovery",
+                                  f"browser died during {data['where']} — relaunched ({data['attempt']})", "warn")
                     elif kind == "links_budget":
                         why = ("collection time up" if data.get("reason") == "time"
                                else "enough places for the time left")

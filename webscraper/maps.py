@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import queue
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 from urllib.parse import quote_plus
 
@@ -386,6 +389,174 @@ def scrape_place(page: Page, href: str, job_id: int, country: str) -> Place:
     )
 
 
+#: Poll interval for the opener while the collector is still tiling and the queue is empty.
+OPENER_POLL_SEC = 2.0
+#: The opener's own persistent Chrome profile, beside the collector's (`settings.profile_dir`).
+OPENER_PROFILE_NAME = "browser-profile-open"
+
+
+def opener_profile_dir() -> Path:
+    return settings.profile_dir.parent / OPENER_PROFILE_NAME
+
+
+def _launch_kwargs(profile_dir: Path, headless: bool) -> dict:
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    kw: dict = dict(
+        user_data_dir=str(profile_dir), headless=headless, locale="en-IN",
+        viewport={"width": 1366, "height": 850},
+        args=["--disable-blink-features=AutomationControlled", "--lang=en-IN"],
+    )
+    if settings.maps_proxy:
+        kw["proxy"] = {"server": settings.maps_proxy}
+    return kw
+
+
+def _open_context(pw, launch_kwargs: dict):
+    c = pw.chromium.launch_persistent_context(**launch_kwargs)
+    # images/fonts/media add nothing we read — skipping them cuts bandwidth ~80%
+    c.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),
+            lambda route: route.abort())
+    pg = c.pages[0] if c.pages else c.new_page()
+    pg.set_default_timeout(20000)
+    return c, pg
+
+
+def _card_from_link(r: dict) -> FeedCard:
+    return FeedCard(href=r["href"], name=r.get("name"), rating=r.get("rating"),
+                    reviews_count=r.get("reviews"), lat=r.get("lat"), lng=r.get("lng"))
+
+
+def _collect_links(*, store_path: Path, job_id: int, queries: list[str], location: str | None,
+                   limit: int, unlimited: bool, max_places: int, headless: bool, country: str,
+                   emit: Callable[[str, dict], None], radius_km: float | None,
+                   center: tuple[float, float] | None, known_keys: set[str] | None,
+                   collect_until: float | None, collect_target: int | None,
+                   stop_ev: threading.Event, pause_ev: threading.Event, result: dict) -> None:
+    """COLLECTOR thread (W26): the tile × keyword loop, persisting every tile's cards to
+    `job_links` + a stub `places` row the moment they are seen, so the opener (and, through
+    it, the CRM) can start on them while the next tile is still loading.
+
+    Runs on its own thread with its OWN Store (sqlite3 connections are thread-bound), its
+    own Playwright instance and its own persistent profile. It never calls the caller's
+    `should_stop` / `wait_if_paused` / `on_event` directly — those closures belong to the
+    lane thread — but reads `stop_ev` / `pause_ev` (set by the opener) and pushes events
+    through `emit`, which is a thread-safe queue drained on the lane thread."""
+    cstore = Store(store_path)
+    skipped_far = skipped_known = 0
+    merged: set[str] = set()
+    budget_hit = False
+
+    def pause_gate() -> None:
+        while pause_ev.is_set() and not stop_ev.is_set():
+            time.sleep(1.0)
+
+    try:
+        with sync_playwright() as pw:
+            kw = _launch_kwargs(settings.profile_dir, headless)
+            rl = Relauncher(lambda: _open_context(pw, kw),
+                            on_restart=lambda where, n: emit("browser_restart", {"where": where, "attempt": n}))
+            ctx, page = rl.open()
+            try:
+                zoom: float | None = None
+                if radius_km and (center or location):
+                    if not center:                     # no pinned centre from the map picker → ask Maps
+                        center = resolve_center(page, queries[0], location or "")
+                    if center:
+                        zoom = zoom_for_radius_km(radius_km)
+                        emit("center", {"lat": center[0], "lng": center[1], "zoom": zoom})
+                    else:
+                        emit("center_failed", {})
+                    time.sleep(random.uniform(1, 2))
+                # One Maps search returns ~120 places max. For "unlimited" or big asks inside a
+                # radius, tile the circle with ~2 km sub-searches and merge.
+                MAPS_PAGE_CAP = 110
+                tiling = bool(center and radius_km) and (unlimited or max_places > MAPS_PAGE_CAP)
+                if tiling:
+                    tile_km = min(float(radius_km), 2.0)
+                    centers = grid_centers(center, float(radius_km), tile_km)
+                    tile_zoom = zoom_for_radius_km(tile_km)
+                    emit("tiles", {"count": len(centers)})
+                else:
+                    centers = [center]
+                    tile_zoom = zoom
+                # Centre-major, NOT query-major: each centre sweeps every keyword, so a
+                # truncated run still leaves every keyword represented.
+                steps = [(qy, c) for c in centers for qy in queries]
+                for s_i, (qy, c) in enumerate(steps, 1):
+                    if stop_ev.is_set() or len(merged) >= limit:
+                        break
+                    # Stop collecting while there is still time left to actually open the
+                    # places found — without this a wide radius tiles until the clock runs out.
+                    if collect_until is not None and time.monotonic() >= collect_until:
+                        budget_hit = True
+                        emit("links_budget", {"count": len(merged), "tile": s_i,
+                                              "tiles": len(steps), "reason": "time"})
+                        break
+                    if collect_target is not None and len(merged) >= collect_target:
+                        budget_hit = True
+                        emit("links_budget", {"count": len(merged), "tile": s_i,
+                                              "tiles": len(steps), "reason": "enough"})
+                        break
+                    pause_gate()
+                    want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
+                    # Retry this tile through the relauncher until it reads or the relaunch
+                    # cap is spent. Everything already persisted survives a crash.
+                    while True:
+                        try:
+                            page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
+                                      wait_until="domcontentloaded", timeout=60000)
+                            _accept_consent(page)
+                            time.sleep(random.uniform(2, 4))
+                            cards = collect_place_links(
+                                page, want,
+                                on_progress=lambda n: emit("links", {"count": len(merged) + n,
+                                                                     "tile": s_i, "tiles": len(steps)}))
+                            break
+                        except PWError as e:
+                            if not is_closed(e) or not rl.recover(f"tile {s_i}/{len(steps)}"):
+                                raise
+                            ctx, page = rl.current
+                    fresh: list[FeedCard] = []
+                    for card in cards:
+                        if card.key in merged:
+                            continue
+                        if known_keys and card.key in known_keys:   # 'only new businesses' job
+                            skipped_known += 1
+                            continue
+                        # pre-filter on the coordinates embedded in the link — no visit needed
+                        if center and radius_km and card.lat is not None:
+                            d = haversine_km(center[0], center[1], card.lat, card.lng)
+                            if d > radius_km:
+                                skipped_far += 1
+                                continue
+                        merged.add(card.key)
+                        fresh.append(card)
+                        if len(merged) >= limit:
+                            break
+                    # Persist THIS tile now: the opener takes links from job_links, and the
+                    # stub rows are what the CRM shows before the panel has been read.
+                    # Stub rows BEFORE the links: the opener takes a link the instant it is
+                    # committed, and its fill must land on an existing row.
+                    if fresh:
+                        cstore.save_stub_places(job_id, fresh, country)
+                        cstore.save_links(job_id, fresh)
+                    emit("tile", {"tile": s_i, "tiles": len(steps), "added": len(fresh), "total": len(merged)})
+                    emit("links", {"count": len(merged), "tile": s_i, "tiles": len(steps)})
+                    if len(steps) > 1:
+                        time.sleep(random.uniform(1.5, 3.5))
+            finally:
+                rl.close()
+    except Exception as e:                                        # noqa: BLE001 — reported, then re-raised by the caller
+        result["error"] = e
+        emit("collect_failed", {"error": f"{type(e).__name__}: {str(e)[:200]}"})
+    finally:
+        result.update(count=len(merged), skipped_far=skipped_far, skipped_known=skipped_known,
+                      budget_hit=budget_hit)
+        emit("links_done", {"count": len(merged), "skipped_far": skipped_far,
+                            "skipped_known": skipped_known, "budget_hit": budget_hit})
+        cstore.close()
+
+
 def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_places: int,
                pacing: Pacing, headless: bool | None = None, country: str | None = None,
                on_event: Callable[[str, dict], None] | None = None,
@@ -398,223 +569,195 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                collect_target: int | None = None,
                preset_links: list[FeedCard] | None = None) -> int:
     """Scrape up to `max_places` (0 = unlimited) for (query, location) into `store`. Returns count saved.
-    `should_stop` is polled between places; when it returns True the job is marked stopped.
-    `radius_km` (needs `location`) centres the search there, tiles the circle when more than one
-    Maps page of results is wanted, and skips farther places.
-    `wait_if_paused` is called between places and may block (run-time window).
-    `collect_until` (time.monotonic deadline) caps the link-collection phase: a wide radius
-    tiles into thousands of sub-searches, and without a cap the job spends its whole time
-    budget collecting links and scrapes nothing at all.
-    `collect_target` stops collection once there are more links than the remaining time could
-    ever visit — past that point every extra tile is time stolen from actual scraping."""
+
+    W26 — two Chrome tabs side by side. A COLLECTOR thread runs the tile/keyword loop and
+    persists every tile's links + a stub place row as it goes; the OPENER (this thread)
+    takes unopened links from `job_links` in feed order, reads each place panel and fills
+    the row. The opener starts on the first tile's links while the collector is still on
+    tile two — before this the whole collect phase ran first and downstream lanes idled
+    (job #16: 96 min, 1,260 links, 0 places). Each thread has its own persistent profile
+    (`settings.profile_dir` / `opener_profile_dir()`), its own Playwright and its own Store.
+
+    `should_stop` is polled between places on this thread (the user's Stop, or the Maps
+    deadline); when it returns True the job is marked stopped and the collector is told to
+    quit. `collect_until` / `collect_target` cap the COLLECTOR only — the opener keeps
+    opening until the deadline. `wait_if_paused` is called between places and may block
+    (run-time window); the collector waits with it. `preset_links` = open exactly these
+    (a capped run's leftovers) — no search, no centre lookup, no tiling, no collector."""
     headless = settings.headless if headless is None else headless
     country = country or settings.default_country
-    emit = on_event or (lambda kind, data: None)
+    emit_direct = on_event or (lambda kind, data: None)
     should_stop = should_stop or (lambda: False)
     wait_if_paused = wait_if_paused or (lambda: None)
     unlimited = max_places <= 0
     limit = 10**9 if unlimited else max_places
     queries = [q.strip() for q in (query or "").split(",") if q.strip()] or [(query or "").strip()]
-    settings.profile_dir.mkdir(parents=True, exist_ok=True)
-    saved = 0
-    with sync_playwright() as pw:
-        launch_kwargs: dict = dict(
-            user_data_dir=str(settings.profile_dir), headless=headless, locale="en-IN",
-            viewport={"width": 1366, "height": 850},
-            args=["--disable-blink-features=AutomationControlled", "--lang=en-IN"],
-        )
-        if settings.maps_proxy:
-            launch_kwargs["proxy"] = {"server": settings.maps_proxy}
 
-        def _open():
-            c = pw.chromium.launch_persistent_context(**launch_kwargs)
-            # images/fonts/media add nothing we read — skipping them cuts bandwidth ~80%
-            c.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),
-                    lambda route: route.abort())
-            pg = c.pages[0] if c.pages else c.new_page()
-            pg.set_default_timeout(20000)
-            return c, pg
+    # Collector → opener event bridge. The caller's on_event closures are bound to THIS
+    # thread's Store, so the collector never calls them; it queues, we drain here.
+    events: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+    stop_ev = threading.Event()
+    pause_ev = threading.Event()
+    collector_done = threading.Event()
+    shared = {"center": center}
+    cresult: dict = {"error": None, "count": 0, "skipped_far": 0, "skipped_known": 0, "budget_hit": False}
 
-        # A headed run shares a desktop with a human, and Chrome also dies on its own
-        # (OOM, a crashed renderer, a Windows update). Losing the browser used to abort
-        # the whole job and throw away every place already collected - job #3 died exactly
-        # that way, mid-feed, with TargetClosedError. Relaunching costs one profile reload;
-        # the alternative is losing the run. Capped so a browser that cannot start at all
-        # still fails fast instead of looping.
-        # The mechanism moved to browser_recovery.py (2026-08-23) so the WhatsApp lane,
-        # which had none, gets the same treatment. Behaviour here is unchanged.
-        _relauncher = Relauncher(
-            _open, on_restart=lambda where, n: emit("browser_restart", {"where": where, "attempt": n}))
-        ctx, page = _relauncher.open()
-        _is_closed = is_closed
-
-        def _recover(where: str) -> bool:
-            nonlocal ctx, page
-            if not _relauncher.recover(where):
-                return False
-            ctx, page = _relauncher.current
-            return True
-
-        try:
-            zoom: float | None = None
-            # `preset_links` = open exactly these (a capped run's leftovers); no search,
-            # no centre lookup, no tiling.
-            if radius_km and (center or location) and preset_links is None:
-                if not center:                     # no pinned centre from the map picker → ask Maps
-                    center = resolve_center(page, queries[0], location or "")
-                if center:
-                    zoom = zoom_for_radius_km(radius_km)
-                    emit("center", {"lat": center[0], "lng": center[1], "zoom": zoom})
-                else:
-                    emit("center_failed", {})
-                time.sleep(random.uniform(1, 2))
-            # One Maps search returns ~120 places max. For "unlimited" or big asks inside a
-            # radius, tile the circle with ~2 km sub-searches and merge.
-            MAPS_PAGE_CAP = 110
-            tiling = bool(center and radius_km) and (unlimited or max_places > MAPS_PAGE_CAP)
-            if tiling:
-                tile_km = min(float(radius_km), 2.0)
-                centers = grid_centers(center, float(radius_km), tile_km)
-                tile_zoom = zoom_for_radius_km(tile_km)
-                emit("tiles", {"count": len(centers)})
-            else:
-                centers = [center]
-                tile_zoom = zoom
-
-            merged: dict[str, FeedCard] = {}
-            skipped_far = skipped_known = 0
-            # A job can carry several comma-separated keywords ("dentist, orthodontist"); each is
-            # its own Maps search, all merged into one deduped lead set.
-            # Centre-major, NOT query-major: a 50 km radius tiles into ~150 cells and a
-            # 52-keyword job is 7,800 searches, far more than any run finishes. Ordered by
-            # query it would collect every tile of keyword 1 and never reach keyword 2, so a
-            # truncated run returned one category. This way each centre sweeps all keywords,
-            # and cutting the phase short still leaves every keyword represented.
-            steps = [(qy, c) for c in centers for qy in queries]
-            if preset_links is not None:
-                steps = []
-                merged.update({c.key: c for c in preset_links})
-                emit("links", {"count": len(merged), "tile": 1, "tiles": 1})
-            budget_hit = False
-            for s_i, (qy, c) in enumerate(steps, 1):
-                if should_stop() or len(merged) >= limit:
-                    break
-                # Stop collecting while there is still time left to actually scrape the
-                # places found. Without this the tile loop eats the entire time limit and
-                # the job ends with links but zero leads.
-                if collect_until is not None and time.monotonic() >= collect_until:
-                    budget_hit = True
-                    emit("links_budget", {"count": len(merged), "tile": s_i,
-                                          "tiles": len(steps), "reason": "time"})
-                    break
-                if collect_target is not None and len(merged) >= collect_target:
-                    budget_hit = True
-                    emit("links_budget", {"count": len(merged), "tile": s_i,
-                                          "tiles": len(steps), "reason": "enough"})
-                    break
-                wait_if_paused()
-                want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
-                # Retry this tile through the relauncher until it reads or the relaunch
-                # cap is spent. Everything already in `merged` survives, so a mid-run
-                # crash costs one tile, not the job. This used to be a single unguarded
-                # retry: job #13 (2026-08-24) relaunched once, the human closed the new
-                # window too, and the second TargetClosedError killed the whole lane.
-                while True:
-                    try:
-                        page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
-                                  wait_until="domcontentloaded", timeout=60000)
-                        _accept_consent(page)
-                        time.sleep(random.uniform(2, 4))
-                        cards = collect_place_links(page, want,
-                                                    on_progress=lambda n: emit("links", {"count": len(merged) + n, "tile": s_i, "tiles": len(steps)}))
-                        break
-                    except PWError as e:
-                        if not _is_closed(e) or not _recover(f"tile {s_i}/{len(steps)}"):
-                            raise
-                for card in cards:
-                    if card.key in merged:
-                        continue
-                    if known_keys and card.key in known_keys:   # 'only new businesses' job
-                        skipped_known += 1
-                        continue
-                    # pre-filter on the coordinates embedded in the link — no visit needed
-                    if center and radius_km and card.lat is not None:
-                        d = haversine_km(center[0], center[1], card.lat, card.lng)
-                        if d > radius_km:
-                            skipped_far += 1
-                            continue
-                    merged[card.key] = card
-                emit("links", {"count": len(merged), "tile": s_i, "tiles": len(steps)})
-                if len(steps) > 1:
-                    time.sleep(random.uniform(1.5, 3.5))
-            links = list(merged.values())[:limit]
-            emit("links_done", {"count": len(links), "skipped_far": skipped_far,
-                                "skipped_known": skipped_known, "budget_hit": budget_hit})
+    def drain() -> None:
+        while True:
             try:
-                store.save_links(job_id, links)
-            except Exception:                                     # noqa: BLE001
-                log.debug("save_links failed", exc_info=True)
-            known = store.known_place_keys(job_id)
-            for i, card in enumerate(links, 1):
-                if saved >= limit:
-                    break
-                if should_stop():
-                    emit("abort", {"reason": "stopped by user"})
-                    store.finish_job(job_id, "stopped", "stopped by user")
-                    return saved
-                wait_if_paused()
-                href = card.href
-                # Opened = attempted. A timeout or a far-away skip still counts: "pending"
-                # means never looked at, so a capped run's leftovers are exactly the rest.
-                try:
-                    store.mark_link_opened(job_id, card.key)
-                except Exception:                                 # noqa: BLE001
-                    pass
-                pacing.sleep_between()
-                try:
-                    place = scrape_place(page, href, job_id, country)
-                except CaptchaError:
-                    backoff = random.uniform(900, 1800)
-                    emit("captcha", {"backoff_sec": backoff})
-                    log.warning("captcha — backing off %.0fs", backoff)
-                    time.sleep(backoff)
+                kind, data = events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "center":
+                shared["center"] = (data["lat"], data["lng"])
+            emit_direct(kind, data)
+
+    def _set_active(flag: int) -> None:
+        try:
+            store.update_job(job_id, disc_active=flag)
+        except Exception:                                         # noqa: BLE001 — CLI jobs may predate the column
+            pass
+
+    collector: threading.Thread | None = None
+    if preset_links is not None:
+        store.save_stub_places(job_id, preset_links, country)
+        store.save_links(job_id, preset_links)
+        emit_direct("links", {"count": len(preset_links), "tile": 1, "tiles": 1})
+        emit_direct("links_done", {"count": len(preset_links), "skipped_far": 0,
+                                   "skipped_known": 0, "budget_hit": False})
+        cresult["count"] = len(preset_links)
+        collector_done.set()
+    else:
+        def _run_collector() -> None:
+            try:
+                _collect_links(
+                    store_path=store.path, job_id=job_id, queries=queries, location=location,
+                    limit=limit, unlimited=unlimited, max_places=max_places, headless=headless,
+                    country=country, emit=lambda k, d: events.put((k, d)), radius_km=radius_km,
+                    center=center, known_keys=known_keys, collect_until=collect_until,
+                    collect_target=collect_target, stop_ev=stop_ev, pause_ev=pause_ev, result=cresult)
+            finally:
+                collector_done.set()
+        collector = threading.Thread(target=_run_collector, name=f"maps-collect-{job_id}", daemon=True)
+        collector.start()
+
+    saved = 0
+    opened = 0
+    try:
+        with sync_playwright() as pw:
+            kw = _launch_kwargs(opener_profile_dir(), headless)
+            rl = Relauncher(lambda: _open_context(pw, kw),
+                            on_restart=lambda where, n: emit_direct("browser_restart", {"where": where, "attempt": n}))
+            ctx, page = rl.open()
+            try:
+                # Places whose panel this job has ALREADY read (an earlier area / run) — a
+                # second visit is reported as `dup`. Stubs are not "known" in that sense.
+                known = store.detailed_place_keys(job_id)
+                while True:
+                    drain()
+                    if should_stop():
+                        stop_ev.set()
+                        emit_direct("abort", {"reason": "stopped by user"})
+                        store.finish_job(job_id, "stopped", "stopped by user")
+                        return saved
+                    if saved >= limit:
+                        stop_ev.set()
+                        break
+                    pause_ev.set()
+                    try:
+                        wait_if_paused()
+                    finally:
+                        pause_ev.clear()
+                    link = store.next_pending_link(job_id)
+                    if link is None:
+                        if collector_done.is_set():
+                            drain()
+                            if store.next_pending_link(job_id) is None:
+                                break
+                            continue
+                        time.sleep(OPENER_POLL_SEC)
+                        continue
+                    card = _card_from_link(link)
+                    href = card.href
+                    opened += 1
+                    # Opened = attempted. A timeout or a far-away skip still counts: "pending"
+                    # means never looked at, so a capped run's leftovers are exactly the rest.
+                    try:
+                        store.mark_link_opened(job_id, card.key)
+                    except Exception:                                 # noqa: BLE001
+                        pass
+                    _set_active(1)
+                    pacing.sleep_between()
                     try:
                         place = scrape_place(page, href, job_id, country)
                     except CaptchaError:
-                        emit("abort", {"reason": "captcha twice"})
-                        store.finish_job(job_id, "stopped", "captcha twice")
-                        return saved
-                except PWTimeout:
-                    emit("skip", {"href": href, "reason": "timeout"})
-                    continue
-                except PWError as e:
-                    # Same recovery as the tile loop: a dead browser costs this one place,
-                    # not the remaining list and not the places already saved.
-                    if not _is_closed(e) or not _recover(f"place {i}/{len(links)}"):
-                        raise
-                    emit("skip", {"href": href, "reason": "browser restarted"})
-                    continue
-                # feed card values fill whatever the panel didn't expose
-                if place.name is None and card.name:
-                    place.name = card.name
-                if place.rating is None and card.rating is not None:
-                    place.rating = card.rating
-                if place.reviews_count is None and card.reviews_count is not None:
-                    place.reviews_count = card.reviews_count
-                if center and place.lat is not None and place.lng is not None:
-                    place.distance_km = round(haversine_km(center[0], center[1], place.lat, place.lng), 2)
-                    if radius_km and place.distance_km > radius_km * 1.05:   # feed coords were approximate
-                        skipped_far += 1
-                        emit("far", {"name": place.name, "distance_km": place.distance_km, "skipped": skipped_far})
+                        backoff = random.uniform(900, 1800)
+                        emit_direct("captcha", {"backoff_sec": backoff})
+                        log.warning("captcha — backing off %.0fs", backoff)
+                        time.sleep(backoff)
+                        try:
+                            place = scrape_place(page, href, job_id, country)
+                        except CaptchaError:
+                            stop_ev.set()
+                            emit_direct("abort", {"reason": "captcha twice"})
+                            store.finish_job(job_id, "stopped", "captcha twice")
+                            return saved
+                    except PWTimeout:
+                        emit_direct("skip", {"href": href, "reason": "timeout"})
                         continue
-                if place.place_key in known:
-                    emit("dup", {"name": place.name})
-                store.upsert_place(place)
-                known.add(place.place_key)
-                saved += 1
-                emit("place", {"i": i, "n": len(links), "saved": saved, "place": place})
-                pacing.maybe_long_pause(i)
-        finally:
-            ctx.close()
+                    except PWError as e:
+                        # Same recovery as the collector: a dead browser costs this one place,
+                        # not the remaining list and not the places already saved.
+                        if not is_closed(e) or not rl.recover(f"place {opened}"):
+                            raise
+                        ctx, page = rl.current
+                        emit_direct("skip", {"href": href, "reason": "browser restarted"})
+                        continue
+                    finally:
+                        _set_active(0)
+                    # feed card values fill whatever the panel didn't expose
+                    if place.name is None and card.name:
+                        place.name = card.name
+                    if place.rating is None and card.rating is not None:
+                        place.rating = card.rating
+                    if place.reviews_count is None and card.reviews_count is not None:
+                        place.reviews_count = card.reviews_count
+                    c0 = shared["center"]
+                    if c0 and place.lat is not None and place.lng is not None:
+                        place.distance_km = round(haversine_km(c0[0], c0[1], place.lat, place.lng), 2)
+                        if radius_km and place.distance_km > radius_km * 1.05:   # feed coords were approximate
+                            cresult["skipped_far"] += 1
+                            try:
+                                store.drop_stub(job_id, place.place_key)     # the stub was provisional
+                            except Exception:                             # noqa: BLE001
+                                pass
+                            emit_direct("far", {"name": place.name, "distance_km": place.distance_km,
+                                                "skipped": cresult["skipped_far"]})
+                            continue
+                    if place.place_key in known:
+                        emit_direct("dup", {"name": place.name})
+                    place.detail_status = "done"
+                    store.upsert_place(place)
+                    known.add(place.place_key)
+                    saved += 1
+                    try:
+                        offered, _ = store.link_counts(job_id)
+                    except Exception:                                     # noqa: BLE001
+                        offered = cresult["count"]
+                    emit_direct("place", {"i": opened, "n": max(offered, opened), "saved": saved, "place": place})
+                    pacing.maybe_long_pause(opened)
+            finally:
+                _set_active(0)
+                rl.close()
+    finally:
+        # Whatever way we leave, the collector must not keep a Chrome open on its own.
+        stop_ev.set()
+        if collector is not None:
+            collector.join(timeout=120)
+        drain()
+    if cresult.get("error") is not None and saved == 0:
+        # The search itself failed (captcha on the results page, dead browser) and there
+        # was nothing to open: surface it as the lane error it is, not a silent "done".
+        raise cresult["error"]
     store.finish_job(job_id, "done")
     return saved

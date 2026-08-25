@@ -367,11 +367,14 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         cloud.done(jid, "error", "could not fetch results")
         return
     # Only rows with a number AND not already decided — a 'yes'/'no' is final, re-checking
-    # it wastes the daily cap. 'unknown'/null are re-tried.
-    targets = [r for r in rows if (r.get("phone") or r.get("whatsapp_number"))
-               and r.get("wa_verified") not in ("yes", "no")]
+    # it wastes the daily cap. 'unknown'/null are re-tried. W26: every candidate number of
+    # a place is checked (Maps phone + WhatsApp link — the CRM `results` action does not
+    # carry `site_phones`, so website numbers are only covered by the live job, not here),
+    # and the unit of progress is NUMBERS.
+    from webscraper.store import aggregate_wa, wa_candidates
+    targets = [r for r in rows if wa_candidates(r) and r.get("wa_verified") not in ("yes", "no")]
     already = sum(1 for r in rows if r.get("wa_verified") in ("yes", "no"))
-    total = len(targets)
+    total = sum(len(wa_candidates(r)) for r in targets)
     src_by_pk = {r["place_key"]: r.get("whatsapp_source") for r in targets}
     if already:
         log.info("re-verify #%s: skipping %d already-verified", jid, already)
@@ -439,25 +442,34 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
           f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
           + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
 
-    def onp(pk: str, status: str, num: str | None = None) -> None:
-        collected[pk] = status
+    # Per-number verdicts per place (W26); the place-level picture is re-derived after
+    # every check with the same rule the live lane uses (any yes → yes, all no → no).
+    checks: dict[str, list[dict[str, Any]]] = {}
+
+    def _n_checked() -> int:
+        return sum(len(v) for v in checks.values())
+
+    def onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
+        checks.setdefault(pk, []).append({"number": num, "source": source, "verdict": status})
+        agg, wa_num = aggregate_wa(checks[pk])
+        collected[pk] = agg
         from webscraper.lanes import _wa_line
         r0 = name_by_pk.get(pk, {})
-        _jlog(_wa_line(r0, status, num or r0.get("whatsapp_number") or r0.get("phone")))
-        upd: dict[str, Any] = {"place_key": pk, "wa_verified": status}
+        _jlog(_wa_line(r0, status, num, source))
+        upd: dict[str, Any] = {"place_key": pk, "wa_verified": agg}
         # Confirmed hit -> promote the verified number + mark source 'verified' (drops an
-        # 'unverified' guess). Miss on a guessed number -> clear it.
+        # 'unverified' guess). Every number a miss on a guessed number -> clear it.
         # 'assumed_mobile' is the retired spelling of 'unverified' (2026-08-23); still
         # accepted here so rows written before the migration still clear correctly.
-        if status == "yes" and num:
-            upd["whatsapp_number"] = num
+        if agg == "yes" and wa_num:
+            upd["whatsapp_number"] = wa_num
             upd["whatsapp_source"] = "verified"
-        elif status == "no" and src_by_pk.get(pk) in ("unverified", "assumed_mobile"):
+        elif agg == "no" and src_by_pk.get(pk) in ("unverified", "assumed_mobile"):
             upd["whatsapp_number"] = None
             upd["whatsapp_source"] = None
         # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
         try:
-            cloud.progress(jid, "verifying_wa", wa_progress(len(collected)))
+            cloud.progress(jid, "verifying_wa", wa_progress(_n_checked()))
             cloud.set_wa(jid, [upd])
         except httpx.HTTPError as e:
             log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
@@ -474,22 +486,23 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         cloud.done(jid, "error", str(e)[:200])
         return
     # Feed the rolling average so the next verify run can be estimated (W4).
-    store.record_phase_rate(None, "verifying_wa", len(collected), time.monotonic() - started)
+    n_checked = _n_checked()
+    store.record_phase_rate(None, "verifying_wa", n_checked, time.monotonic() - started)
     if collected:
         cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()])
     capped = bool(res.get("capped")) if isinstance(res, dict) else False
     reason = "wa_daily_cap" if capped else "completed"
-    left = max(0, total - len(collected))
+    left = max(0, total - n_checked)
     try:
-        cloud.progress(jid, "verifying_wa", wa_progress(len(collected), reason))
+        cloud.progress(jid, "verifying_wa", wa_progress(n_checked, reason))
     except httpx.HTTPError as e:
         log.warning("re-verify #%s: final progress failed: %s", jid, e)
-    msg = (f"WhatsApp daily cap reached ({settings.wa_daily_cap}/account/day) — {len(collected)} checked, "
+    msg = (f"WhatsApp daily cap reached ({settings.wa_daily_cap}/account/day) — {n_checked} numbers checked, "
            f"{left} left; re-run tomorrow or add another WhatsApp account (wa-login)") if capped else None
-    _jlog(f"re-verify finished: {len(collected)} checked, {left} left" + (" — daily cap hit" if capped else ""),
-          "warn" if capped else "info")
+    _jlog(f"re-verify finished: {n_checked} numbers checked across {len(collected)} lead(s), {left} left"
+          + (" — daily cap hit" if capped else ""), "warn" if capped else "info")
     cloud.done(jid, "done", msg)
-    log.info("re-verify #%s: %d checked%s", jid, len(collected), " (daily cap hit)" if capped else "")
+    log.info("re-verify #%s: %d numbers checked%s", jid, n_checked, " (daily cap hit)" if capped else "")
 
 
 def _place_keys_json(cj: dict) -> str | None:

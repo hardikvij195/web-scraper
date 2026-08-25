@@ -46,6 +46,12 @@ class Place:
     team: list = field(default_factory=list)   # [{name, role, phone, email}]
     research_status: str | None = None   # pending | done | failed | no_website | no_key
     researched_at: str | None = None
+    # W26: 'pending' = a stub written from the feed card (name/rating/coords only) before
+    # the opener has read the place panel; 'done' once phone/website/address are in.
+    detail_status: str = "done"
+    # W26: every phone number the website itself listed (E.164 with '+'), so WhatsApp
+    # verification can check ALL of them, not just the Maps one.
+    site_phones: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_row(self) -> dict[str, Any]:
@@ -64,6 +70,7 @@ class Contacts:
     youtube: str | None = None
     tiktok: str | None = None
     whatsapp_number: str | None = None
+    phones: list[str] = field(default_factory=list)   # W26: tel: links + visible numbers (E.164, '+')
     pages_fetched: int = 0
     thin: bool = False                   # pages had almost no HTML/links (likely JS-only site)
     via: str | None = None               # how the HOME page was fetched: httpx | tls | browser

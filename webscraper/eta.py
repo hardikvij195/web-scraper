@@ -159,8 +159,11 @@ def _live_counts(row: Any, store: Any) -> dict[str, tuple[int, int, int]]:
     if jid is None:
         return {}
     try:
-        places = int(store.count_places(jid))
-        links = int(_get(row, "links_found", 0) or 0)
+        # W26: discovery's done = places whose panel was READ (stubs excluded); active = the
+        # opener has a panel in flight; pending = feed links not yet opened.
+        places = int(store.count_places_detailed(jid))
+        disc_active = int(_get(row, "disc_active", 0) or 0)
+        links_pending = int(store.count_unopened_links(jid))
         enr_done = int(store.count_enriched(jid))
         enr_active = int(_get(row, "enrich_active", 0) or 0)
         enr_pending = max(0, int(store.count_pending_enrichment(jid)) - enr_active)
@@ -170,7 +173,7 @@ def _live_counts(row: Any, store: Any) -> dict[str, tuple[int, int, int]]:
     except Exception:  # noqa: BLE001 — an old store without these helpers keeps the row counters
         return {}
     return {
-        "discovery": (places, 0, max(0, links - places)),
+        "discovery": (places, disc_active, max(0, links_pending)),
         "enrichment": (enr_done, enr_active, enr_pending),
         "whatsapp": (wa_done, wa_active, wa_pending),
     }

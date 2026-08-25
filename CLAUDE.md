@@ -5,6 +5,7 @@ Python 3.13 + Playwright Google Maps lead scraper + httpx website enricher. Live
 "Lead Finder" idea (replaces Apify; runs on the user's PC first, VPS later). Read `README.md`
 for usage; this file is for working on the code.
 
+> **W26 (2026-08-25): discovery = collector + opener tabs side by side; WhatsApp checks EVERY number** (Maps phone immediately, website numbers after enrichment) with per-number verdicts in `wa_checks`. See Rules below and `tasks.md` W26.
 > **WhatsApp cap (2026-08-25):** `WA_DAILY_CAP` defaults to 0 = unlimited (user directive); job logs now carry one line per site / number (W25).
 > **Self-check / installers (2026-08-25):** `webscraper/healthcheck.py` + `python -m webscraper doctor`; `scripts/install-agent.{sh,ps1}` are what the CRM's "Install agent" button downloads (raw GitHub → repo must be public).
 > **Mac / second device?** Read [`MAC-SETUP.md`](./MAC-SETUP.md) — device-targeted runs, launchd agent, multi-device test plan (2026-08-25).
@@ -19,14 +20,19 @@ webscraper/
   agent.py       cloud agent mode: polls the Vercel API for the member's queued jobs, mirrors them
                  into local jobs rows (jobs.cloud_id), reuses the same Worker, syncs results up
   static/index.html  vanilla-JS single page: form -> jobs list -> progress bars -> leads table -> downloads
-  maps.py        Playwright: search URL -> scroll feed (FeedCard) -> per-place panel -> Place
+  maps.py        Playwright, TWO tabs since W26: a collector thread tiles the search and
+                 persists each tile (job_links + stub places rows) while the opener thread
+                 reads place panels from job_links in feed order; profiles
+                 data/browser-profile (collector) + data/browser-profile-open (opener)
   enrich.py      async httpx: home + contact/about pages -> emails, socials, WhatsApp;
                  fetch ladder httpx -> impersonate_fetch (curl_cffi) -> browser_fetch (Playwright)
                  (-> camoufox_fetch with ENRICH_BROWSER_CAMOUFOX=1); browser_fetch classifies
                  Cloudflare walls (cf_*) and can click Turnstile with ENRICH_CF_CLICK=1 (W22)
   proxies.py     W15 ProxyPool: ENRICH_PROXIES round-robin, quarantine/re-admit, redact()
   extractors.py  pure functions (regex/selectolax) — the only part with unit tests
-  store.py       sqlite3 (jobs, places), stats, CSV/JSON export, tiny ALTER-TABLE migrate
+  store.py       sqlite3 (jobs, places, job_links, wa_checks), stats, CSV/JSON export, tiny
+                 ALTER-TABLE migrate; wa_candidates() / aggregate_wa() = the per-number WA model
+  wa_verify.py   WhatsApp Web check per NUMBER (maps phone | wa_link | site), account rotation
   models.py      Place / Contacts dataclasses
   config.py      .env -> Settings (delay, pauses, headless, proxy, country, paths)
 vercel-app/      cloud product on Vercel (web-scraper-leads.vercel.app) — see "Cloud product" below
@@ -39,7 +45,7 @@ vercel-app/      cloud product on Vercel (web-scraper-leads.vercel.app) — see 
 supabase_migrations/  001 accounts, 002 jobs+credits (+debit_credits RPC), 003 leads multiuser
 scripts/         apply_migrations.py (psycopg2 pooler scan), create_admin.py (GoTrue admin REST)
 tests/test_extractors.py + tests/cloud/ (pure-logic unit tests for the cloud API)
-data/            gitignored: leads.db, browser-profile/, exports/
+data/            gitignored: leads.db, browser-profile/, browser-profile-open/, exports/
 ```
 
 ## Cloud product (Lead Finder Cloud, since 2026-08-21)
@@ -130,8 +136,25 @@ launch (one pick per launch); httpx/curl_cffi rotate per attempt.
 ## Rules
 
 - Keep it slow by default (`SCRAPE_DELAY_SEC=6`). Never add concurrency to the Maps step
-  without a proxy pool; the enricher is the place for parallelism. **This still holds under
-  the lane model** — the three lanes run at once, but discovery itself is one thread.
+  without a proxy pool; the enricher is the place for parallelism. **Under W26 discovery is
+  exactly two Chrome tabs** — one collector (search feeds) and one opener (place panels),
+  each with its own persistent profile, Playwright instance and `Store`. Do not add a third.
+  The collector never calls the lane's `should_stop` / `wait_if_paused` / `on_event` (they
+  are bound to the lane thread's sqlite connection): it reads `stop_ev` / `pause_ev` and
+  pushes events into a queue the opener drains. Stub rows are committed BEFORE their
+  `job_links` row so the opener never picks a link whose place row does not exist yet.
+- **Stub → fill.** The collector writes a `places` row with `detail_status='pending'`
+  (name/rating/reviews/coords/maps_url from the feed card) per link; the opener's
+  `upsert_place` fills it and sets `detail_status='done'`. `upsert_place` COALESCEs every
+  column so a NULL from the panel never wipes what the stub had. Enrichment queues only
+  `detail_status='done'` rows (a stub has no website); WhatsApp does not wait for enrichment.
+- **WhatsApp is per NUMBER (`wa_checks`).** Candidates = `wa_candidates(row)`: a WhatsApp
+  link (`wa_link`) > the Maps phone (`maps`) > every number the website lists
+  (`site_phones`, `site`), deduped on digits. The Maps phone is checked as soon as the
+  opener writes it; site numbers join once `enrich_status` resolves. `record_wa_check`
+  re-derives `wa_verified` (any yes → yes, all no → no, else unknown), `whatsapp_number`
+  (first yes in that priority, source `verified`) and the `wa_numbers` JSON summary. The WA
+  lane's done/total are numbers, not places.
 - **Lanes (2026-08-23, `lanes.py`): the `places` table is the queue.** Discovery, enrichment
   and WhatsApp run concurrently; each owns its **own `Store`** (sqlite3 connections are not
   thread-safe) and each writes **disjoint columns** (`disc_*` / `enr_*` / `wa_*` plus its own

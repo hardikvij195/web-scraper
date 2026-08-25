@@ -176,18 +176,25 @@ def account_status(name: str) -> str:
 def verify_places(
     store: Store,
     rows: list[dict[str, Any]],
-    # (place_key, status, resolved_number|None) - the third arg has been passed since
-    # 4e00a3a; the annotation lagged behind it, which is how a 2-arg callback slipped in.
-    on_progress: Callable[[str, str, str | None], None] | None = None,
+    # (place_key, status, resolved_number|None, source|None). W26 added the 4th arg —
+    # which of the place's numbers this verdict is about (maps | wa_link | site).
+    on_progress: Callable[..., None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     job_id: int | None = None,
 ) -> dict[str, int]:
-    """Verify each row's number against WhatsApp. Writes wa_verified per place.
+    """Verify numbers against WhatsApp, one verdict per NUMBER (W26).
+
+    A row carrying `number` (+ `source`) — what `Store.pending_wa_verify` hands the lane —
+    is checked on that one number. A bare place row (CLI, the CRM re-verify) expands to
+    every distinct candidate via `store.wa_candidates`: the Maps phone, a WhatsApp link,
+    the website's own numbers. With `job_id` each verdict lands in `wa_checks` and the
+    place-level `wa_verified` / `whatsapp_number` are re-derived (`record_wa_check`).
 
     Rotates across enabled accounts, respects each account's daily cap, paces checks.
     Returns counts: {yes, no, unknown, checked, capped, no_number}.
     """
-    on_progress = on_progress or (lambda pk, s, num=None: None)
+    from webscraper.store import wa_candidates
+    on_progress = on_progress or (lambda pk, s, num=None, source=None: None)
     should_stop = should_stop or (lambda: False)
     cap = settings.wa_daily_cap
     today = date.today().isoformat()
@@ -244,21 +251,36 @@ def verify_places(
                     raise
                 # loop: retry this ONE number on the relaunched browser.
 
+    # Expand to (row, bare digits, source) — one entry per number to check.
+    targets: list[tuple[dict[str, Any], str, str]] = []
+    for r in rows:
+        pk = r["place_key"]
+        if r.get("number"):
+            d = "".join(ch for ch in str(r["number"]) if ch.isdigit())
+            if 8 <= len(d) <= 15:
+                targets.append((r, d, str(r.get("source") or "maps")))
+            continue
+        cands = wa_candidates(r)
+        if not cands:
+            # Legacy single-number fallback covers a row whose phone did not parse for its
+            # region but is still a plausible bare number.
+            legacy = _e164_digits(r.get("phone"), r.get("whatsapp_number"), r.get("country"))
+            if legacy:
+                cands = [(f"+{legacy}", "maps")]
+        if not cands:
+            counts["no_number"] += 1
+            if job_id is not None:
+                store.set_wa_verify(job_id, pk, "unknown", None)
+            on_progress(pk, "unknown", None, None)
+            continue
+        for e164, src in cands:
+            targets.append((r, e164.lstrip("+"), src))
+
     try:
-        for r in rows:
+        for r, num, source in targets:
             if should_stop():
                 break
-            # A already-decided number is final — never re-check (defensive; callers filter).
-            if r.get("wa_verified") in ("yes", "no"):
-                continue
-            num = _e164_digits(r.get("phone"), r.get("whatsapp_number"), r.get("country"))
             pk = r["place_key"]
-            if not num:
-                counts["no_number"] += 1
-                if job_id is not None:
-                    store.set_wa_verify(job_id, pk, "unknown", None)
-                on_progress(pk, "unknown", None)
-                continue
 
             name = store.pick_wa_account(cap, today)
             if name is None:
@@ -296,12 +318,10 @@ def verify_places(
             # number straight into whatsapp_number - so it has to be +'d here, not in store.
             e164 = plus(num)
             if job_id is not None:
-                # prior_source flows through untouched: 'assumed_mobile' was retired on
-                # 2026-08-23 in favour of 'unverified', and set_wa_verify treats BOTH as
-                # candidates to clear on a 'no', so old and new rows behave the same.
-                store.set_wa_verify(job_id, pk, status, name,
-                                    wa_number=e164, prior_source=r.get("whatsapp_source"))
-            on_progress(pk, status, e164)
+                # Per-number verdict; the place-level wa_verified / whatsapp_number are
+                # re-derived from every verdict so far (any yes → yes, all no → no).
+                store.record_wa_check(job_id, pk, e164, source, status, name)
+            on_progress(pk, status, e164, source)
             time.sleep(random.uniform(settings.wa_delay_min, settings.wa_delay_max))
     finally:
         for pw_ctx, _ in open_ctx.values():

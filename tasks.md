@@ -2,7 +2,7 @@
 
 `[x]` done · `[~]` in progress · `[ ]` todo. Newest on top.
 
-> **State 2026-08-23: W0-W10 are all done** (W11 open — a pre-existing SaaS-sync break found by the live smoke). Remote is `hardikvij195/web-scraper`, HEAD
+> **State 2026-08-25: W26 done (uncommitted)** — discovery is a collector + opener pair, WhatsApp checks every number; 117 tests pass. Earlier: **W0-W10 are all done** (W11 open — a pre-existing SaaS-sync break found by the live smoke). Remote is `hardikvij195/web-scraper`, HEAD
 > `a544ae7`, tree clean, 0 unpushed. Cross-repo backlog index:
 > `../hvt-ai-crm-live/tasks.md` — the items below are the agent half of its **T136**
 > (closed); the CRM half (UI, ETA display, job phases in the DB) lives there.
@@ -10,6 +10,117 @@
 > Two known leftovers, neither blocking: `synced_upto` is **in-memory only**, so a restarted
 > agent re-sends one job's rows once (absorbed by the `(job_id, place_key)` upsert, just
 > wasteful), and the CRM UI does not refresh mid-job to show leads arriving.
+
+---
+
+## Session 2026-08-25 — concurrent discovery + every-number WhatsApp
+
+Prompt (verbatim): "divide google discovery into 2 jobs => as it scraps the places, it adds
+whatever info it has in the crm, it runs one more chrome tab to open those places one by one
+and scrape reviews and more info => so 2 chrome tabs will run side by side for the google
+maps scraper => and then as soon as each place comes in and updates in crm => websites
+scraper starts and wa scraper starts side by side => make sure to check all nos in whatsapp
+verification => the number we have got from google maps and all numbers we have got from
+website".
+
+### W26 — concurrent discovery (collector + opener) + every-number WhatsApp  [x]
+**Why.** `run_scrape` collected ALL links (tiles × keywords, up to `collect_until` /
+`collect_target`) and only then opened places, so enrichment and WhatsApp — which poll the
+`places` table — idled for the whole collect phase. Job #16: 96 min, 1,260 links, 0 places,
+nothing in the CRM.
+
+**A. Discovery = two Chrome tabs side by side** (`maps.py`). A **collector** thread runs
+today's tile/keyword loop on `data/browser-profile` and, per tile, commits a stub `places`
+row (`detail_status='pending'`: name, rating, review count, coords, maps_url from the feed
+card) and then the `job_links` row — stub first, so the opener never picks a link whose row
+is missing. The **opener** (the discovery lane's own thread, profile
+`data/browser-profile-open`) takes `next_pending_link` in feed order → `scrape_place` →
+`upsert_place` (now `COALESCE(excluded.c, places.c)` per column, so a NULL from the headless
+panel keeps the stub's rating/reviews/coords) → `detail_status='done'`; it idles 2 s when the
+queue is empty and ends when the collector is done and the queue is drained, or on
+`should_stop` (Stop / Maps deadline), which also tells the collector to quit. Each thread has
+its own Playwright, own `Store`, own profile; the collector never touches the lane's closures
+(sqlite is thread-bound) — it reads `stop_ev`/`pause_ev` and queues events the opener drains
+on the lane thread. `collect_until`/`collect_target` cap the collector only; the opener runs
+to the deadline. Far-on-exact-coords → the stub is dropped again. `preset_links`
+(`discovery_pending`, W21) seeds stubs+links and runs the opener alone. Enrichment queues only
+`detail_status='done'` rows (`pending_enrichment`, `count_pending_enrichment`); old rows are
+migrated to `'done'`. `eta._live_counts` discovery = (panels read, `jobs.disc_active`,
+unopened links). Logs: `tile i/n: +k links, total m` per tile, the existing per-place line,
+`collect_failed` / `browser_restart` as warnings. A search that fails with nothing opened
+still raises (lane `error:`), not a silent "done".
+
+**B. WhatsApp checks every number** (`store.py`, `wa_verify.py`, `lanes.py`, `agent.py`,
+`enrich.py`, `extractors.py`). New table **`wa_checks(job_id, place_key, number, source
+maps|wa_link|site, verdict yes|no|unknown, checked_at, account)`**, PK `(job_id, place_key,
+number)`. `wa_candidates(row)` = WhatsApp link > Maps phone > every number the website
+listed, deduped on digits (the `unverified` guess IS the Maps phone and collapses into it);
+site numbers only once `enrich_status` has resolved, the Maps phone **immediately** — no
+enrichment wait. Enrichment now stores **`site_phones`** (new `extract_phones`: `tel:` links,
+then phonenumbers' VALID matcher over the visible text, ≤6, E.164 `+`). `pending_wa_verify`
+/ `count_wa_pending` / `count_wa_done` are per NUMBER (place row + `number` + `source`); a
+number with any `wa_checks` row is not re-offered in the run (an `unknown` used to loop).
+`record_wa_check` re-derives the place: `wa_verified` = yes if ANY number is yes, no if all
+checked are no, else unknown; `whatsapp_number` = first yes in wa_link > maps > site
+(`whatsapp_source='verified'`); all-no clears an `unverified` guess; `wa_numbers` JSON
+`[{number, source, verdict}]` on the row. `verify_places` takes one-number rows from the lane
+or expands bare rows itself; callback is `(place_key, status, number, source)`. Log line:
+`Name · +44… (maps|whatsapp link|website) → ON WhatsApp ✓ / not on WhatsApp ✗`. The WA
+lane's done/total/queued are numbers. CRM re-verify (`agent._reverify_wa`) uses the same
+candidates + aggregation (units = numbers) — but the CRM `results` action carries no
+`site_phones`, so a re-verify covers Maps phone + WhatsApp link only; website numbers are
+checked in the live job. `wa_numbers` rides in the sync row (`supa._COLS`): the CRM Edge
+Function's `sync` whitelists `LEAD_COLS` and silently drops unknown keys, so it is harmless
+there and becomes useful once the CRM adds the column (`set_wa` likewise ignores it).
+`python -m webscraper wa-verify <job>` now iterates unchecked numbers.
+
+**C. Tests + smoke.** `tests/test_w26_discovery.py` (+13): extract_phones; stub → fill via
+COALESCE (+ `changed_at` bump for W20 streaming); pending_enrichment excludes stubs; old-row
+migration; WA pending = Maps phone before enrichment, wa_link + site after, dedupe, verdict
+aggregation and promotion order, unverified clearing; `_wa_line` wording; the real
+`verify_places` with a fake WhatsApp page recording two per-number verdicts;
+`_live_counts` discovery = (1, 1, 2); and `run_scrape` with a fake Playwright: the opener
+fills tile 1 while tile 3 is still collecting, every place existed as a stub before its
+fill, feed-card name/rating survive; preset_links never starts the collector; Stop ends both
+threads in < 5 s. **104 → 117 pass.**
+
+Smoke (real Maps, headless, temp store + temp profiles, 2 keywords `cafe, bakery`, 1 km
+radius around Koregaon Park, `max_places=8`, delay 2 s):
+
+```
+   0.77s  center 18.5362,73.8939 z15
+  28.77s  collector tile 1/2: +8 links, total 8      ← limit reached on tile 1
+  31.01s  opener   opening ChIJqUxT…                ← opener starts while the collector is finishing
+  32.39s  opener   filled 1/8 'Cafe - The Voyage' · +918596950267
+  32.39s  collector DONE — 8 links (far 4)
+  35.72s  opener   filled 2/8 'Cafe MAPLE'
+  …
+  52.86s  opener   filled 8/8 'Cafe Soussol' · +919112372777 · https://soussol.in/
+places: 8  detailed: 8  links: (8, 8) — every row has changed_at set, i.e. the fill was an
+UPDATE on a pre-existing stub (only the UPDATE trigger writes changed_at)
+WA numbers checkable right now (Maps phones, before enrichment): 6
+```
+
+Unlimited variant (`max_places=0`, stop after 10 fills) — the second keyword's tile is
+collected while the opener is already opening the first keyword's places:
+
+```
+   2.46s  center 18.5362,73.8939 z15
+  22.46s  collector tile 1/2 (cafe): +17 links, total 17
+  24.05s  opener   opening ChIJqUxT…  (row before fill: pending)   ← stub existed
+  25.49s  opener   filled 1/17 'Cafe - The Voyage' · +918596950267
+  27.62s  opener   opening ChIJM-jw…  (row before fill: pending)
+  …
+  42.51s  opener   opening ChIJo3RE…  (row before fill: pending)
+  43.23s  opener   filled 6/22 'Jubilee cafe Pune' · +919272102369
+  43.23s  collector tile 2/2 (bakery): +5 links, total 22          ← landed while the opener was on place 6
+  46.37s  collector DONE — 22 links (far 58)
+  48.58s  opener   filled 8/22 'Cafe Soussol' · +919112372777 · https://soussol.in/
+  54.80s  opener   filled 10/22 'Café Vinyaasa' · +918010255853
+  54.80s  abort stopped by user (should_stop after 10)             ← collector already ended; join instant
+places: 22  detailed: 10  links: (22, 10) — the 12 unopened ones are stubs (name + rating
++ coords from the feed card, detail_status='pending'); WA numbers checkable now: 8 (maps)
+```
 
 ---
 

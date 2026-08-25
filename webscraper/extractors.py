@@ -202,6 +202,49 @@ def extract_whatsapp(html: str) -> str | None:
 
 
 # ── phones ────────────────────────────────────────────────────────────────────
+_TEL_HREF_RE = re.compile(r"""href\s*=\s*["']tel:([^"']+)["']""", re.I)
+_TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>|<[^>]+>", re.I | re.S)
+
+
+def extract_phones(html: str, region: str = "IN", limit: int = 6) -> list[str]:
+    """Every phone number a page lists, E.164 with '+', in order of appearance (W26).
+
+    `tel:` links first — a site that bothers to link a number means it — then the visible
+    text through phonenumbers' matcher (VALID leniency, so a random 10-digit id does not
+    pass). WhatsApp deep links are NOT included; `extract_whatsapp` owns those. Capped so a
+    directory page cannot hand the WhatsApp lane hundreds of numbers for one business."""
+    if not html:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        try:
+            n = phonenumbers.parse(unquote(raw).strip(), region)
+        except phonenumbers.NumberParseException:
+            return
+        if not phonenumbers.is_valid_number(n):
+            return
+        e = phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)
+        if e not in seen:
+            seen.add(e)
+            out.append(e)
+
+    for m in _TEL_HREF_RE.finditer(html):
+        add(m.group(1))
+        if len(out) >= limit:
+            return out
+    text = _TAG_RE.sub(" ", html[:300_000])
+    try:
+        for m in phonenumbers.PhoneNumberMatcher(text, region, leniency=phonenumbers.Leniency.VALID):
+            add(m.raw_string)
+            if len(out) >= limit:
+                break
+    except Exception:                                             # noqa: BLE001 — matcher is best-effort
+        pass
+    return out
+
+
 def normalise_phone(raw: str | None, country: str = "IN") -> tuple[str | None, str | None]:
     """Return (E.164 string, digits-only) or (None, None)."""
     if not raw:

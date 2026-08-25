@@ -16,7 +16,7 @@ import httpx
 
 from webscraper.config import settings
 from webscraper.extractors import (
-    contact_page_links, extract_emails, extract_socials, extract_whatsapp, is_probably_mobile,
+    contact_page_links, extract_emails, extract_phones, extract_socials, extract_whatsapp, is_probably_mobile,
     normalise_wa, region_of_phone,
 )
 from webscraper.config import settings
@@ -216,7 +216,7 @@ async def _fetch(client: httpx.AsyncClient, url: str, retries: int = 1) -> str |
     return (await _fetch_ex(client, url, retries)).html
 
 
-def _merge(into: Contacts, html: str) -> None:
+def _merge(into: Contacts, html: str, region: str = "IN") -> None:
     for e in extract_emails(html):
         if e not in into.emails:
             into.emails.append(e)
@@ -225,6 +225,12 @@ def _merge(into: Contacts, html: str) -> None:
             setattr(into, net, url)
     if into.whatsapp_number is None:
         into.whatsapp_number = extract_whatsapp(html)
+    # W26: every number the site lists, so WhatsApp verification can check them all —
+    # not just the one Google Maps shows. Capped inside extract_phones; deduped here.
+    if len(into.phones) < 6:
+        for p in extract_phones(html, region):
+            if p not in into.phones:
+                into.phones.append(p)
 
 
 async def _fetch_home(client: httpx.AsyncClient, website: str,
@@ -311,6 +317,7 @@ async def _with_proxies(attempt: Callable[[str | None], Awaitable[Fetched]],
 async def crawl_site(client: httpx.AsyncClient, website: str,
                      browser_retry: Callable[[str], Awaitable[Any]] | None = None,
                      camoufox_retry: Callable[[str], Awaitable[tuple[str | None, str | None]]] | None = None,
+                     region: str | None = None,
                      ) -> tuple[Contacts, str | None]:
     """Home page + up to 4 contact/about pages on the same domain.
 
@@ -375,7 +382,10 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
     home = got.html
     c.via = via
     c.pages_fetched = 1
-    _merge(c, home)
+    # `region` = the phone-parsing region for numbers written without a country code
+    # (W26 site phones); the lead's own region is passed in by enrich_places.
+    region = (region or settings.default_country or "IN").upper()
+    _merge(c, home, region)
     if len(home) < 2_000:
         c.thin = True
     # Contact/about pages are only worth the extra requests when the home page left gaps:
@@ -389,7 +399,7 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
         page = await _fetch(client, link)
         if page:
             c.pages_fetched += 1
-            _merge(c, page)
+            _merge(c, page, region)
         if c.emails and (socials_found or c.instagram or c.facebook):
             break
     return c, None
@@ -508,11 +518,12 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
     domain_tasks: dict[str, asyncio.Task] = {}
     host_sems: dict[str, asyncio.Semaphore] = {}
 
-    async def crawl_domain(client: httpx.AsyncClient, website: str) -> tuple[Contacts, str | None]:
+    async def crawl_domain(client: httpx.AsyncClient, website: str,
+                           region: str | None = None) -> tuple[Contacts, str | None]:
         dom = domain_of(website) or website
         hs = host_sems.setdefault(dom, asyncio.Semaphore(2))
         async with hs:
-            return await crawl_site(client, website, browser_retry, camoufox_retry)
+            return await crawl_site(client, website, browser_retry, camoufox_retry, region=region)
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout,
                                  limits=limits, verify=False) as client:
@@ -541,7 +552,9 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                     dom = domain_of(website) or website
                     task = domain_tasks.get(dom)
                     if task is None:
-                        task = asyncio.ensure_future(crawl_domain(client, website))
+                        # One crawl per domain: the first branch's region parses the
+                        # site's bare numbers (branches of one site share a country).
+                        task = asyncio.ensure_future(crawl_domain(client, website, region_for(r)))
                         domain_tasks[dom] = task
                     c, reason = await asyncio.shield(task)
                 except Exception as e:  # noqa: BLE001 — one bad site must not kill the batch
@@ -580,6 +593,8 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                 emails=c.emails,
                 instagram=c.instagram, facebook=c.facebook, linkedin=c.linkedin,
                 twitter_x=c.twitter_x, youtube=c.youtube, tiktok=c.tiktok,
+                # W26: the site's own numbers (E.164 '+'), all offered to WhatsApp verification.
+                site_phones=list(c.phones),
                 # Stored E.164 WITH the '+' (store.plus) — wa.me links strip it at render.
                 whatsapp_number=plus(wa_num), whatsapp_source=wa_src,
             )
