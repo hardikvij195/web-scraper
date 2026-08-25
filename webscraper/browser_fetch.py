@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import random
 import re
 import threading
 from typing import Any, Callable
@@ -76,17 +77,54 @@ USE_REAL_CHROME = _bool(os.getenv("ENRICH_BROWSER_REAL_CHROME"), True)
 #: running in the other lane on `settings.profile_dir`.
 PROFILE_DIR = settings.profile_dir.parent / "fetch-profile"
 
+#: W22: click Cloudflare's managed / interactive Turnstile checkbox ourselves (Scrapling's
+#: technique — find the challenge iframe, press at its checkbox offset, wait for clearance).
+#: Default ON (user directive 2026-08-25; `ENRICH_CF_CLICK=0` turns it off, in which case
+#: the wall is only CLASSIFIED and reported as `cf_managed` / `cf_interactive`).
+CF_CLICK = settings.enrich_cf_click
+CF_CLICK_ATTEMPTS = 3
+CF_CLICK_WAIT_MS = 10_000
+_CF_FRAME_RE = re.compile(r"^https?://challenges\.cloudflare\.com/cdn-cgi/challenge-platform/")
+_CF_CTYPE_RE = re.compile(r"cType:\s*'([a-z_-]+)'")
+_CF_TURNSTILE_RE = re.compile(r"<script[^>]+src=[\"'][^\"']*challenges\.cloudflare\.com/turnstile/v", re.I)
+
+#: W22: Scrapling's DEFAULT_ARGS + STEALTH_ARGS, minus `--disable-features=IsolateOrigins,
+#: site-per-process` (nodriver: a non-default feature flag is itself fingerprintable) and
+#: minus the window-position/start-maximized pair (headed keeps the real window). `--lang`
+#: / `--accept-lang` replace the context `locale` option: Cloudflare compares the worker's
+#: language with the document's, and the Playwright locale override only reaches one side.
+LAUNCH_ARGS = [
+    "--no-first-run", "--no-default-browser-check", "--disable-infobars", "--disable-breakpad",
+    "--disable-dev-shm-usage", "--disable-session-crashed-bubble",
+    "--disable-search-engine-choice-screen", "--no-pings", "--password-store=basic",
+    "--test-type", "--force-color-profile=srgb", "--font-render-hinting=none",
+    "--lang=en-GB", "--accept-lang=en-GB,en",
+]
+#: Stock Playwright still needs the AutomationControlled blink flag; patchright already
+#: patches that surface and its guidance is that the flag is then redundant and itself a tell.
+AUTOMATION_FLAG = "--disable-blink-features=AutomationControlled"
+#: Playwright's own defaults that give the browser away (`--enable-automation` shows the
+#: infobar and sets `navigator.webdriver`; the rest are non-default flags a real Chrome
+#: never carries).
+IGNORE_DEFAULT_ARGS = ["--enable-automation", "--disable-popup-blocking",
+                      "--disable-component-update", "--disable-default-apps",
+                      "--disable-extensions"]
 #: Same trick maps.py uses - images/fonts/media add nothing we read and cut bandwidth ~80%.
-_ASSETS = re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I)
+#: Keyed on Playwright's resource type (W22) rather than a URL regex, so a CDN image with no
+#: extension is still dropped; stylesheets stay — `looks_blocked` reads the rendered text.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+#: Headless screen — a real 1080p desktop. Headed keeps whatever window Chrome opens.
+HEADLESS_SCREEN = {"width": 1920, "height": 1080}
 
 NAV_TIMEOUT_MS = 25_000
 #: Cloudflare's interstitial solves itself in JS and then swaps the document; without a
 #: settle the page we read is still the "Just a moment" challenge.
 SETTLE_MS = 1_500
 #: If the settle left a challenge page up, re-read for up to this long in these steps —
-#: a JS challenge that auto-solves usually does so within ~6 s; longer is a managed
-#: Turnstile / hard deny no browser passes, so we stop rather than wait forever.
-CHALLENGE_WAIT_MS = 6_000
+#: a non-interactive JS challenge usually auto-solves within ~5-10 s (W22: raised from 6 s
+#: after Scrapling's numbers); longer is a managed Turnstile / hard deny no browser passes
+#: on its own, so we stop rather than wait forever.
+CHALLENGE_WAIT_MS = 12_000
 CHALLENGE_STEP_MS = 1_500
 BOOT_TIMEOUT_SEC = 90.0
 #: Generous because calls queue behind each other on the single worker thread.
@@ -95,6 +133,8 @@ MAX_BYTES = 1_500_000
 
 _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking your browser",
                   "access denied", "error 1015", "request blocked", "are you a robot")
+#: The headless UA with "Headless" stripped, learned on the first launch (process-wide).
+_HEADLESS_UA: dict[str, str | None] = {}
 
 
 def _proxy_arg(url: str | None = None) -> dict[str, str] | None:
@@ -121,6 +161,29 @@ def looks_blocked(html: str | None) -> bool:
     return any(m in head for m in _BLOCK_MARKERS)
 
 
+def detect_cloudflare(html: str | None) -> str | None:
+    """Which Cloudflare wall this page is (port of Scrapling's `_detect_cloudflare`), or None.
+
+    'non-interactive' / 'managed' / 'interactive' come from the literal `cType: '...'`
+    marker Cloudflare's challenge script embeds; 'embedded' is a site that mounts a Turnstile
+    widget itself (`challenges.cloudflare.com/turnstile/v…`). Only the first two classes
+    ever clear on their own; the rest need a click or a human."""
+    if not html:
+        return None
+    m = _CF_CTYPE_RE.search(html)
+    if m and m.group(1) in ("non-interactive", "managed", "interactive"):
+        return m.group(1)
+    if _CF_TURNSTILE_RE.search(html):
+        return "embedded"
+    return None
+
+
+def cf_error(kind: str | None) -> str:
+    """The stored reason for a wall that stayed up: 'cf_managed', 'cf_non_interactive', … or
+    plain 'blocked' when it was a deny/challenge page of no known Cloudflare class."""
+    return f"cf_{kind.replace('-', '_')}" if kind else "blocked"
+
+
 class BrowserFetcher:
     """One long-lived Chromium context, reused across calls, driven from one worker thread.
 
@@ -134,7 +197,7 @@ class BrowserFetcher:
         #: Proxy URL for this browser (W15 pool pick); None = ENRICH_PROXY / direct. A
         #: persistent context binds its proxy at launch, so rotation happens per launch.
         self._proxy = proxy
-        self._jobs: queue.Queue[tuple[str, list[str | None], threading.Event] | None] = queue.Queue()
+        self._jobs: queue.Queue[tuple[str, list[Any], threading.Event] | None] = queue.Queue()
         self._ready = threading.Event()
         self._boot_error: BaseException | None = None
         self._start_lock = threading.Lock()
@@ -160,15 +223,22 @@ class BrowserFetcher:
     def fetch(self, url: str) -> str | None:
         """HTML of `url`, or None if the browser could not get it either. Blocking - call it
         from a worker thread (`asyncio.to_thread`), never from the event loop."""
+        return self.fetch_ex(url)[0]
+
+    def fetch_ex(self, url: str) -> tuple[str | None, str | None]:
+        """`(html, error)`: the page, or why not — 'cf_managed' / 'cf_interactive' /
+        'cf_non_interactive' / 'cf_embedded' for a Cloudflare wall that stayed up (W22, so the
+        CRM can show WHICH wall remains), 'blocked' for any other challenge/deny page,
+        'timeout' / 'network' / 'dead' otherwise."""
         if not self.alive:
-            return None
-        slot: list[str | None] = []
+            return None, "dead"
+        slot: list[tuple[str | None, str | None]] = []
         done = threading.Event()
         self._jobs.put((url, slot, done))
         if not done.wait(FETCH_TIMEOUT_SEC):
             log.warning("browser fetch timed out waiting for %s", url)
-            return None
-        return slot[0] if slot else None
+            return None, "timeout"
+        return slot[0] if slot else (None, "dead")
 
     def close(self) -> None:
         with self._start_lock:
@@ -179,10 +249,17 @@ class BrowserFetcher:
         self._thread.join(timeout=30)
 
     # -- worker thread -------------------------------------------------------------
+    #: Overridable by the Camoufox tier: which Playwright to drive (patchright here).
+    def _playwright(self) -> Any:
+        return sync_playwright()
+
+    def _profile_dir(self) -> Any:
+        return PROFILE_DIR
+
     def _run(self) -> None:
         try:
-            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-            with sync_playwright() as pw:
+            self._profile_dir().mkdir(parents=True, exist_ok=True)
+            with self._playwright() as pw:
                 rl = Relauncher(self._opener(pw))
                 rl.open()
                 self._ready.set()
@@ -196,7 +273,7 @@ class BrowserFetcher:
                             slot.append(self._goto(rl, url))
                         except Exception:                          # noqa: BLE001
                             log.debug("browser fetch crashed on %s", url, exc_info=True)
-                            slot.append(None)
+                            slot.append((None, "network"))
                         finally:
                             done.set()
                 finally:
@@ -210,75 +287,176 @@ class BrowserFetcher:
             self._ready.set()
             self._drain()
 
+    def _context_options(self) -> dict[str, Any]:
+        """W22: Scrapling's context shape. Dark scheme + DPR 2 + a real screen, no touch,
+        service workers allowed, geolocation/notification permissions granted — what a
+        desktop Chrome a person configured looks like, as opposed to Playwright's defaults
+        (light, DPR 1, 1280×720, no permissions), which are a known automation signature."""
+        kw: dict[str, Any] = dict(
+            color_scheme="dark", device_scale_factor=2, is_mobile=False, has_touch=False,
+            service_workers="allow", permissions=["geolocation", "notifications"],
+            # Auto-proceed past cert warnings. Many small business sites have a misissued
+            # or wrong-CN certificate (newsquaredentist.com, camskinclinic.com on job 11
+            # both threw ERR_CERT_COMMON_NAME_INVALID) — a human would click "proceed",
+            # so the crawler does the same rather than stalling on the interstitial. We
+            # only ever READ a public page, so a bad cert is a data-quality signal, not a
+            # security decision.
+            ignore_https_errors=True,
+        )
+        if self._headless:
+            kw["viewport"] = dict(HEADLESS_SCREEN)
+            kw["screen"] = dict(HEADLESS_SCREEN)
+        else:
+            kw["no_viewport"] = True             # headed: the real window is the viewport
+        return kw
+
     def _opener(self, pw: Any) -> Callable[[], tuple[Any, Any]]:
         proxy = _proxy_arg(self._proxy)
+        args = list(LAUNCH_ARGS)
+        if not STEALTH:
+            args.append(AUTOMATION_FLAG)
 
-        def _launch(use_chrome: bool) -> Any:
-            kw: dict[str, Any] = dict(
-                user_data_dir=str(PROFILE_DIR), headless=self._headless, locale="en-GB",
-                viewport={"width": 1366, "height": 850},
-                # Auto-proceed past cert warnings. Many small business sites have a misissued
-                # or wrong-CN certificate (newsquaredentist.com, camskinclinic.com on job 11
-                # both threw ERR_CERT_COMMON_NAME_INVALID) — a human would click "proceed",
-                # so the crawler does the same rather than stalling on the interstitial. We
-                # only ever READ a public page, so a bad cert is a data-quality signal, not a
-                # security decision.
-                ignore_https_errors=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+        def _launch(use_chrome: bool, user_agent: str | None = None) -> Any:
+            kw: dict[str, Any] = dict(user_data_dir=str(PROFILE_DIR), headless=self._headless,
+                                      args=args, ignore_default_args=IGNORE_DEFAULT_ARGS,
+                                      **self._context_options())
             # channel="chrome" = the machine's installed Google Chrome, not the bundled
             # chromium; a real fingerprint Cloudflare trusts. Omitted when Chrome is absent.
             if use_chrome:
                 kw["channel"] = "chrome"
             if proxy:
                 kw["proxy"] = proxy
+            if user_agent:
+                kw["user_agent"] = user_agent
             return pw.chromium.launch_persistent_context(**kw)
 
         def _open() -> tuple[Any, Any]:
+            use_chrome = USE_REAL_CHROME
             try:
-                ctx = _launch(USE_REAL_CHROME)
+                ctx = _launch(use_chrome, _HEADLESS_UA.get("ua"))
             except Exception as e:  # noqa: BLE001 — Chrome not installed / channel unusable
                 if not USE_REAL_CHROME:
                     raise
                 log.info("real Chrome unavailable (%s) — falling back to bundled Chromium", e)
-                ctx = _launch(False)
-            log.debug("browser fetch launched (chrome=%s, stealth=%s, proxy=%s)",
-                      USE_REAL_CHROME, STEALTH, proxy["server"] if proxy else None)
-            ctx.route(_ASSETS, lambda route: route.abort())
+                use_chrome = False
+                ctx = _launch(False, _HEADLESS_UA.get("ua"))
             pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            # Headless Chrome announces itself as "HeadlessChrome/151" in the UA. Strip
+            # that ONE word, keeping the browser's real version — but only headless: a headed
+            # real Chrome keeps its own UA untouched. The UA is only settable at launch, so
+            # the first headless launch reads it and relaunches; later launches reuse it.
+            if self._headless and "ua" not in _HEADLESS_UA:
+                real = pg.evaluate("navigator.userAgent") or ""
+                _HEADLESS_UA["ua"] = real.replace("HeadlessChrome/", "Chrome/") if "Headless" in real else None
+                if _HEADLESS_UA["ua"]:
+                    ctx.close()
+                    ctx = _launch(use_chrome, _HEADLESS_UA["ua"])
+                    pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            log.debug("browser fetch launched (chrome=%s, stealth=%s, proxy=%s)",
+                      use_chrome, STEALTH, proxy["server"] if proxy else None)
+            self._route_assets(ctx)
             pg.set_default_timeout(NAV_TIMEOUT_MS)
             return ctx, pg
         return _open
 
-    def _goto(self, rl: Relauncher, url: str) -> str | None:
-        """Navigate + settle + read. One relaunch retry, on the same terms as the Maps lane:
-        a dead Chromium is worth rebuilding, a misbehaving page is not."""
+    @staticmethod
+    def _route_assets(ctx: Any) -> None:
+        def handle(route: Any) -> None:
+            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+                route.abort()
+            else:
+                route.continue_()
+        ctx.route("**/*", handle)
+
+    def _goto(self, rl: Relauncher, url: str) -> tuple[str | None, str | None]:
+        """Navigate + settle + read → `(html, error)`. One relaunch retry, on the same terms
+        as the Maps lane: a dead Chromium is worth rebuilding, a misbehaving page is not."""
         for attempt in (0, 1):
             _ctx, page = rl.current
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 page.wait_for_timeout(SETTLE_MS)
                 html = page.content()
+                if not looks_blocked(html):
+                    return html[:MAX_BYTES], None
                 # A Cloudflare JS challenge swaps the document for the real page once its
-                # script solves — but that can take 3-5 s, past the initial settle. Re-read
+                # script solves — but that can take 3-10 s, past the initial settle. Re-read
                 # a few times before giving up; a challenge that never clears (a managed
                 # Turnstile, or a hard 1020 deny) still bails at CHALLENGE_WAIT_MS instead
                 # of hanging. Auto-solvers are rescued; unsolvable walls cost a few seconds.
+                kind = detect_cloudflare(html)
                 waited = 0
                 while looks_blocked(html) and waited < CHALLENGE_WAIT_MS:
                     page.wait_for_timeout(CHALLENGE_STEP_MS)
                     waited += CHALLENGE_STEP_MS
                     html = page.content()
+                    kind = kind or detect_cloudflare(html)
+                # W22: a managed / interactive Turnstile never clears on its own — it wants
+                # the checkbox pressed. Only when the user turned that on.
+                if looks_blocked(html) and kind in ("managed", "interactive") and CF_CLICK:
+                    try:
+                        html = self._click_turnstile(page, url) or html
+                    except PWError as e:
+                        # The click DID trigger the document swap and a read raced it: the
+                        # wall is still the verdict, not a transport failure.
+                        log.debug("turnstile click errored on %s: %s", url, e)
                 if looks_blocked(html):
-                    log.debug("browser fetch still blocked after %dms: %s", SETTLE_MS + waited, url)
-                    return None
-                return html[:MAX_BYTES]
+                    log.debug("browser fetch still blocked (%s) after %dms: %s",
+                              cf_error(kind), SETTLE_MS + waited, url)
+                    return None, cf_error(kind)
+                return html[:MAX_BYTES], None
             except PWError as e:
                 if attempt == 0 and is_closed(e) and rl.recover(f"fetch {url}"):
                     continue
                 log.debug("browser fetch failed %s: %s", url, e)
-                return None
+                return None, "timeout" if "timeout" in str(e).lower() else "network"
+        return None, "network"
+
+    def _click_turnstile(self, page: Any, url: str) -> str | None:
+        """Scrapling's Turnstile press: the challenge iframe's box, (x+27, y+26) is the
+        checkbox, a 100-200 ms hold, then wait for the document swap. Up to CF_CLICK_ATTEMPTS
+        tries; the HTML once it cleared, else None. Gated by ENRICH_CF_CLICK."""
+        for n in range(CF_CLICK_ATTEMPTS):
+            frame = next((f for f in page.frames if _CF_FRAME_RE.match(f.url or "")), None)
+            if frame is None:
+                log.debug("turnstile click: no challenge frame yet (%d) on %s", n + 1, url)
+                page.wait_for_timeout(CHALLENGE_STEP_MS)
+                continue
+            try:
+                box = frame.frame_element().bounding_box()
+            except PWError:
+                box = None
+            if not box:
+                page.wait_for_timeout(CHALLENGE_STEP_MS)
+                continue
+            x, y = box["x"] + 27, box["y"] + 26
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(100, 200))
+            page.mouse.up()
+            try:
+                page.wait_for_load_state("networkidle", timeout=CF_CLICK_WAIT_MS)
+            except PWError:
+                pass
+            # A cleared Turnstile navigates; `page.content()` in the middle of that raises
+            # "page is navigating" — wait it out rather than treat it as a failure.
+            waited = 0
+            html = self._content_or_none(page)
+            while (html is None or looks_blocked(html)) and waited < CF_CLICK_WAIT_MS:
+                page.wait_for_timeout(CHALLENGE_STEP_MS)
+                waited += CHALLENGE_STEP_MS
+                html = self._content_or_none(page)
+            if html and not looks_blocked(html):
+                log.info("turnstile cleared on click %d: %s", n + 1, url)
+                return html
         return None
+
+    @staticmethod
+    def _content_or_none(page: Any) -> str | None:
+        try:
+            return page.content()
+        except PWError:
+            return None
 
     def _drain(self) -> None:
         """Release anyone already queued - a dead worker must not hang the enrichment run."""

@@ -21,6 +21,8 @@ webscraper/
   maps.py        Playwright: search URL -> scroll feed (FeedCard) -> per-place panel -> Place
   enrich.py      async httpx: home + contact/about pages -> emails, socials, WhatsApp;
                  fetch ladder httpx -> impersonate_fetch (curl_cffi) -> browser_fetch (Playwright)
+                 (-> camoufox_fetch with ENRICH_BROWSER_CAMOUFOX=1); browser_fetch classifies
+                 Cloudflare walls (cf_*) and can click Turnstile with ENRICH_CF_CLICK=1 (W22)
   proxies.py     W15 ProxyPool: ENRICH_PROXIES round-robin, quarantine/re-admit, redact()
   extractors.py  pure functions (regex/selectolax) — the only part with unit tests
   store.py       sqlite3 (jobs, places), stats, CSV/JSON export, tiny ALTER-TABLE migrate
@@ -111,6 +113,14 @@ data/            gitignored: leads.db, browser-profile/, exports/
 | `ENRICH_PROXIES` | — | W15: comma/newline list (`user:pass@host:port` ok). **Supersedes `ENRICH_PROXY`.** Every tier: direct attempt, then if blocked one attempt via the pool's next proxy; a 407 / unreachable gateway earns one retry with the next proxy before the tier escalates |
 | `ENRICH_PROXY_FIRST` | `0` | W15: proxy before the own-IP attempt (VPS / datacenter IP) |
 | `ENRICH_PROXY_MAX_FAILURES` / `_COOLDOWN_SEC` | `3` / `300` | W15: consecutive proxy-blamed failures before a proxy is benched, and for how long |
+| `ENRICH_CF_CLICK` | **`1`** | W22: press a managed/interactive Cloudflare Turnstile checkbox in the browser tier (≤3 tries). Default ON — user directive 2026-08-25. `0` = the wall is only classified — `enrich_error` = `cf_non_interactive` / `cf_managed` / `cf_interactive` / `cf_embedded` / `blocked` |
+| `ENRICH_BROWSER_CAMOUFOX` | `0` | W22: last tier after Chrome — Camoufox (fingerprint-rewritten Firefox, stock Playwright, `pip install camoufox && camoufox fetch`). Fingerprint frozen in `data/camoufox-profile/camoufox-opts.json`; delete to re-roll. `enrich_via='camoufox'` |
+
+W22 also fixed the non-browser tiers' identity: httpx sends a full Chrome 150 header set
+(`sec-ch-ua`, `Sec-Fetch-*`, Google referer) matching curl_cffi's `chrome` alias, and the
+browser tier launches with Scrapling's stealth args/context (no `IsolateOrigins` flag, `--lang`
+instead of `locale`, dark scheme, DPR 2, headless UA de-"Headless"ed). Bench on job #7's 19
+blocked URLs: 9 → 12 readable with the click off, 15 with it on (the default), Camoufox +0.
 
 The proxy that read (or failed) a site shows up redacted (`host:port`, never credentials) as
 `enrich_via='tls@gw:7777'` / `enrich_error='http_403@gw:7777'`. The browser binds its proxy at

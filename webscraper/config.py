@@ -62,6 +62,10 @@ class Settings:
     # for how long, in seconds, before it is offered again.
     enrich_proxy_max_failures: int = _int(os.getenv("ENRICH_PROXY_MAX_FAILURES"), 3)
     enrich_proxy_cooldown_sec: float = _float(os.getenv("ENRICH_PROXY_COOLDOWN_SEC"), 300.0)
+    # W22: press Cloudflare's managed/interactive Turnstile checkbox in the browser tier.
+    # Default ON — user directive 2026-08-25 (bench: +3/19 sites). `0`/`false` turns it off,
+    # in which case the wall is only classified (enrich_error = cf_managed / cf_interactive).
+    enrich_cf_click: bool = _bool(os.getenv("ENRICH_CF_CLICK"), True)
     enrich_concurrency: int = _int(os.getenv("ENRICH_CONCURRENCY"), 5)
     db_path: Path = ROOT / (os.getenv("DB_PATH") or "data/leads.db")
     profile_dir: Path = ROOT / "data" / "browser-profile"

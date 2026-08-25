@@ -21,6 +21,7 @@ None, so enrichment behaves exactly as it did before — same contract as `brows
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Callable
@@ -28,6 +29,20 @@ from typing import Any, Callable
 from webscraper.config import _bool, settings
 
 log = logging.getLogger("webscraper.impersonate_fetch")
+
+try:
+    from curl_cffi.curl import CurlError  # type: ignore
+except Exception:  # noqa: BLE001 — optional dep absent: a class nothing ever raises
+    class CurlError(Exception):  # type: ignore[no-redef]
+        """Stand-in so the retry rule below is importable without curl_cffi."""
+
+#: W22: headers curl_cffi's `chrome` alias does NOT set on its own, kept identical to the
+#: httpx tier (`enrich.HEADERS`) so both non-browser tiers present one identity. A Google
+#: referer is what a real visit from a Maps listing carries.
+EXTRA_HEADERS = {"Referer": "https://www.google.com/", "Accept-Language": "en-GB,en;q=0.9"}
+#: W22: ONE retry on a connection-level curl error (reset, EOF mid-handshake, transient
+#: resolve). Never on an HTTP status — a 403 retried is a 403 twice.
+RETRY_DELAY_SEC = 1.0
 
 #: Default ON — it is cheap and only ever runs on a site httpx already failed to read.
 ENABLED = _bool(os.getenv("ENRICH_TLS_IMPERSONATE"), True)
@@ -102,25 +117,36 @@ async def impersonate_fetch_ex(url: str, proxy: str | None = None) -> tuple[str 
     # Route through a proxy when one is configured. curl_cffi takes the requests-style
     # {"http": url, "https": url} shape. Inert without one.
     use_proxy = settings.enrich_proxy if proxy is None else (proxy or None)
-    kw: dict[str, Any] = dict(impersonate=IMPERSONATE, timeout=NAV_TIMEOUT_SEC)
+    kw: dict[str, Any] = dict(impersonate=IMPERSONATE, timeout=NAV_TIMEOUT_SEC,
+                              headers=dict(EXTRA_HEADERS))
     if use_proxy:
         kw["proxies"] = {"http": use_proxy, "https": use_proxy}
-    try:
-        async with session_cls(**kw) as s:
-            r = await s.get(url, allow_redirects=True)
-            if r.status_code == 407:
-                return None, "proxy_407"
-            if r.status_code >= 400:
-                log.debug("tls impersonate still refused %s: %s", url, r.status_code)
-                return None, f"http_{r.status_code}"
-            ctype = (r.headers.get("content-type") or "").lower()
-            if ctype and "html" not in ctype and "xml" not in ctype:
-                return None, "non_html"
-            html = usable_html(r.text)
-            return (html, None) if html else (None, "blocked")
-    except Exception as e:  # noqa: BLE001 — fall through to the browser, never crash the run
-        log.debug("tls impersonate failed %s: %s", url, e)
-        return None, _classify_exception(e, bool(use_proxy))
+    for attempt in (0, 1):
+        try:
+            async with session_cls(**kw) as s:
+                r = await s.get(url, allow_redirects=True)
+                if r.status_code == 407:
+                    return None, "proxy_407"
+                if r.status_code >= 400:
+                    log.debug("tls impersonate still refused %s: %s", url, r.status_code)
+                    return None, f"http_{r.status_code}"
+                ctype = (r.headers.get("content-type") or "").lower()
+                if ctype and "html" not in ctype and "xml" not in ctype:
+                    return None, "non_html"
+                html = usable_html(r.text)
+                return (html, None) if html else (None, "blocked")
+        except CurlError as e:
+            # Connection-level only (the status branches above never raise): one retry.
+            if attempt == 0:
+                log.debug("tls impersonate curl error %s (retrying once): %s", url, e)
+                await asyncio.sleep(RETRY_DELAY_SEC)
+                continue
+            log.debug("tls impersonate failed %s: %s", url, e)
+            return None, _classify_exception(e, bool(use_proxy))
+        except Exception as e:  # noqa: BLE001 — fall through to the browser, never crash the run
+            log.debug("tls impersonate failed %s: %s", url, e)
+            return None, _classify_exception(e, bool(use_proxy))
+    return None, "network"
 
 
 async def impersonate_fetch(url: str, proxy: str | None = None) -> str | None:

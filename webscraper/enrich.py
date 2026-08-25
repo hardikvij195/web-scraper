@@ -27,10 +27,48 @@ from webscraper.store import Store, now_iso, plus
 
 log = logging.getLogger("webscraper.enrich")
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/126.0.0.0 Safari/537.36")
-HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-           "Accept-Language": "en-IN,en;q=0.9"}
+#: W22: a FULL, internally consistent Chrome 150 desktop header set, hand-written to match
+#: curl_cffi's `chrome` alias (chrome150 = the macOS UA below) so the httpx tier and the TLS
+#: tier present the same identity. Cloudflare scores the whole set: a Chrome UA with no
+#: `sec-ch-ua` / `Sec-Fetch-*` is a bot tell in itself. `Accept-Encoding` lists only what
+#: httpx can actually decode here (br needs `brotli`, zstd needs `zstandard`) — advertising
+#: an encoding we cannot decode would turn a 200 into garbage.
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/150.0.0.0 Safari/537.36")
+CHROME_MAJOR = "150"
+SEC_CH_UA = f'"Not;A=Brand";v="8", "Chromium";v="{CHROME_MAJOR}", "Google Chrome";v="{CHROME_MAJOR}"'
+SEC_CH_UA_PLATFORM = '"macOS"'
+ACCEPT_LANGUAGE = "en-GB,en;q=0.9"
+REFERER = "https://www.google.com/"
+
+
+def _accept_encoding() -> str:
+    encs = ["gzip", "deflate"]
+    for enc, mod in (("br", "brotli"), ("zstd", "zstandard")):
+        try:
+            __import__(mod)
+            encs.append(enc)
+        except Exception:  # noqa: BLE001 — optional decoder absent: do not advertise it
+            pass
+    return ", ".join(encs)
+
+
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+               "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+    "Accept-Language": ACCEPT_LANGUAGE,
+    "Accept-Encoding": _accept_encoding(),
+    "sec-ch-ua": SEC_CH_UA,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": REFERER,
+}
 MAX_BYTES = 1_500_000
 
 #: Statuses that mean "a bot filter turned us away", not "this site has no page". These are
@@ -84,6 +122,11 @@ def is_block(error: str | None) -> bool:
     """
     if error and "@" in error:
         error = error.split("@", 1)[0]          # 'http_403@gw:7777' — the proxy tag (W15)
+    if error and (error.startswith("cf_") or error == "blocked"):
+        # W22: a Cloudflare wall classified by the browser tier (cf_non_interactive /
+        # cf_managed / cf_interactive / cf_embedded) or a 200 whose body was an
+        # interstitial — a block by definition, and what the next tier exists for.
+        return True
     return error == "timeout" or error in tuple(http_error(c) for c in BLOCK_CODES)
 
 
@@ -267,13 +310,17 @@ async def _with_proxies(attempt: Callable[[str | None], Awaitable[Fetched]],
 
 async def crawl_site(client: httpx.AsyncClient, website: str,
                      browser_retry: Callable[[str], Awaitable[Any]] | None = None,
+                     camoufox_retry: Callable[[str], Awaitable[tuple[str | None, str | None]]] | None = None,
                      ) -> tuple[Contacts, str | None]:
     """Home page + up to 4 contact/about pages on the same domain.
 
     Returns the contacts plus the reason nothing was fetched (None when something was).
     `browser_retry`, when given, is the slow path from `browser_fetch.py`: it is offered the
     home page URL once, and only when httpx was blocked rather than merely refused. It may
-    return the HTML, or an `(html, proxy_url)` pair so the proxy shows in the report.
+    return the HTML, an `(html, proxy_url)` pair so the proxy shows in the report, or a
+    `(html, proxy_url, error)` triple where `error` names the Cloudflare wall the browser
+    saw (`cf_managed` …, W22). `camoufox_retry` (W22, `ENRICH_BROWSER_CAMOUFOX=1`) is the
+    last tier after that, returning `(html, error)`.
 
     Fetch ladder: httpx → curl_cffi TLS impersonation → real browser, each tier under the W15
     proxy rules of `_with_proxies` (direct first unless ENRICH_PROXY_FIRST). The tier and
@@ -302,12 +349,27 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
             got, via = t, t.tag("tls")
     if got.html is None and is_block(got.error) and browser_retry is not None:
         res = await browser_retry(url)
-        html, bproxy = res if isinstance(res, tuple) else (res, None)
+        # (html) | (html, proxy) | (html, proxy, error) — the 3rd is W22's Cloudflare class
+        # ('cf_managed' …) so the reason stored says WHICH wall is left, not just 'http_403'.
+        html, bproxy, berr = (res if isinstance(res, tuple) and len(res) == 3
+                              else (res[0], res[1], None) if isinstance(res, tuple)
+                              else (res, None, None))
         if html:
             log.info("browser retry rescued %s (httpx said %s)%s", url, got.error,
                      f" via {redact(bproxy)}" if bproxy else "")
             got = Fetched(html=html, proxy=bproxy)
             via = got.tag("browser")
+        elif berr:
+            got = Fetched(error=berr, proxy=bproxy, url=url)
+    # W22 last tier: Camoufox (a Firefox with a whole-fingerprint rewrite), env-gated OFF.
+    # Only after the Chrome tier ALSO failed on a block; one attempt, no proxy rotation.
+    if got.html is None and is_block(got.error) and camoufox_retry is not None:
+        html, cerr = await camoufox_retry(url)
+        if html:
+            log.info("camoufox rescued %s (chrome tier said %s)", url, got.error)
+            got, via = Fetched(html=html), "camoufox"
+        elif cerr and cerr != "off":
+            got = Fetched(error=cerr, url=url)
     if got.html is None:
         return c, got.tag(got.error) or "no_pages"
     home = got.html
@@ -414,8 +476,30 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                     log.warning("browser fallback unavailable (%s) — blocked sites stay failed", e)
                     browser["off"] = True
                     return None, None
-        html = await asyncio.to_thread(browser["fetcher"].fetch, url)
-        return html, (browser.get("proxy") or None)
+        html, err = await asyncio.to_thread(browser["fetcher"].fetch_ex, url)
+        return html, (browser.get("proxy") or None), err
+
+    # W22 Camoufox tier — same lazy, once-per-run shape as the Chrome tier; inert unless
+    # ENRICH_BROWSER_CAMOUFOX=1, and skipped with one log line when camoufox is not installed.
+    camoufox: dict[str, Any] = {"fetcher": None, "off": False}
+
+    async def camoufox_retry(url: str) -> tuple[str | None, str | None]:
+        async with browser_lock:
+            if camoufox["fetcher"] is None:
+                if camoufox["off"]:
+                    return None, "off"
+                try:
+                    from webscraper.camoufox_fetch import CAMOUFOX_ENABLED, CamoufoxFetcher, available
+                    if not CAMOUFOX_ENABLED or not available():
+                        camoufox["off"] = True
+                        return None, "off"
+                    camoufox["fetcher"] = await asyncio.to_thread(
+                        lambda: CamoufoxFetcher(headless=headless))
+                except Exception as e:                # noqa: BLE001 — no camoufox, no tier
+                    log.warning("camoufox tier unavailable (%s) — skipped", e)
+                    camoufox["off"] = True
+                    return None, "off"
+        return await asyncio.to_thread(camoufox["fetcher"].fetch_ex, url)
 
     # One crawl per website domain, shared by every branch of the same business (chains list
     # 5–10 Maps entries on one site); plus a per-host cap so one slow server can't hog the
@@ -428,7 +512,7 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
         dom = domain_of(website) or website
         hs = host_sems.setdefault(dom, asyncio.Semaphore(2))
         async with hs:
-            return await crawl_site(client, website, browser_retry)
+            return await crawl_site(client, website, browser_retry, camoufox_retry)
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout,
                                  limits=limits, verify=False) as client:
@@ -490,7 +574,7 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                 # NULL again when the crawl worked, so a successful re-enrich clears a stale
                 # reason instead of leaving the lead looking blocked forever.
                 enrich_error=crawl_error(c.pages_fetched, reason),
-                # Which fetch tier read the home page (httpx | tls | browser); None on failure.
+                # Which fetch tier read the home page (httpx | tls | browser | camoufox); None on failure.
                 enrich_via=c.via,
                 email=c.emails[0] if c.emails else None,
                 emails=c.emails,
@@ -511,4 +595,6 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
             # lane calls this once per batch — leaking here would be one browser per batch.
             if browser["fetcher"] is not None:
                 await asyncio.to_thread(browser["fetcher"].close)
+            if camoufox["fetcher"] is not None:
+                await asyncio.to_thread(camoufox["fetcher"].close)
     return counts

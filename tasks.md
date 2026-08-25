@@ -13,6 +13,90 @@
 
 ---
 
+## Session 2026-08-25 — nodriver / Scrapling / Camoufox source read, techniques ported
+
+Prompt (CRM session, ported): "This is the result of reading nodriver, Scrapling and Camoufox
+source. Port these techniques (no new heavy dependencies except optional camoufox which is
+ALREADY installed locally …). No proxies needed (leave W15 plumbing intact/inert). No
+CAPTCHA-solving services." Follow-up the same day: "the Turnstile checkbox click is
+APPROVED and must be ENABLED BY DEFAULT."
+
+### W22 — nodriver/Scrapling/Camoufox techniques ported  [x]
+Four tiers touched, W15 proxy plumbing untouched and still inert.
+**A. httpx** (`enrich.HEADERS`): the bare Chrome/126 UA + 2 headers became a full,
+hand-written Chrome **150** identity matching curl_cffi's `chrome` alias (chrome150, macOS
+UA): `sec-ch-ua` / `-mobile` / `-platform`, all four `Sec-Fetch-*`, `Upgrade-Insecure-Requests`,
+`Referer: https://www.google.com/`, `Accept-Language: en-GB,en;q=0.9`, and an
+`Accept-Encoding` that only advertises what httpx can decode here (`brotli` present → `br`;
+`zstandard` absent → no `zstd`). Not browserforge — its Sec-Fetch output is wrong on this box.
+**B. curl_cffi** (`impersonate_fetch.py`): same `Referer` + `Accept-Language` on top of the
+alias's own headers; ONE retry after 1 s on `curl_cffi.curl.CurlError` (connection-level
+only — a 403 is never retried).
+**C. Browser** (`browser_fetch.py`, Scrapling's stealth ported): launch args =
+Scrapling DEFAULT+STEALTH set **minus** `--disable-features=IsolateOrigins,site-per-process`
+(nodriver: a non-default feature flag is itself fingerprintable) and minus the
+window-position pair; `--lang=en-GB --accept-lang=en-GB,en` replace the context `locale`
+(Cloudflare compares worker vs document language); `ignore_default_args` drops
+`--enable-automation` + 4 others; the `AutomationControlled` blink flag is only added on
+stock Playwright (patchright: redundant and a signal). Context: `color_scheme=dark`, DPR 2,
+no touch/mobile, service workers allowed, geolocation+notifications granted, 1920×1080
+screen+viewport when headless (headed keeps the real window), headless UA has "Headless"
+stripped (learned on first launch, relaunched once, cached process-wide); headed real
+Chrome keeps its own UA. Asset blocking is now by `request.resource_type`
+(image/media/font; stylesheets kept). `CHALLENGE_WAIT_MS` 6 → 12 s. **Cloudflare
+classification** (`detect_cloudflare`, port of Scrapling's `_detect_cloudflare`):
+`non-interactive` / `managed` / `interactive` from the `cType: '…'` marker, `embedded` from a
+Turnstile script tag. The class travels out as `fetch_ex() → (html, 'cf_managed' …)`,
+`browser_retry` now returns a 3-tuple, `is_block` accepts `cf_*`/`blocked`, and the reason
+lands in `enrich_error` so the CRM's issues dialog says WHICH wall remains. **Turnstile
+click** (`ENRICH_CF_CLICK`, **default ON — user directive 2026-08-25**; `0`/`false` turns
+it off): for `managed`/`interactive`, find the
+`challenges.cloudflare.com/cdn-cgi/challenge-platform/` frame, press `(x+27, y+26)` with a
+100–200 ms hold, wait network idle, poll ≤10 s, ≤3 attempts. The flag lives in
+`config.Settings.enrich_cf_click`. First bench pass exposed a race — the cleared page
+navigates and `page.content()` raises mid-swap — fixed with a tolerant read; the click had
+actually worked (the profile held `cf_clearance` afterwards and the same sites loaded in 4 s).
+**D. Camoufox** (`camoufox_fetch.py`, `ENRICH_BROWSER_CAMOUFOX=1`, default OFF): last tier
+after Chrome fails on a block; `CamoufoxFetcher(BrowserFetcher)` on STOCK Playwright's
+`firefox.launch_persistent_context` with `camoufox.utils.launch_options(humanize=False,
+block_images=True, os=windows|macos)`; the opts dict is **frozen** to
+`data/camoufox-profile/camoufox-opts.json` on first use and reused (a `cf_clearance` is
+bound to the fingerprint), only `headless` re-applied. Lazy import; missing package = one
+log line and the tier is skipped. `via='camoufox'`.
+
+**Bench** (19 blocked URLs from job #7, headless, ladder via `crawl_site` +
+`BrowserFetcher(headless=True)`, ≤30 s/site; baseline before W22 = **9/19**):
+
+| run | readable | tls | browser | camoufox | left |
+|---|---|---|---|---|---|
+| 1. A+B+C, `ENRICH_CF_CLICK=0` | **12/19** | 9 | 3 | – | fullcarchecks `blocked` (1020 deny), addlestone / autocapital / truckandvanplus `cf_interactive`, yell + staiano `blocked`, jany.io `network` (flaky, OK in runs 2–3) |
+| 2. click off + `ENRICH_BROWSER_CAMOUFOX=1` | **13/19** | 9 | 4 | **0** | same walls — Camoufox cleared nothing Chrome had not; the +1 is jany.io answering this time |
+| 3. click ON (the new default), fresh profile | **15/19** | 9 | 6 | – | **all three `cf_interactive` sites cleared by the click** (35–53 s each incl. queueing); still `blocked`: fullcarchecks, yell, staiano; browningsgarage flaked `network` this pass |
+
+Per-site (run 3): fullcarchecks FAIL blocked · varianse OK tls · sixt ×5 OK tls · jany.io OK
+browser · truckandplant OK tls · addlestone OK browser · autocapital OK browser ·
+browningsgarage FAIL network · tvcexports OK tls · global-commercials OK tls ·
+truckandvanplus OK browser · dr-azmat OK browser · yell FAIL blocked · reliablemedicare OK
+browser · staiano FAIL blocked. So: headers+stealth alone 9 → 12, the click adds +3 (the
+whole `cf_interactive` band) and is now on by default, Camoufox is worth 0 on this set and
+stays off. Never rescued by anything: a hard 1020 deny and two non-Cloudflare `blocked` pages.
+Note the clearance cookie persists in `data/fetch-profile` — a site clicked once loads in
+~4 s afterwards, so the per-site cost above is a first-visit cost.
+
+**Deliberately NOT adopted:** nodriver as a library (its own CDP driver — a second browser
+stack for no measured gain over patchright), Scrapling as a dependency (its fetchers drag in
+browserforge + its own Playwright fork; the two techniques worth having are ~80 lines here),
+Camoufox `humanize` (cursor animation, seconds per page, we never interact), `geoip`
+(MaxMind download + only meaningful behind a proxy), browserforge headers (wrong Sec-Fetch
+on this machine), any CAPTCHA-solving service, proxies (W15 stays inert).
+Tests: `tests/test_w22_stealth.py` (+15: header set + UA/impersonate-target match,
+`detect_cloudflare` ×4 + negatives, `is_block` on `cf_*`, launch-arg findings, `crawl_site`
+carrying `cf_managed` → reason and camoufox → via, opts freeze + corrupt-cache regen,
+CurlError retry-once / not-twice / never-on-403). 89 → **104 pass**. Docs: `.env.example`,
+`CLAUDE.md` env table + layout.
+
+---
+
 ## Session 2026-08-25 — closed-window crash + Mac agent (CRM T165)
 
 ### W21 — persisted Maps links + `discovery_pending` re-run (CRM T172)  [x]
