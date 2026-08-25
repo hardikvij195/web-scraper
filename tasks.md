@@ -15,6 +15,20 @@
 
 ## Session 2026-08-25 — closed-window crash + Mac agent (CRM T165)
 
+### W21 — persisted Maps links + `discovery_pending` re-run (CRM T172)  [x]
+New `job_links` table (every feed card, `opened` flag; saved at `links_done`, marked when a
+place is attempted). `run_scrape(preset_links=)` skips search/centre/tiling and opens exactly
+those; `server._discovery` uses it when `jobs.discovery_pending` (mirrored from the CRM) is
+set, then clears the flag. `_local_progress` adds `links_offered/links_opened/skipped_known/
+skipped_far`. Old jobs have no links → the CRM tells the user to use Find missed.
+
+### W20 — stream UPDATED rows mid-job; caps are stops, not failures (CRM T171)  [x]
+`places.changed_at` bumped by a trigger on every update; `Store.places_changed_since()`;
+`_tick` streams changed rows (rowid ≤ synced watermark) before new ones, watermark
+`_changed_upto` in memory. The CRM read "64 / 248" while 116 were enriched locally because
+only NEW rows were streamed until the job ended. `eta._lane_state`: ok=0 → `failed` only for
+`error:` reasons, `stopped` for maps_cap / wa_daily_cap / stopped. Test updated. 89 pass.
+
 ### W19 — store-derived lane counts + in-flight/queued per lane (CRM T170)  [x]
 `eta.lanes()` no longer trusts the per-run counters on the job row when it has a store:
 `_live_counts()` counts places (discovery done), `count_enriched` (enrichment done),

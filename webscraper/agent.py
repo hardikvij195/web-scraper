@@ -203,6 +203,15 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
            "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"],
            "research_done": row["research_done"], "research_total": row["research_total"],
            "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
+    # Discovery stats for the card's info dialog (T172): what Maps offered, what was
+    # opened, what was skipped and why. Best-effort — an old store has no job_links.
+    try:
+        offered, opened = store.link_counts(row["id"]) if store is not None else (0, 0)
+        out.update({"links_offered": offered, "links_opened": opened,
+                    "skipped_known": int(_col(row, "skipped_known", 0) or 0),
+                    "skipped_far": int(_col(row, "skipped_far", 0) or 0)})
+    except Exception:                                             # noqa: BLE001
+        pass
     s = eta.summarise(row, store)
     out.update({"phases": s["phases"], "lanes": s["lanes"], "eta_sec": s["eta_sec"],
                 "phase_eta_sec": s["phase_eta_sec"], "estimating": s["estimating"],
@@ -468,6 +477,7 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         phase="queued", status="running", note=None, finished_at=None,
         stop_requested=0,
         reenrich_only=int(bool(cj.get("reenrich_only", False))),
+        discovery_pending=int(bool(cj.get("discovery_pending", False))),
         do_enrich=int(bool(cj.get("do_enrich", True))),
         do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
         place_keys=_place_keys_json(cj),
@@ -480,6 +490,11 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     store.log(local_id, "job", f"re-run requested from the CRM (cloud job #{cj['id']})")
     srv.worker.wake.set()                        # do not wait out the poll interval
     log.info("cloud job #%s re-queued -> local job #%s", cj["id"], local_id)
+
+
+#: local job id -> `changed_at` watermark of updates already streamed. In memory like
+#: `synced_upto`; a restart re-sends one tick's worth of updates, absorbed by the upsert.
+_changed_upto: dict[int, str] = {}
 
 
 def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
@@ -530,6 +545,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                          # created as a scoped re-enrich would otherwise start a full Maps
                          # scrape of everything.
                          reenrich_only=int(bool(cj.get("reenrich_only", False))),
+                         discovery_pending=int(bool(cj.get("discovery_pending", False))),
                          place_keys=_place_keys_json(cj),
                          locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
@@ -549,6 +565,20 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             # upserted on (job_id, place_key), so the full sync at the end still overwrites
             # these with their enriched/researched versions.
             if synced_upto is not None:
+                # Rows the CRM already has, updated since the last tick (enrichment /
+                # WhatsApp verdicts). Before the new-row stream so the watermark of "what
+                # the CRM holds" is the one this query was scoped to.
+                since = _changed_upto.get(row["id"], "")
+                changed, ctop = store.places_changed_since(
+                    row["id"], since, synced_upto.get(row["id"], 0))
+                if changed:
+                    try:
+                        for i in range(0, len(changed), 200):
+                            cloud.sync(cid, [_flat(c) for c in changed[i:i + 200]])
+                        _changed_upto[row["id"]] = ctop
+                        log.info("streamed %d updated lead(s) to job #%s", len(changed), cid)
+                    except httpx.HTTPError as e:
+                        log.warning("update stream to #%s failed (will retry next tick): %s", cid, e)
                 fresh, top = store.places_after(row["id"], synced_upto.get(row["id"], 0))
                 if fresh:
                     try:

@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS job_logs (
   message TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id, id);
+
+-- Every link the Google Maps feed offered a job, and whether it was opened. Before this
+-- the links lived only in memory, so a run that hit the Maps time limit with 37 of 237
+-- unopened could only "search again" — now a `discovery_pending` re-run opens exactly
+-- those 37 (CRM T172, 2026-08-25).
+CREATE TABLE IF NOT EXISTS job_links (
+  job_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  href TEXT NOT NULL,
+  name TEXT, rating REAL, reviews INTEGER, lat REAL, lng REAL,
+  opened INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (job_id, key)
+);
 """
 
 
@@ -163,6 +176,19 @@ class Store:
                          ("enrich_via", "TEXT")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
+        # `changed_at` bumps on EVERY update to a place (enrichment verdict, socials, WA
+        # result), so the agent can stream updates to the CRM mid-job instead of only new
+        # rows — the CRM showed "64 / 248" while the agent had enriched 116 (job #14). The
+        # WHEN guard stops the trigger re-firing on its own write.
+        if "changed_at" not in have:
+            self.conn.execute("ALTER TABLE places ADD COLUMN changed_at TEXT")
+        self.conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS places_changed_at AFTER UPDATE ON places
+            WHEN NEW.changed_at IS OLD.changed_at
+            BEGIN
+                UPDATE places SET changed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
+                WHERE rowid = NEW.rowid;
+            END""")
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
         for col, typ in (
             ("phase", "TEXT"),            # queued | scraping | enriching | done | stopped | failed
@@ -176,6 +202,8 @@ class Store:
             ("headless", "INTEGER NOT NULL DEFAULT 1"),
             ("country", "TEXT"),
             ("reenrich_only", "INTEGER NOT NULL DEFAULT 0"),   # re-queued just to retry enrichment
+            # Re-run that opens only the job_links never visited (Maps cap), no new search.
+            ("discovery_pending", "INTEGER NOT NULL DEFAULT 0"),
             # JSON array of place_key: a re-run scoped to exactly the leads the user
             # had filtered in the CRM. NULL/absent = the whole job. Without this the
             # CRM's "Re-enrich (24)" silently re-ran everything.
@@ -402,6 +430,31 @@ class Store:
         except (TypeError, json.JSONDecodeError):
             return None
         return [str(k) for k in keys] if isinstance(keys, list) and keys else None
+
+    # ── job_links: what the Maps feed offered vs what was opened ───────────────
+    def save_links(self, job_id: int, cards: list[Any]) -> None:
+        """Upsert the feed cards of this run; `opened` is never reset here."""
+        self.conn.executemany(
+            "INSERT INTO job_links(job_id, key, href, name, rating, reviews, lat, lng) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(job_id, key) DO UPDATE SET href=excluded.href, "
+            "name=COALESCE(excluded.name, job_links.name)",
+            [(job_id, c.key, c.href, c.name, c.rating, c.reviews_count, c.lat, c.lng) for c in cards])
+        self.conn.commit()
+
+    def mark_link_opened(self, job_id: int, key: str) -> None:
+        self.conn.execute("UPDATE job_links SET opened=1 WHERE job_id=? AND key=?", (job_id, key))
+        self.conn.commit()
+
+    def pending_links(self, job_id: int) -> list[dict[str, Any]]:
+        """Feed links this job never opened, in feed order."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM job_links WHERE job_id=? AND opened=0 ORDER BY rowid", (job_id,))]
+
+    def link_counts(self, job_id: int) -> tuple[int, int]:
+        """(offered, opened) for the discovery stats."""
+        r = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(opened),0) FROM job_links WHERE job_id=?", (job_id,)).fetchone()
+        return int(r[0] or 0), int(r[1] or 0)
 
     def count_places(self, job_id: int) -> int:
         r = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()
@@ -637,6 +690,17 @@ class Store:
             [*fields.values(), job_id, place_key],
         )
         self.conn.commit()
+
+    def places_changed_since(self, job_id: int, since: str, upto_rowid: int) -> tuple[list[dict[str, Any]], str]:
+        """Places already streamed (rowid <= upto_rowid) that changed after `since`, plus the
+        new watermark. New rows go through places_after(); this catches the enrichment and
+        WhatsApp verdicts written onto rows the CRM already holds."""
+        rows = self.conn.execute(
+            "SELECT * FROM places WHERE job_id=? AND rowid<=? AND changed_at IS NOT NULL "
+            "AND changed_at>? ORDER BY changed_at", (job_id, upto_rowid, since)).fetchall()
+        out = self._decode_json_cols([dict(r) for r in rows])
+        top = max((str(r["changed_at"]) for r in rows), default=since)
+        return out, top
 
     def places_after(self, job_id: int, after_rowid: int) -> tuple[list[dict[str, Any]], int]:
         """Places saved since `after_rowid`, plus the new watermark.

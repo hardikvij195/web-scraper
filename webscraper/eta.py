@@ -309,7 +309,10 @@ def _lane_state(row: Any, lane: str, now: datetime) -> dict[str, Any]:
         # ok is NULL only on a pre-columns row that somehow has an end stamp; treat the
         # presence of an end as success rather than inventing a failure.
         ok = True if ok_raw is None else bool(ok_raw)
-        state = "done" if ok else "failed"
+        # A lane that hit its time/daily cap or was stopped did what it was allowed to;
+        # only an `error:` reason is a failure. Discovery read "Failed" for "hit the
+        # 30 min Google Maps limit" (job #14) — a planned stop is not a failure.
+        state = "done" if ok else ("failed" if str(reason or "").startswith("error:") else "stopped")
     elif status in TERMINAL:
         state = "done" if status == "done" else status
         ok = None if ok_raw is None else bool(ok_raw)

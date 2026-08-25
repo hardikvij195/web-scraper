@@ -157,9 +157,13 @@ def test_lane_ended_not_ok_is_failed_and_keeps_its_reason() -> None:
               wa_ended_at=iso(120), wa_ok=0, wa_reason="wa_daily_cap")
     ln = by_key(eta.lanes(row, FakeStore(), NOW))
     wa = ln["whatsapp"]
-    assert wa["status"] == "failed"
+    # A cap is a planned stop, not a failure (2026-08-25): 'stopped', never 'done'.
+    assert wa["status"] == "stopped"
     assert wa["ok"] is False
     assert wa["reason"] == "wa_daily_cap"
+    # Only an error: reason reads 'failed'.
+    row2 = job(scrape_started_at=iso(600), disc_ended_at=iso(300), disc_ok=0, disc_reason="error:boom")
+    assert by_key(eta.lanes(row2, FakeStore(), NOW))["discovery"]["status"] == "failed"
     assert wa["eta_sec"] is None and wa["estimating"] is False   # over; nothing to wait for
     assert wa["ran_sec"] == 460                                  # 580s ago -> 120s ago
     # A lane can end 'ok' and still owe the user an explanation — maps_cap means the search

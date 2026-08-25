@@ -51,6 +51,15 @@ def _record_rate(store: Store, job_id: int, phase: str, units: Any, started_at: 
                             (datetime.now(timezone.utc) - start).total_seconds())
 
 
+def _col(row, key, default=None):
+    """Read a column that may not exist yet (sqlite3.Row raises IndexError, dict KeyError)."""
+    try:
+        v = row[key]
+    except (IndexError, KeyError):
+        return default
+    return default if v is None else v
+
+
 def _wall(seconds_from_now: float | None) -> str | None:
     """`n` seconds from now as an ISO instant, for a deadline other processes must see."""
     if not seconds_from_now:
@@ -335,7 +344,26 @@ class Worker(threading.Thread):
                     # at that lane's own Store before touching the DB.
                     disc["store"] = lane.store
                     store = lane.store
-                    for idx, area in enumerate(areas):
+                    # "Extend & scrape the pending N": open only the links the capped run
+                    # never visited — one pass, no new Maps search (T172).
+                    if int(_col(job, "discovery_pending", 0) or 0):
+                        from webscraper.maps import FeedCard
+                        pend = [FeedCard(href=r["href"], name=r["name"], rating=r["rating"],
+                                         reviews_count=r["reviews"], lat=r["lat"], lng=r["lng"])
+                                for r in store.pending_links(job_id)]
+                        store.update_job(job_id, message=f"opening the {len(pend)} places the last run never reached…")
+                        a0 = areas[0]
+                        run_scrape(store, job_id, job["query"], a0["location"], 0, pacing,
+                                   headless=bool(job["headless"]), country=job["country"],
+                                   on_event=on_event, should_stop=should_stop,
+                                   radius_km=a0["radius_km"], wait_if_paused=wait_if_paused,
+                                   center=a0["center"], known_keys=None,
+                                   preset_links=pend)
+                        store.update_job(job_id, discovery_pending=0)
+                        areas_to_run: list = []
+                    else:
+                        areas_to_run = list(areas)
+                    for idx, area in enumerate(areas_to_run):
                         if should_stop():
                             break
                         area_label["txt"] = (f"area {idx + 1}/{len(areas)} ({area['location'] or 'anywhere'}): "

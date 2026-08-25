@@ -395,7 +395,8 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                center: tuple[float, float] | None = None,
                known_keys: set[str] | None = None,
                collect_until: float | None = None,
-               collect_target: int | None = None) -> int:
+               collect_target: int | None = None,
+               preset_links: list[FeedCard] | None = None) -> int:
     """Scrape up to `max_places` (0 = unlimited) for (query, location) into `store`. Returns count saved.
     `should_stop` is polled between places; when it returns True the job is marked stopped.
     `radius_km` (needs `location`) centres the search there, tiles the circle when more than one
@@ -456,7 +457,9 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
 
         try:
             zoom: float | None = None
-            if radius_km and (center or location):
+            # `preset_links` = open exactly these (a capped run's leftovers); no search,
+            # no centre lookup, no tiling.
+            if radius_km and (center or location) and preset_links is None:
                 if not center:                     # no pinned centre from the map picker → ask Maps
                     center = resolve_center(page, queries[0], location or "")
                 if center:
@@ -488,6 +491,10 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
             # truncated run returned one category. This way each centre sweeps all keywords,
             # and cutting the phase short still leaves every keyword represented.
             steps = [(qy, c) for c in centers for qy in queries]
+            if preset_links is not None:
+                steps = []
+                merged.update({c.key: c for c in preset_links})
+                emit("links", {"count": len(merged), "tile": 1, "tiles": 1})
             budget_hit = False
             for s_i, (qy, c) in enumerate(steps, 1):
                 if should_stop() or len(merged) >= limit:
@@ -543,6 +550,10 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
             links = list(merged.values())[:limit]
             emit("links_done", {"count": len(links), "skipped_far": skipped_far,
                                 "skipped_known": skipped_known, "budget_hit": budget_hit})
+            try:
+                store.save_links(job_id, links)
+            except Exception:                                     # noqa: BLE001
+                log.debug("save_links failed", exc_info=True)
             known = store.known_place_keys(job_id)
             for i, card in enumerate(links, 1):
                 if saved >= limit:
@@ -553,6 +564,12 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                     return saved
                 wait_if_paused()
                 href = card.href
+                # Opened = attempted. A timeout or a far-away skip still counts: "pending"
+                # means never looked at, so a capped run's leftovers are exactly the rest.
+                try:
+                    store.mark_link_opened(job_id, card.key)
+                except Exception:                                 # noqa: BLE001
+                    pass
                 pacing.sleep_between()
                 try:
                     place = scrape_place(page, href, job_id, country)
