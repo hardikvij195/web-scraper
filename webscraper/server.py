@@ -306,6 +306,10 @@ class Worker(threading.Thread):
                         store.update_job(job_id, links_found=agg["links_total"] + data["count"],
                                          message=f"{pfx}collecting places from the results list{tile}…")
                     elif kind == "links_done":
+                        store.log(job_id, "discovery",
+                                  f"Google Maps offered {data['count']} places — opening each one"
+                                  + (f" ({data.get('skipped_known', 0)} already in the system skipped)" if data.get("skipped_known") else "")
+                                  + (f" ({data.get('skipped_far', 0)} outside the radius skipped)" if data.get("skipped_far") else ""))
                         notes = []
                         if data.get("skipped_far"):
                             notes.append(f"{data['skipped_far']} outside radius")
@@ -317,6 +321,13 @@ class Worker(threading.Thread):
                                          message=f"{pfx}{data['count']} places found{extra}, opening each one…")
                     elif kind == "place":
                         store.update_job(job_id, scraped_count=agg["scraped_base"] + data["i"])
+                        try:
+                            pl = data.get("place")
+                            store.log(job_id, "discovery",
+                                      f"{data['i']}/{data['n']} {(getattr(pl, 'name', None) or '?')[:50]} · "
+                                      f"{getattr(pl, 'phone', None) or 'no phone'} · {getattr(pl, 'website', None) or 'no website'}")
+                        except Exception:                          # noqa: BLE001
+                            pass
                     elif kind == "far":
                         store.update_job(job_id, scraped_count=store.get_job(job_id)["scraped_count"] + 1,
                                          skipped_far=data["skipped"],

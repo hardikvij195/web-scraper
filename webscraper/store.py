@@ -561,12 +561,18 @@ class Store:
         rows = self.conn.execute("SELECT sent_today FROM wa_accounts WHERE disabled=0").fetchall()
         return sum(max(0, cap - int(r[0])) for r in rows)
 
+    def enabled_wa_accounts(self) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT name FROM wa_accounts WHERE disabled=0 ORDER BY name")]
+
     def pick_wa_account(self, cap: int, today: str) -> str | None:
         """Enabled account with remaining cap today, least-recently-used first (rotation)."""
         self._roll_day(today)
+        # cap <= 0 = unlimited: rotate over every enabled account regardless of today's count.
+        where = "disabled=0" + (" AND sent_today<?" if cap > 0 else "")
+        args = (cap,) if cap > 0 else ()
         row = self.conn.execute(
-            "SELECT name FROM wa_accounts WHERE disabled=0 AND sent_today<? "
-            "ORDER BY last_used_at IS NULL DESC, last_used_at ASC LIMIT 1", (cap,)).fetchone()
+            f"SELECT name FROM wa_accounts WHERE {where} "
+            "ORDER BY last_used_at IS NULL DESC, last_used_at ASC LIMIT 1", args).fetchone()
         return row[0] if row else None
 
     def bump_wa_account(self, name: str, today: str) -> None:

@@ -534,7 +534,7 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                 store.update_enrichment(*key, fields)
                 counts["no_website"] += 1
                 if on_progress:
-                    on_progress(r, "no_website")
+                    on_progress(r, "no_website", fields)
                 return
             async with sem:
                 try:
@@ -555,7 +555,7 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
                     store.update_enrichment(*key, fields)
                     counts["failed"] += 1
                     if on_progress:
-                        on_progress(r, "failed")
+                        on_progress(r, "failed", fields)
                     return
             if c.pages_fetched == 0:
                 status = "failed"
@@ -586,7 +586,7 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
             store.update_enrichment(*key, fields)
             counts[status] += 1
             if on_progress:
-                on_progress(r, status)
+                on_progress(r, status, fields)
 
         try:
             await asyncio.gather(*(one(r) for r in rows))

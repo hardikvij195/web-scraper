@@ -262,8 +262,14 @@ def verify_places(
 
             name = store.pick_wa_account(cap, today)
             if name is None:
-                counts["capped"] += 1
-                log.info("all accounts hit the daily cap (%d) - stopping; re-run tomorrow", cap)
+                if cap > 0:
+                    counts["capped"] += 1
+                    log.info("all accounts hit the daily cap (%d) - stopping; re-run tomorrow", cap)
+                else:
+                    # No cap, so None means every account is disabled (logged out).
+                    log.warning("no enabled WhatsApp account left - stopping")
+                    if job_id is not None:
+                        store.log(job_id, "whatsapp", "no enabled WhatsApp account left — run wa-login", "error")
                 break
 
             page = _ensure_session(pw, open_ctx, relaunchers, name)

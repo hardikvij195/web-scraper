@@ -73,7 +73,9 @@ class Settings:
     # WhatsApp number verification (opt-in per job). Each account = one persistent
     # browser profile under wa_profiles/<name>/. Cap + throttle guard the account.
     wa_profiles_dir: Path = ROOT / "data" / "wa-profiles"
-    wa_daily_cap: int = _int(os.getenv("WA_DAILY_CAP"), 200)          # per account, per day
+    # 0 = NO cap (user directive 2026-08-25: "remove daily cap logic from wa verify").
+    # Set a number to restore the per-account per-day ceiling.
+    wa_daily_cap: int = _int(os.getenv("WA_DAILY_CAP"), 0)
     wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 8.0)
     wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 20.0)
     # Headed by default: WhatsApp Web treats a headless Chromium as a NEW device and

@@ -36,6 +36,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from webscraper.config import settings
 from webscraper.store import Store
 
 log = logging.getLogger("webscraper.lanes")
@@ -57,6 +58,34 @@ R_STOPPED = "stopped"              # user pressed Stop
 R_WA_CAP = "wa_daily_cap"          # per-account WhatsApp cap reached
 R_WA_LOGIN = "wa_not_logged_in"    # no live WhatsApp Web session
 R_DISABLED = "disabled"            # the job did not ask for this lane
+
+
+
+def _enrich_line(r: dict, status: str, f: dict) -> str:
+    """'Name · site → done via tls · 1 email, instagram, whatsapp' / '… → FAILED: http_403'."""
+    name = (r.get("name") or r.get("place_key") or "?")[:50]
+    site = (r.get("website") or "").strip()
+    if status == "no_website":
+        return f"{name} · no website listed on Google Maps — nothing to crawl"
+    found = []
+    if f.get("emails"):
+        n = len(f["emails"]); found.append(f"{n} email{'s' if n != 1 else ''}")
+    for k in ("instagram", "facebook", "linkedin", "twitter_x", "youtube", "tiktok"):
+        if f.get(k):
+            found.append(k.replace("twitter_x", "x"))
+    if f.get("whatsapp_number"):
+        found.append(f"whatsapp ({f.get('whatsapp_source') or '?'})")
+    via = f" via {f['enrich_via']}" if f.get("enrich_via") else ""
+    if status == "failed":
+        return f"{name} · {site} → FAILED: {f.get('enrich_error') or 'unknown'}"
+    tail = ", ".join(found) if found else "no contacts found"
+    return f"{name} · {site} → {status}{via} · {tail}"
+
+
+def _wa_line(r: dict, status: str, num: str | None) -> str:
+    name = (r.get("name") or r.get("place_key") or "?")[:50]
+    verdict = {"yes": "ON WhatsApp ✓", "no": "not on WhatsApp ✗", "unknown": "no number to check"}.get(status, status)
+    return f"{name} · {num or '—'} → {verdict}"
 
 
 class Lane(threading.Thread):
@@ -191,7 +220,14 @@ class EnrichmentLane(Lane):
             t0 = time.monotonic()
             done = {"n": 0}
 
-            def on_progress(_r: dict[str, Any], status: str) -> None:
+            def on_progress(r: dict[str, Any], status: str, fields: dict[str, Any] | None = None) -> None:
+                # One log line per lead (T179): what was crawled, how it ended, which tier
+                # read it, what it yielded — so the CRM Logs dialog tells the whole story.
+                try:
+                    self.store.log(self.job_id, "enrichment", _enrich_line(r, status, fields or {}),
+                                   "warn" if status == "failed" else "info")
+                except Exception:                                 # noqa: BLE001
+                    pass
                 # A lead with no website is skipped, not enriched: it is outside the
                 # denominator (count_pending_enrichment ignores it too), so it must not
                 # move the numerator either — keeps done + outstanding = enrichable (T163).
@@ -204,6 +240,10 @@ class EnrichmentLane(Lane):
             # in the CRM) must actually open a visible browser on a blocked site. `headless`
             # is stored 1/0; None leaves the module default when the column is unset.
             hl = self.job.get("headless")
+            self.store.log(self.job_id, "enrichment",
+                           f"crawling {len(batch)} website(s): " + ", ".join(
+                               (r.get("name") or r.get("place_key") or "?")[:40] for r in batch[:10])
+                           + (" …" if len(batch) > 10 else ""))
             store.update_job(self.job_id, enrich_active=len(batch))
             try:
                 asyncio.run(enrich_places(store, batch, None, self.job.get("country"),
@@ -309,10 +349,21 @@ class WhatsAppLane(Lane):
                              wa_verify_total=checked + len(batch),
                              wa_verify_done=checked, wa_active=len(batch))
 
-            def on_wa(_pk: str, _status: str, _num: str | None = None) -> None:
+            by_pk = {r["place_key"]: r for r in batch}
+            self.store.log(self.job_id, "whatsapp",
+                           f"checking {len(batch)} number(s) on WhatsApp — accounts: "
+                           f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
+                           + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
+
+            def on_wa(pk: str, status: str, num: str | None = None) -> None:
                 nonlocal checked
                 checked += 1
                 store.update_job(self.job_id, wa_verify_done=checked)
+                try:
+                    r = by_pk.get(pk, {})
+                    self.store.log(self.job_id, "whatsapp", _wa_line(r, status, num or r.get("whatsapp_number") or r.get("phone")))
+                except Exception:                                 # noqa: BLE001
+                    pass
 
             try:
                 res = wa_verify.verify_places(store, batch, on_wa, self.stopped,

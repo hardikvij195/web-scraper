@@ -21,6 +21,23 @@ ALREADY installed locally …). No proxies needed (leave W15 plumbing intact/ine
 CAPTCHA-solving services." Follow-up the same day: "the Turnstile checkbox click is
 APPROVED and must be ENABLED BY DEFAULT."
 
+### W25 — detailed job logs (CRM T179)  [x]
+The CRM Logs dialog now tells the whole story: discovery logs "Google Maps offered N places"
+and one line per place opened (`i/n Name · phone · website`); enrichment logs each batch
+("crawling 10 website(s): …") and one line per lead — `Name · site → done via tls · 2 emails,
+instagram, whatsapp (wa_link)` / `→ FAILED: cf_interactive` (warn) / `no website listed`;
+WhatsApp logs the batch start with the accounts in play and one line per number —
+`Name · +44… → ON WhatsApp ✓` / `not on WhatsApp ✗` / `no number to check`. The CRM-driven
+re-verify writes the same lines onto the mirrored local job so they reach the dialog too.
+~1 line per lead per lane (job #14 ≈ 800 lines) — the CRM dialog paginates.
+
+### W24 — WhatsApp daily cap removed (user directive)  [x]
+`WA_DAILY_CAP` now defaults to **0 = no cap**; `pick_wa_account` rotates over every enabled
+account regardless of `sent_today`, `verify_places` only reports `capped` when a cap is set.
+Set `WA_DAILY_CAP=200` to restore the old per-account ceiling. Also: the CRM re-verify path
+now ends its lane with a real reason (`wa_daily_cap` / `completed`) instead of leaving the
+CRM to print "Interrupted · ran 0s" (job #14, T178).
+
 ### W23 — headed browser tier died after W22 ("Show window" showed nothing)  [x]
 Job #14's follow-up re-enrich ran with the window toggle on and no browser appeared. Not
 headless: real Chrome REFUSED to launch — Playwright rejects `device_scale_factor` together

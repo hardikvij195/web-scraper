@@ -12,6 +12,9 @@ from typing import Any
 
 import httpx
 
+from webscraper.config import settings
+from datetime import datetime, timezone
+
 from webscraper import eta
 from webscraper import server as srv
 from webscraper.store import Store
@@ -377,20 +380,31 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     # WhatsApp-check rate instead of the full job model. `None` (no history yet) is
     # passed through untouched — the CRM renders "estimating…" for it.
     started = time.monotonic()
+    started_iso = datetime.now(timezone.utc).isoformat()
 
-    def wa_progress(done: int) -> dict:
+    def wa_progress(done: int, reason: str | None = None) -> dict:
+        """`reason` set = the final picture: the lane ended with that token (completed /
+        wa_daily_cap / ...). Without it the CRM saw a lane that never reported an ending
+        and printed "Interrupted · the job stopped before this lane reported finishing"
+        for a plain daily-cap stop (job #14, 2026-08-25)."""
         per = ((time.monotonic() - started) / done) if done >= 3 else store.phase_rate("verifying_wa")
         eta_sec = round(max(0, total - done) * per) if per else None
         src = "live" if done >= 3 else "history"
+        ended = reason is not None
+        if ended:
+            eta_sec = None
         # A re-verify runs exactly one lane, so `lanes` is hand-built here rather than read
         # off a jobs row — there is no local job row for it (the work is driven straight off
         # the CRM's existing results). Same shape as eta.lanes() so the CRM renders it with
         # the same code path; the two idle lanes are reported 'disabled', not 'pending'.
+        now_iso = datetime.now(timezone.utc).isoformat()
         wa_lane = {"key": "whatsapp", "label": eta.LANE_LABELS["whatsapp"],
-                   "unit": eta.LANE_UNITS["whatsapp"], "status": "running",
+                   "unit": eta.LANE_UNITS["whatsapp"],
+                   "status": ("done" if reason == "completed" else "stopped") if ended else "running",
                    "done": done, "total": total, "total_is_min": False,
-                   "eta_sec": eta_sec, "estimating": eta_sec is None, "rate_source": src,
-                   "started_at": None, "ended_at": None, "ok": None, "reason": None,
+                   "eta_sec": eta_sec, "estimating": (eta_sec is None) and not ended, "rate_source": src,
+                   "started_at": started_iso, "ended_at": now_iso if ended else None,
+                   "ok": (reason == "completed") if ended else None, "reason": reason,
                    "ran_sec": round(time.monotonic() - started)}
         idle = [{"key": k, "label": eta.LANE_LABELS[k], "unit": eta.LANE_UNITS[k],
                  "status": "disabled", "done": 0, "total": None, "total_is_min": False,
@@ -408,9 +422,28 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
 
     cloud.progress(jid, "verifying_wa", wa_progress(0))
     collected: dict[str, str] = {}
+    # The CRM's Logs dialog reads the mirrored LOCAL job's job_logs; a re-verify has no
+    # run of its own, so its lines go onto that job (T179).
+    _lrow = store.conn.execute("SELECT id FROM jobs WHERE cloud_id=? ORDER BY id DESC LIMIT 1", (jid,)).fetchone()
+    local_log_id = int(_lrow["id"]) if _lrow else None
+    name_by_pk = {r["place_key"]: r for r in targets}
+
+    def _jlog(msg: str, level: str = "info") -> None:
+        if local_log_id is not None:
+            try:
+                store.log(local_log_id, "whatsapp", msg, level)
+            except Exception:                                     # noqa: BLE001
+                pass
+
+    _jlog(f"re-verify: checking {total} number(s) on WhatsApp — accounts: "
+          f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
+          + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
 
     def onp(pk: str, status: str, num: str | None = None) -> None:
         collected[pk] = status
+        from webscraper.lanes import _wa_line
+        r0 = name_by_pk.get(pk, {})
+        _jlog(_wa_line(r0, status, num or r0.get("whatsapp_number") or r0.get("phone")))
         upd: dict[str, Any] = {"place_key": pk, "wa_verified": status}
         # Confirmed hit -> promote the verified number + mark source 'verified' (drops an
         # 'unverified' guess). Miss on a guessed number -> clear it.
@@ -432,7 +465,7 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     try:
         # job_id=None → verify_places won't touch the local store's places (they aren't
         # here); `store` is still used for WA account rotation + daily caps.
-        wa_verify.verify_places(store, targets, on_progress=onp, job_id=None)
+        res = wa_verify.verify_places(store, targets, on_progress=onp, job_id=None)
     except wa_verify.WaNotLoggedIn as e:
         cloud.done(jid, "error", f"WhatsApp verify skipped — {e}")
         return
@@ -444,8 +477,19 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
     store.record_phase_rate(None, "verifying_wa", len(collected), time.monotonic() - started)
     if collected:
         cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()])
-    cloud.done(jid, "done")
-    log.info("re-verify #%s: %d checked", jid, len(collected))
+    capped = bool(res.get("capped")) if isinstance(res, dict) else False
+    reason = "wa_daily_cap" if capped else "completed"
+    left = max(0, total - len(collected))
+    try:
+        cloud.progress(jid, "verifying_wa", wa_progress(len(collected), reason))
+    except httpx.HTTPError as e:
+        log.warning("re-verify #%s: final progress failed: %s", jid, e)
+    msg = (f"WhatsApp daily cap reached ({settings.wa_daily_cap}/account/day) — {len(collected)} checked, "
+           f"{left} left; re-run tomorrow or add another WhatsApp account (wa-login)") if capped else None
+    _jlog(f"re-verify finished: {len(collected)} checked, {left} left" + (" — daily cap hit" if capped else ""),
+          "warn" if capped else "info")
+    cloud.done(jid, "done", msg)
+    log.info("re-verify #%s: %d checked%s", jid, len(collected), " (daily cap hit)" if capped else "")
 
 
 def _place_keys_json(cj: dict) -> str | None:
