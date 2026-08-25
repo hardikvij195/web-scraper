@@ -23,6 +23,12 @@ scraper starts and wa scraper starts side by side => make sure to check all nos 
 verification => the number we have got from google maps and all numbers we have got from
 website".
 
+### W27 — installers take the CRM's Supabase URL (clone tenants)  [x]
+`install-agent.sh --crm-url` / `install-agent.ps1 -CrmUrl` write `VITE_SUPABASE_URL` into the
+agent `.env`, which `cli._crm_base()` already prefers over the HVT default — so the launcher a
+CLONED CRM downloads points its agent at the tenant project. The CRM embeds its own
+`VITE_SUPABASE_URL` in the launcher (CRM T184).
+
 ### W26 — concurrent discovery (collector + opener) + every-number WhatsApp  [x]
 **Why.** `run_scrape` collected ALL links (tiles × keywords, up to `collect_until` /
 `collect_target`) and only then opened places, so enrichment and WhatsApp — which poll the

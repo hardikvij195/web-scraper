@@ -9,7 +9,10 @@ param(
   [Parameter(Mandatory = $true)][string]$Token,
   [string]$Device = "",
   [string]$Dir = "$env:USERPROFILE\hvt-lead-finder-agent",
-  [string]$Repo = "https://github.com/hardikvij195/web-scraper.git"
+  [string]$Repo = "https://github.com/hardikvij195/web-scraper.git",
+  # The CRM's Supabase URL. A CLONED tenant CRM lives on its own project; without this the
+  # agent would talk to HVT's (the built-in default) and never see the tenant's jobs.
+  [string]$CrmUrl = ""
 )
 $ErrorActionPreference = "Stop"
 if (-not $Device) { $Device = $env:COMPUTERNAME }
@@ -62,9 +65,11 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 Step "4/6 .env"
 if (-not (Test-Path ".env")) { New-Item -ItemType File ".env" | Out-Null }
-$lines = @(Get-Content ".env" | Where-Object { $_ -notmatch '^(CRM_AGENT_TOKEN|LEAD_FINDER_DEVICE)=' })
+$drop = if ($CrmUrl) { '^(CRM_AGENT_TOKEN|LEAD_FINDER_DEVICE|VITE_SUPABASE_URL)=' } else { '^(CRM_AGENT_TOKEN|LEAD_FINDER_DEVICE)=' }
+$lines = @(Get-Content ".env" | Where-Object { $_ -notmatch $drop })
 $lines += "CRM_AGENT_TOKEN=$Token"
 $lines += "LEAD_FINDER_DEVICE=$Device"
+if ($CrmUrl) { $lines += "VITE_SUPABASE_URL=$CrmUrl" }
 Set-Content ".env" $lines -Encoding utf8
 
 Step "5/6 autostart (scheduled task) + start"

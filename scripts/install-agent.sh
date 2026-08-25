@@ -6,7 +6,7 @@
 # Idempotent: re-running updates the checkout, deps and .env, then restarts the agent.
 set -euo pipefail
 
-TOKEN=""; DEVICE=""; DIR="$HOME/hvt-lead-finder-agent"
+TOKEN=""; DEVICE=""; DIR="$HOME/hvt-lead-finder-agent"; CRM_URL=""
 REPO="${LEAD_FINDER_AGENT_REPO:-https://github.com/hardikvij195/web-scraper.git}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -14,6 +14,9 @@ while [ $# -gt 0 ]; do
     --device) DEVICE="$2"; shift 2;;
     --dir) DIR="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
+    # The CRM's Supabase URL. A CLONED tenant CRM lives on its own project; without this
+    # the agent would talk to HVT's (the built-in default) and never see the tenant's jobs.
+    --crm-url) CRM_URL="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -60,7 +63,7 @@ step "3/6 python deps"
 step "4/6 .env"
 touch .env
 # replace-or-append each key; keep everything else the user put there
-for kv in "CRM_AGENT_TOKEN=$TOKEN" "LEAD_FINDER_DEVICE=$DEVICE"; do
+for kv in "CRM_AGENT_TOKEN=$TOKEN" "LEAD_FINDER_DEVICE=$DEVICE" ${CRM_URL:+"VITE_SUPABASE_URL=$CRM_URL"}; do
   k="${kv%%=*}"
   if grep -q "^$k=" .env; then
     tmp="$(mktemp)"; grep -v "^$k=" .env > "$tmp"; mv "$tmp" .env
