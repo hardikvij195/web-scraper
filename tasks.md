@@ -21,6 +21,16 @@ ALREADY installed locally …). No proxies needed (leave W15 plumbing intact/ine
 CAPTCHA-solving services." Follow-up the same day: "the Turnstile checkbox click is
 APPROVED and must be ENABLED BY DEFAULT."
 
+### W23 — headed browser tier died after W22 ("Show window" showed nothing)  [x]
+Job #14's follow-up re-enrich ran with the window toggle on and no browser appeared. Not
+headless: real Chrome REFUSED to launch — Playwright rejects `device_scale_factor` together
+with `no_viewport` ("deviceScaleFactor option is not supported with null viewport"), which
+W22 combined for headed runs — and the bundled-Chromium fallback was patchright 1.62's
+chromium-1234, never installed, so the tier vanished silently (`browser fallback
+unavailable`). Fix: DPR 2 only with the headless fixed viewport; headed keeps the real
+window's DPR. Also `python -m patchright install chromium` on the PC so the fallback exists.
+Verified: `BrowserFetcher(headless=False).fetch()` opens a real window and reads the page.
+
 ### W22 — nodriver/Scrapling/Camoufox techniques ported  [x]
 Four tiers touched, W15 proxy plumbing untouched and still inert.
 **A. httpx** (`enrich.HEADERS`): the bare Chrome/126 UA + 2 headers became a full,

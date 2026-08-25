@@ -293,7 +293,7 @@ class BrowserFetcher:
         desktop Chrome a person configured looks like, as opposed to Playwright's defaults
         (light, DPR 1, 1280×720, no permissions), which are a known automation signature."""
         kw: dict[str, Any] = dict(
-            color_scheme="dark", device_scale_factor=2, is_mobile=False, has_touch=False,
+            color_scheme="dark", is_mobile=False, has_touch=False,
             service_workers="allow", permissions=["geolocation", "notifications"],
             # Auto-proceed past cert warnings. Many small business sites have a misissued
             # or wrong-CN certificate (newsquaredentist.com, camskinclinic.com on job 11
@@ -306,8 +306,14 @@ class BrowserFetcher:
         if self._headless:
             kw["viewport"] = dict(HEADLESS_SCREEN)
             kw["screen"] = dict(HEADLESS_SCREEN)
+            # DPR 2 only makes sense with a fixed viewport. Playwright REFUSES
+            # `device_scale_factor` together with `no_viewport` ("deviceScaleFactor option
+            # is not supported with null viewport") — on job #14's headed re-run that
+            # killed the real-Chrome launch, and the bundled fallback wasn't installed, so
+            # the whole browser tier silently vanished and "Show window" showed nothing.
+            kw["device_scale_factor"] = 2
         else:
-            kw["no_viewport"] = True             # headed: the real window is the viewport
+            kw["no_viewport"] = True             # headed: the real window is the viewport, real DPR
         return kw
 
     def _opener(self, pw: Any) -> Callable[[], tuple[Any, Any]]:
