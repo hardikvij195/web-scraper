@@ -565,6 +565,14 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 # data/agent.log on this PC. The Worker already stores the exception in
                 # jobs.message; fall back to the phase only when there is none.
                 failure = (row["message"] or "").strip() or f"failed during {row['phase']}"
+                # Push the FINAL lane picture first. The last progress tick predates the
+                # lanes ending, so without this the CRM row kept every lane as
+                # status=running / reason=None and had to guess: job #13 (2026-08-25)
+                # showed enrichment + WhatsApp "Completed" on 0 / 0 after discovery died.
+                try:
+                    cloud.progress(cid, row["phase"], _local_progress(row, store))
+                except httpx.HTTPError as e:
+                    log.warning("final progress for #%s failed (done still sent): %s", cid, e)
                 cloud.done(cid, "done" if row["phase"] == "done" else "error",
                            None if row["phase"] == "done" else failure[:300])
                 store.update_job(row["id"], note="synced")
