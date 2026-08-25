@@ -5,6 +5,8 @@ Python 3.13 + Playwright Google Maps lead scraper + httpx website enricher. Live
 "Lead Finder" idea (replaces Apify; runs on the user's PC first, VPS later). Read `README.md`
 for usage; this file is for working on the code.
 
+> **Mac / second device?** Read [`MAC-SETUP.md`](./MAC-SETUP.md) — device-targeted runs, launchd agent, multi-device test plan (2026-08-25).
+
 ## Layout
 
 ```
