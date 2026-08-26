@@ -117,6 +117,20 @@ def _device_name() -> str:
 DEVICE_NAME = _device_name()
 
 
+def _running_git() -> str:
+    try:
+        from .healthcheck import _git_rev
+        return _git_rev()
+    except Exception:                                       # noqa: BLE001
+        return ""
+
+
+#: The commit THIS PROCESS was started from (T214). `checks.git` is re-read on every
+#: self-check and reflects the checkout on disk — after a `git pull` the two differ until
+#: the agent restarts, which is exactly what the CRM's "outdated" badge is about.
+RUNNING_GIT = _running_git()
+
+
 def crm_payload(action: str, **kw) -> dict:
     # `device` rides on every call: it is both the heartbeat that puts this machine in the
     # CRM's "Run on" list and the key the CRM uses to route a targeted job here.
@@ -146,6 +160,7 @@ class CrmCloud:
             try:
                 from .healthcheck import run_checks
                 extra["checks"] = run_checks()
+                extra["checks"]["running_git"] = RUNNING_GIT
             except Exception:                                     # noqa: BLE001
                 log.debug("self-check failed", exc_info=True)
             self._checks_sent_at = time.monotonic()
@@ -428,7 +443,8 @@ def _start_whoami_server() -> None:
                 git = _git_rev()
             except Exception:                               # noqa: BLE001
                 git = None
-            body = _json.dumps({"device": DEVICE_NAME, "root": str(ROOT), "git": git}).encode()
+            body = _json.dumps({"device": DEVICE_NAME, "root": str(ROOT), "git": git,
+                                "running_git": RUNNING_GIT}).encode()
             self.send_response(200); self._cors()
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
