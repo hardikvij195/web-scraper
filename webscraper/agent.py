@@ -404,6 +404,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     if kind == "crm":
         crm_log.setFormatter(logging.Formatter("%(name)s: %(message)s"))
         logging.getLogger().addHandler(crm_log)
+        _CRM_LOG[:] = [crm_log]
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
@@ -463,6 +464,8 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
 
 #: The one command thread allowed at a time (a second QR window would only confuse).
 _cmd_thread = None
+#: The CRM log handler, so an `update` can flush its last lines before exiting.
+_CRM_LOG: list = []
 
 
 def _poll_command(cloud: "CrmCloud") -> None:
@@ -508,6 +511,31 @@ def _poll_command(cloud: "CrmCloud") -> None:
             elif cmd["command"] == "checks":
                 # "Verify": re-run the self-check now instead of at the next 5-min mark.
                 ok, result = True, "self-check re-sent"
+            elif cmd["command"] == "update":
+                # "Update agent" (T209): pull main, reinstall deps, then exit — the
+                # supervisor loop (run-agent-loop.sh/.bat) restarts us on the new code.
+                # A job in flight is left to _requeue_orphans on the way back up.
+                import subprocess
+                import sys
+                from webscraper.config import ROOT
+                before = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                                        capture_output=True, text=True).stdout.strip()
+                pull = subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT,
+                                      capture_output=True, text=True, timeout=120)
+                if pull.returncode != 0:
+                    result = f"git pull failed: {(pull.stderr or pull.stdout).strip()[:200]}"
+                else:
+                    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+                                   cwd=ROOT, capture_output=True, text=True, timeout=600)
+                    after = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                                           capture_output=True, text=True).stdout.strip()
+                    ok, result = True, (f"already on {after}" if after == before
+                                        else f"updated {before} → {after}, restarting")
+                    log.info("update: %s", result)
+                    cloud.command_done(int(cmd["id"]), True, result)
+                    _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
+                    import os as _os
+                    _os._exit(0)
             else:
                 result = f"unknown command {cmd['command']}"
         except Exception as e:                                    # noqa: BLE001
