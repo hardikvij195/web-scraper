@@ -12,6 +12,9 @@ if not exist "%PY%" set "PY=python"
 if not exist "data" mkdir "data"
 
 :loop
+REM Self-update before every start (2026-08-26) - fast-forward only, never blocks;
+REM offline just runs what is on disk. A restart is therefore also an upgrade.
+git pull --ff-only -q >> "data\agent.log" 2>&1 && "%PY%" -m pip install -q -r requirements.txt >> "data\agent.log" 2>&1
 echo [%date% %time%] starting agent >> "data\agent.log"
 "%PY%" -m webscraper agent --crm --poll 5 >> "data\agent.log" 2>&1
 echo [%date% %time%] agent exited (code %errorlevel%) - restarting in 15s >> "data\agent.log"
