@@ -8,6 +8,7 @@ for usage; this file is for working on the code.
 > **W26 (2026-08-25): discovery = collector + opener tabs side by side; WhatsApp checks EVERY number** (Maps phone immediately, website numbers after enrichment) with per-number verdicts in `wa_checks`. See Rules below and `tasks.md` W26.
 > **WhatsApp cap (2026-08-25):** `WA_DAILY_CAP` defaults to 0 = unlimited (user directive); job logs now carry one line per site / number (W25).
 > **Self-check / installers (2026-08-25):** `webscraper/healthcheck.py` + `python -m webscraper doctor`; `scripts/install-agent.{sh,ps1}` are what the CRM's "Install agent" button downloads (raw GitHub → repo must be public).
+> **Versioning (2026-08-26):** `VERSION` (1.0.1, 1.0.2 … 1.0.9 → 1.1.0) — run `python scripts/bump-version.py` before every push that touches agent code; the CRM shows "outdated" against main's `VERSION`.
 > **Mac / second device?** Read [`MAC-SETUP.md`](./MAC-SETUP.md) — device-targeted runs, launchd agent, multi-device test plan (2026-08-25).
 
 ## Layout

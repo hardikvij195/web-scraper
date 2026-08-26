@@ -20,8 +20,17 @@ from webscraper.config import ROOT
 
 from .config import settings
 
-#: Bumped by hand when the agent protocol changes; the CRM shows it per device.
-AGENT_VERSION = "2026-08-26"
+def _read_version() -> str:
+    """`VERSION` at the repo root (1.0.1, 1.0.2 ... 1.0.9 -> 1.1.0; bump with
+    scripts/bump-version.py). The CRM compares this against main's VERSION to say
+    "up to date" / "outdated". Date-style values are the pre-1.0 agents."""
+    try:
+        return (ROOT / "VERSION").read_text(encoding="utf-8").strip() or "0.0.0"
+    except OSError:
+        return "0.0.0"
+
+
+AGENT_VERSION = _read_version()
 
 #: Where the Windows scheduled task / macOS launchd job live (see scripts/).
 _LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / "app.hvtechnologies.leadfinder-agent.plist"
