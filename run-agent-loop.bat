@@ -18,5 +18,7 @@ git pull --ff-only -q >> "data\agent.log" 2>&1 && "%PY%" -m pip install -q -r re
 echo [%date% %time%] starting agent >> "data\agent.log"
 "%PY%" -m webscraper agent --crm --poll 5 >> "data\agent.log" 2>&1
 echo [%date% %time%] agent exited (code %errorlevel%) - restarting in 15s >> "data\agent.log"
-timeout /t 15 /nobreak >nul
+REM `timeout` blocks forever when there is no console (scheduled task) - 27 zombie
+REM loops were found parked on it (2026-08-26). ping is a sleep that never needs stdin.
+ping -n 16 127.0.0.1 >nul
 goto loop
