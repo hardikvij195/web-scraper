@@ -47,8 +47,22 @@ fi
 echo "using $($PY --version) at $(command -v "$PY")"
 
 step "2/6 code → $DIR"
-if [ -d "$DIR/.git" ]; then
+# An existing checkout is PULLED, never re-cloned. `.git` is a FILE inside a mono-repo
+# submodule (hv-technologies/web-scraper), so test with git itself, not `-d .git`
+# (2026-08-26: the Mac hit "destination path already exists and is not an empty directory").
+if git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # A submodule checkout is on a detached HEAD, where `git pull` refuses to run (and so
+  # would the self-updating loop). Put it on main tracking origin/main once.
+  if ! git -C "$DIR" symbolic-ref -q HEAD >/dev/null; then
+    git -C "$DIR" fetch -q origin main && git -C "$DIR" checkout -q -B main origin/main || true
+  fi
   git -C "$DIR" pull --ff-only || echo "pull failed (local changes?) — continuing with the current checkout"
+elif [ -d "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
+  if [ -f "$DIR/webscraper/agent.py" ]; then
+    echo "$DIR holds the scraper but is not a git checkout — using it as is (no updates via git)"
+  else
+    echo "ERROR: $DIR exists, is not empty, and is not the web-scraper repo. Pick another --dir or clone the mono repo with: git submodule update --init"; exit 1
+  fi
 else
   git clone --depth 1 "$REPO" "$DIR"
 fi

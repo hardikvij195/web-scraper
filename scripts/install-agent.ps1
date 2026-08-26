@@ -46,8 +46,20 @@ if (-not $py) {
 Write-Host ("using " + ($py -join " "))
 
 Step "2/6 code -> $Dir"
-if (Test-Path (Join-Path $Dir ".git")) {
+# An existing checkout is PULLED, never re-cloned. `.git` is a FILE inside a mono-repo
+# submodule, and a submodule sits on a detached HEAD where `git pull` refuses to run —
+# put it on main tracking origin/main once (2026-08-26).
+$isRepo = $false
+if (Test-Path $Dir) { git -C $Dir rev-parse --is-inside-work-tree 2>$null | Out-Null; $isRepo = ($LASTEXITCODE -eq 0) }
+if ($isRepo) {
+  git -C $Dir symbolic-ref -q HEAD 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { git -C $Dir fetch -q origin main; git -C $Dir checkout -q -B main origin/main }
   git -C $Dir pull --ff-only
+} elseif ((Test-Path $Dir) -and (Get-ChildItem $Dir -Force | Select-Object -First 1)) {
+  if (-not (Test-Path (Join-Path $Dir "webscraper\agent.py"))) {
+    Write-Host "ERROR: $Dir exists, is not empty, and is not the web-scraper repo. Pick another -Dir or run: git submodule update --init" -ForegroundColor Red; exit 1
+  }
+  Write-Host "$Dir holds the scraper but is not a git checkout - using it as is (no updates via git)" -ForegroundColor Yellow
   if (-not $?) { Write-Host "pull failed (local changes?) - continuing with the current checkout" }
 } else {
   git clone --depth 1 $Repo $Dir
