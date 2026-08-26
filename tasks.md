@@ -13,10 +13,11 @@
 
 ---
 
-## Session 2026-08-26 — installer 404 on Mac + Windows laptop → repo made PUBLIC
+## Session 2026-08-26 — installer 404 on Mac + Windows laptop → repo made PUBLIC; Mac pip `;`-comment fix
 
 | # | What | State |
 |---|---|---|
+| **W30** | Mac installer (screenshot 2026-08-26 11:41, `Hardik - MAC`, Python 3.14.4) got past the clone (W29 public flip works) then died at step 3/6 `python deps`: `ERROR: Invalid requirement: 'curl_cffi>=0.7': Expected a marker variable or quoted string` | `[x]` 2026-08-26 — root cause: three `requirements.txt` lines (`curl_cffi`, `patchright`, `psycopg2-binary`) used `;` to start an inline comment; pip parses `;` as the PEP 508 environment-marker separator, so the comment text was read as a marker and rejected. Changed all three to `#` comments (`pip install --dry-run -r requirements.txt` exit 0). Installer clones `main`, so the push is the fix — user re-runs the same install line on the Mac. |
 | **W29** | One-click agent installer 404'd on both a Mac and a second Windows laptop (`iwr raw.githubusercontent.com/.../install-agent.ps1` → 404, then CommandNotFoundException on the missing file) | `[x]` 2026-08-26 — root cause: `hardikvij195/web-scraper` was still **private**, so both the raw download AND the `git clone` inside the script fail without auth (the long-known blocker). Scanned every tracked file for key material (JWTs, `sk_live`, `wsk_`, `rzp_live`): **none** — only `.env.example` is tracked, `.env`/`data/` gitignored. User approved → flipped repo to **public** via GitHub API (`PATCH /repos … {"private":false}`). Verified: raw URL now 200. User re-runs the same installer line on both machines. ⚠ Screenshot showed agent token `wsk_jPoT…g42R` in the command — hash-only server-side; re-mint from SaaS Settings if it ever leaks beyond a screenshot. |
 
 ---
