@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from webscraper.config import ROOT
+
 from .config import settings
 
 #: Bumped by hand when the agent protocol changes; the CRM shows it per device.
@@ -179,5 +181,8 @@ def run_checks() -> dict:
         "version": AGENT_VERSION,
         "git": _git_rev(),
         "python": platform.python_version(),
+        # Where this agent lives on disk (T210) — shown on the CRM device card so the
+        # user knows which checkout a machine runs (own folder vs the mono repo).
+        "root": str(ROOT),
         "checks": checks,
     }
