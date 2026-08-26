@@ -13,6 +13,14 @@
 
 ---
 
+## Session 2026-08-26 — installer 404 on Mac + Windows laptop → repo made PUBLIC
+
+| # | What | State |
+|---|---|---|
+| **W29** | One-click agent installer 404'd on both a Mac and a second Windows laptop (`iwr raw.githubusercontent.com/.../install-agent.ps1` → 404, then CommandNotFoundException on the missing file) | `[x]` 2026-08-26 — root cause: `hardikvij195/web-scraper` was still **private**, so both the raw download AND the `git clone` inside the script fail without auth (the long-known blocker). Scanned every tracked file for key material (JWTs, `sk_live`, `wsk_`, `rzp_live`): **none** — only `.env.example` is tracked, `.env`/`data/` gitignored. User approved → flipped repo to **public** via GitHub API (`PATCH /repos … {"private":false}`). Verified: raw URL now 200. User re-runs the same installer line on both machines. ⚠ Screenshot showed agent token `wsk_jPoT…g42R` in the command — hash-only server-side; re-mint from SaaS Settings if it ever leaks beyond a screenshot. |
+
+---
+
 ## Session 2026-08-25 — concurrent discovery + every-number WhatsApp
 
 Prompt (verbatim): "divide google discovery into 2 jobs => as it scraps the places, it adds
