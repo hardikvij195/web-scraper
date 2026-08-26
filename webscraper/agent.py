@@ -62,13 +62,55 @@ class Cloud:
         return {}  # SaaS members set AI keys in their cloud Settings tab, not here
 
 
+def _device_name_path():
+    from webscraper.config import ROOT
+    return ROOT / "data" / "device_name"
+
+
+def _remember_device_name(name: str) -> None:
+    """Persist the label so it survives reboots — see _device_name."""
+    try:
+        p = _device_name_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists() or p.read_text(encoding="utf-8").strip() != name:
+            p.write_text(name + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _device_name() -> str:
     """This machine's label, sent on every CRM call so the job can be pinned to it.
-    `LEAD_FINDER_DEVICE` overrides the hostname for a friendlier name ("Hardik-MacBook")."""
+
+    Order: `data/device_name` (what this machine called itself last time, incl. a rename
+    from the CRM) → `LEAD_FINDER_DEVICE` (installer --device) → macOS ComputerName →
+    hostname. The winner is written back to `data/device_name` so it never changes again:
+    under launchd a Mac's hostname came back as `Unknown_26:e5:…` and then
+    `Unknown_ba:67:…` on the next boot, so every restart registered a NEW device and
+    orphaned the jobs pinned to the old one (2026-08-26)."""
     import os
     import socket
-    name = os.getenv("LEAD_FINDER_DEVICE") or socket.gethostname() or "agent"
-    return name.strip()[:120]
+    import subprocess
+    name = ""
+    try:
+        name = _device_name_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    if not name:
+        name = (os.getenv("LEAD_FINDER_DEVICE") or "").strip()
+    if not name:
+        for args in (["scutil", "--get", "ComputerName"], ["scutil", "--get", "LocalHostName"]):
+            try:
+                out = subprocess.run(args, capture_output=True, text=True, timeout=5).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                out = ""
+            if out and not out.startswith("Unknown"):
+                name = out
+                break
+    if not name:
+        name = socket.gethostname() or "agent"
+    name = name.strip()[:120]
+    _remember_device_name(name)
+    return name
 
 
 #: Computed once — the hostname does not change while the agent runs.
@@ -396,6 +438,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
         return
 
     def _run() -> None:
+        global DEVICE_NAME
         ok, result = False, None
         try:
             if cmd["command"] == "wa_login":
@@ -404,6 +447,19 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
                 ok = wa_verify.login(label)
                 result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
+            elif cmd["command"] == "rename":
+                # The CRM already renamed its row + repointed jobs; from the next call on
+                # this machine must heartbeat under the new label, and keep it after reboot.
+                new = (cmd.get("arg") or "").strip()[:120]
+                if new:
+                    _remember_device_name(new)
+                    DEVICE_NAME = new
+                    ok, result = True, f"now reporting as {new}"
+                else:
+                    result = "empty name"
+            elif cmd["command"] == "checks":
+                # "Verify": re-run the self-check now instead of at the next 5-min mark.
+                ok, result = True, "self-check re-sent"
             else:
                 result = f"unknown command {cmd['command']}"
         except Exception as e:                                    # noqa: BLE001
