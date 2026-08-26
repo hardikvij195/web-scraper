@@ -77,7 +77,22 @@ async def _gather_text(client: httpx.AsyncClient, website: str) -> str:
     return "\n\n".join(parts)[:14000]
 
 
-async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str) -> dict[str, Any] | None:
+def _gemini_error_text(e: BaseException) -> str:
+    """One line a user can act on. Job #17 (2026-08-26, Mac) ran 50 leads through a Gemini
+    key that was out of quota: every call 429'd, the lane still said "50 done" and the CRM
+    showed no summary/owner with no reason anywhere. The status code is the whole story."""
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code
+        if code == 429:
+            return "Gemini quota exhausted (HTTP 429) — replace GEMINI_API_KEY (Lead Finder Setup or the agent's .env)"
+        if code in (401, 403):
+            return f"Gemini key rejected (HTTP {code}) — check GEMINI_API_KEY"
+        return f"Gemini HTTP {code}"
+    return f"Gemini call failed: {type(e).__name__}: {str(e)[:120]}"
+
+
+async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
+                      errors: dict[str, Any] | None = None) -> dict[str, Any] | None:
     try:
         r = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{_MODEL}:generateContent?key={key}",
@@ -91,6 +106,9 @@ async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str) -> dict[
         return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
     except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
         log.warning("gemini research failed: %s", e)
+        if errors is not None:
+            errors["error"] = _gemini_error_text(e)
+            errors["gemini_failed"] = errors.get("gemini_failed", 0) + 1
         return None
 
 
@@ -127,7 +145,7 @@ async def research_places(store: Store, rows: list[dict[str, Any]], concurrency:
                 site_emails = extract_emails(text)
                 data = await _ask_gemini(client, key, _PROMPT.format(
                     name=r.get("name") or "", category=r.get("category") or "", website=website,
-                    linkedin=r.get("linkedin") or "none", text=text))
+                    linkedin=r.get("linkedin") or "none", text=text), errors=counts)
             if not data:
                 store.update_enrichment(r["job_id"], r["place_key"], {"research_status": "failed"})
                 counts["failed"] += 1

@@ -113,6 +113,10 @@ class Lane(threading.Thread):
         self.done = threading.Event()
         self.reason: str | None = None
         self.store: Store | None = None
+        # Set by EnrichmentLane._research when most Gemini calls fail (quota, bad key):
+        # the lane then ends `error:AI research: …` instead of a clean "completed" that
+        # hides 50 leads with no summary/owner (job #17, 2026-08-26).
+        self.research_error: str | None = None
 
     # -- helpers ---------------------------------------------------------------------
     def note(self, message: str, level: str = "info") -> None:
@@ -217,6 +221,8 @@ class EnrichmentLane(Lane):
             if not batch:
                 # Nothing waiting. If discovery has finished, nothing ever will be.
                 if self.ctl.discovery_finished():
+                    if seen and self.research_error:
+                        return f"error:AI research: {self.research_error}"[:200]
                     return R_COMPLETED if seen else R_NO_TARGETS
                 time.sleep(IDLE_POLL_SEC)
                 continue
@@ -313,6 +319,13 @@ class EnrichmentLane(Lane):
         store.record_phase_rate(self.job_id, "researching", rdone["n"], time.monotonic() - t0)
         if isinstance(rc, dict) and rc.get("skipped") == len(targets) and targets:
             self.note("AI research skipped — no Gemini key configured", "warn")
+        elif isinstance(rc, dict) and rc.get("failed"):
+            # Say WHY, not just how many. Job #17 (2026-08-26) reported "50 done" while every
+            # Gemini call 429'd; the CRM showed no summary/owner and no reason.
+            why = rc.get("error") or "could not read the site text"
+            self.note(f"AI research failed for {rc['failed']} of {len(targets)} in this batch — {why}", "warn")
+            if (rc.get("gemini_failed") or 0) >= max(1, len(targets) // 2):
+                self.research_error = why
 
 
 class WhatsAppLane(Lane):

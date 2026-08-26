@@ -150,6 +150,19 @@ class CrmCloud:
         d = r.json()
         return d if isinstance(d, dict) else {}
 
+    def command(self) -> dict | None:
+        """Pop the one out-of-band command the CRM may have left for THIS device
+        (T202: `wa_login`). None when there is nothing, or on an Edge Fn that predates it."""
+        r = self._post(crm_payload("command"))
+        if r.status_code >= 400:
+            return None
+        d = r.json()
+        return d if isinstance(d, dict) and d.get("command") else None
+
+    def command_done(self, cid: int, ok: bool, result: str | None = None) -> None:
+        self._post(crm_payload("command_done", id=cid, status="done" if ok else "failed",
+                               result=result)).raise_for_status()
+
     def results(self, jid: int) -> list[dict]:
         """Existing results of a job (for on-demand WhatsApp re-verify)."""
         r = self._post(crm_payload("results", job_id=jid))
@@ -341,6 +354,8 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         return row is not None
 
     while True:
+        if kind == "crm":
+            _poll_command(cloud)
         try:
             _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:
@@ -354,6 +369,55 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             log.debug("busy check failed", exc_info=True)
         fast = (time.monotonic() - last_busy) < FAST_WINDOW_SEC
         time.sleep(BUSY_POLL_SEC if fast else poll_sec)
+
+
+#: The one command thread allowed at a time (a second QR window would only confuse).
+_cmd_thread = None
+
+
+def _poll_command(cloud: "CrmCloud") -> None:
+    """T202 - run a CRM-requested out-of-band command on this machine.
+
+    `wa_login <label>` opens WhatsApp Web HEADED here (the browser window appears on this
+    machine's screen - the agent runs on the user's PC/Mac, so that is where the QR must
+    be scanned). Runs in its own thread so job polling continues; when it ends the
+    self-check is re-sent on the next `jobs` call so the CRM health panel flips green
+    without waiting the usual 5 minutes."""
+    import threading
+    global _cmd_thread
+    if _cmd_thread is not None and _cmd_thread.is_alive():
+        return
+    _cmd_thread = None
+    try:
+        cmd = cloud.command()
+    except (httpx.HTTPError, ValueError):
+        return
+    if not cmd:
+        return
+
+    def _run() -> None:
+        ok, result = False, None
+        try:
+            if cmd["command"] == "wa_login":
+                from webscraper import wa_verify
+                label = (cmd.get("arg") or "main").strip() or "main"
+                log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
+                ok = wa_verify.login(label)
+                result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
+            else:
+                result = f"unknown command {cmd['command']}"
+        except Exception as e:                                    # noqa: BLE001
+            log.warning("command %s failed: %s", cmd.get("command"), e)
+            result = str(e)[:300]
+        finally:
+            cloud._checks_sent_at = 0.0          # re-send the self-check on the next tick
+            try:
+                cloud.command_done(int(cmd["id"]), ok, result)
+            except httpx.HTTPError as e:
+                log.warning("command_done failed: %s", e)
+
+    _cmd_thread = threading.Thread(target=_run, name="agent-command", daemon=True)
+    _cmd_thread.start()
 
 
 def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
