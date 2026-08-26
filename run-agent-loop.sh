@@ -7,8 +7,15 @@ set -u
 cd "$(dirname "$0")"
 PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 mkdir -p data
-# Friendly machine name shown in the CRM "Run on" picker; override in .env.
-export LEAD_FINDER_DEVICE="${LEAD_FINDER_DEVICE:-$(scutil --get ComputerName 2>/dev/null || hostname)}"
+# Friendly machine name shown in the CRM "Run on" picker. `.env` (written by the
+# installer's --device) wins; otherwise the Mac's ComputerName. Never export the bare
+# hostname: under launchd `scutil` can return nothing and the agent then registered as
+# "Unknown_26:e5:…" — a NEW device, so the job pinned to the old name and the queued
+# wa-login command were orphaned (2026-08-26).
+if ! grep -q '^LEAD_FINDER_DEVICE=' .env 2>/dev/null && [ -z "${LEAD_FINDER_DEVICE:-}" ]; then
+  _name="$(scutil --get ComputerName 2>/dev/null || true)"
+  [ -n "$_name" ] && export LEAD_FINDER_DEVICE="$_name"
+fi
 while true; do
   # Self-update before every start (2026-08-26): a CRM feature that needs new agent code
   # (the Start-WhatsApp-session button) sat at "waiting for <Mac> to pick it up" because
