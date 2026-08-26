@@ -21,7 +21,7 @@ from webscraper.config import ROOT
 from .config import settings
 
 #: Bumped by hand when the agent protocol changes; the CRM shows it per device.
-AGENT_VERSION = "2026-08-25"
+AGENT_VERSION = "2026-08-26"
 
 #: Where the Windows scheduled task / macOS launchd job live (see scripts/).
 _LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / "app.hvtechnologies.leadfinder-agent.plist"

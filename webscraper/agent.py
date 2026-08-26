@@ -398,8 +398,58 @@ def _ship_agent_logs(cloud: "CrmCloud", handler: _CrmLogHandler) -> None:
         handler.rows[:0] = rows
 
 
+def _start_whoami_server() -> None:
+    """T213 — `GET http://127.0.0.1:8766/whoami` → {device, root, git}. The CRM's "Detect
+    this PC" button calls it from the browser: a web page cannot know which machine it is
+    on, but it CAN reach loopback. CORS + Private-Network-Access headers so an https CRM
+    origin may read it. Loopback only; nothing sensitive in the reply."""
+    import json as _json
+    import os
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from webscraper.config import ROOT
+    port = int(os.getenv("LEAD_FINDER_LOCAL_PORT") or 8766)
+
+    class H(BaseHTTPRequestHandler):
+        def _cors(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+
+        def do_OPTIONS(self) -> None:                       # noqa: N802
+            self.send_response(204); self._cors(); self.end_headers()
+
+        def do_GET(self) -> None:                           # noqa: N802
+            if self.path.split("?")[0] != "/whoami":
+                self.send_response(404); self._cors(); self.end_headers(); return
+            try:
+                from .healthcheck import _git_rev
+                git = _git_rev()
+            except Exception:                               # noqa: BLE001
+                git = None
+            body = _json.dumps({"device": DEVICE_NAME, "root": str(ROOT), "git": git}).encode()
+            self.send_response(200); self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, *a: Any) -> None:            # silence per-request noise
+            pass
+
+    def _serve() -> None:
+        try:
+            HTTPServer(("127.0.0.1", port), H).serve_forever()
+        except OSError as e:
+            log.info("whoami server not started on 127.0.0.1:%s (%s)", port, e)
+
+    threading.Thread(target=_serve, name="whoami", daemon=True).start()
+
+
 def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    if kind == "crm":
+        _start_whoami_server()
     crm_log = _CrmLogHandler()
     if kind == "crm":
         crm_log.setFormatter(logging.Formatter("%(name)s: %(message)s"))
