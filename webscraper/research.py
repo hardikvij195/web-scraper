@@ -91,6 +91,88 @@ def _gemini_error_text(e: BaseException) -> str:
     return f"Gemini call failed: {type(e).__name__}: {str(e)[:120]}"
 
 
+#: OpenAI-compatible fallbacks, tried in order after Gemini — first one with a key wins,
+#: any failure moves on (T208, after the Gemini quota outage of 2026-08-26). Model per
+#: provider overridable with AI_RESEARCH_MODEL_<NAME>; order with AI_RESEARCH_PROVIDERS.
+_PROVIDERS: list[tuple[str, str, str, str]] = [
+    # name, env key, base url, default model
+    ("groq",       "GROQ_API_KEY",       "https://api.groq.com/openai/v1",       "openai/gpt-oss-20b"),
+    ("cerebras",   "CEREBRAS_API_KEY",   "https://api.cerebras.ai/v1",           "gpt-oss-120b"),
+    ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "openai/gpt-oss-20b"),
+    ("nvidia",     "NVIDIA_API_KEY",     "https://integrate.api.nvidia.com/v1",  "meta/llama-3.3-70b-instruct"),
+    ("xai",        "XAI_API_KEY",        "https://api.x.ai/v1",                  "grok-3-mini"),
+    ("openai",     "OPENAI_API_KEY",     "https://api.openai.com/v1",            "gpt-4o-mini"),
+]
+
+
+def _provider_order() -> list[str]:
+    raw = os.getenv("AI_RESEARCH_PROVIDERS") or "gemini," + ",".join(p[0] for p in _PROVIDERS)
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+
+def available_providers() -> list[str]:
+    """Names with a key set, in the order they will be tried."""
+    out = []
+    for name in _provider_order():
+        if name == "gemini" and _gemini_key():
+            out.append("gemini")
+        for p in _PROVIDERS:
+            if p[0] == name and os.getenv(p[1]):
+                out.append(name)
+    return out
+
+
+async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, base: str, model: str,
+                             prompt: str, errors: dict[str, Any] | None) -> dict[str, Any] | None:
+    try:
+        r = await client.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": model, "temperature": 0.2, "max_tokens": 1200,
+                  "messages": [{"role": "system", "content": "Reply with a single JSON object only."},
+                               {"role": "user", "content": prompt}]},
+            timeout=45)
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"] or ""
+        return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
+        log.warning("%s research failed: %s", name, e)
+        if errors is not None:
+            code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+            errors["error"] = (f"{name}: quota exhausted (HTTP 429)" if code == 429
+                               else f"{name}: HTTP {code}" if code
+                               else f"{name}: {type(e).__name__}")
+        return None
+
+
+async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any]) -> dict[str, Any] | None:
+    """Walk the provider chain; the first answer wins. `errors['error']` keeps the LAST
+    failure and `errors['provider']` the provider that answered."""
+    tried = 0
+    for name in _provider_order():
+        if name == "gemini":
+            key = _gemini_key()
+            if not key:
+                continue
+            tried += 1
+            data = await _ask_gemini(client, key, prompt, errors)
+        else:
+            spec = next((p for p in _PROVIDERS if p[0] == name), None)
+            if not spec or not os.getenv(spec[1]):
+                continue
+            tried += 1
+            model = os.getenv(f"AI_RESEARCH_MODEL_{name.upper()}") or spec[3]
+            data = await _ask_openai_compat(client, name, os.environ[spec[1]], spec[2], model, prompt, errors)
+        if data:
+            errors["provider"] = name
+            return data
+    if tried == 0:
+        errors["error"] = "no AI key configured"
+    else:
+        errors["gemini_failed"] = errors.get("gemini_failed", 0) + 1   # counts "all providers failed"
+    return None
+
+
 async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
                       errors: dict[str, Any] | None = None) -> dict[str, Any] | None:
     try:
@@ -108,7 +190,6 @@ async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
         log.warning("gemini research failed: %s", e)
         if errors is not None:
             errors["error"] = _gemini_error_text(e)
-            errors["gemini_failed"] = errors.get("gemini_failed", 0) + 1
         return None
 
 
@@ -117,8 +198,8 @@ async def research_places(store: Store, rows: list[dict[str, Any]], concurrency:
                           should_stop: Callable[[], bool] | None = None) -> dict[str, int]:
     key = _gemini_key()
     should_stop = should_stop or (lambda: False)
-    counts = {"done": 0, "skipped": 0, "failed": 0}
-    if not key:
+    counts: dict[str, Any] = {"done": 0, "skipped": 0, "failed": 0}
+    if not available_providers():
         for r in rows:
             store.update_enrichment(r["job_id"], r["place_key"], {"research_status": "no_key"})
         counts["skipped"] = len(rows)
@@ -143,9 +224,9 @@ async def research_places(store: Store, rows: list[dict[str, Any]], concurrency:
                     if on_progress: on_progress(r, "failed")
                     return
                 site_emails = extract_emails(text)
-                data = await _ask_gemini(client, key, _PROMPT.format(
+                data = await _ask_llm(client, _PROMPT.format(
                     name=r.get("name") or "", category=r.get("category") or "", website=website,
-                    linkedin=r.get("linkedin") or "none", text=text), errors=counts)
+                    linkedin=r.get("linkedin") or "none", text=text), counts)
             if not data:
                 store.update_enrichment(r["job_id"], r["place_key"], {"research_status": "failed"})
                 counts["failed"] += 1

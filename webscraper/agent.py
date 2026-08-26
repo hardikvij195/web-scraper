@@ -192,6 +192,10 @@ class CrmCloud:
         d = r.json()
         return d if isinstance(d, dict) else {}
 
+    def agent_logs(self, rows: list[dict]) -> None:
+        """Ship device-level log lines (T208). A 404 from an older Edge Fn is fine."""
+        self._post(crm_payload("agent_logs", rows=rows)).raise_for_status()
+
     def command(self) -> dict | None:
         """Pop the one out-of-band command the CRM may have left for THIS device
         (T202: `wa_login`). None when there is nothing, or on an Edge Fn that predates it."""
@@ -355,8 +359,51 @@ BUSY_POLL_SEC = 1.0
 FAST_WINDOW_SEC = 30.0
 
 
+class _CrmLogHandler(logging.Handler):
+    """Buffers this process's log lines so the agent loop can ship them to the CRM
+    (`lead_gen_agent_logs`, T208). Bounded — a dead link drops the oldest, never blocks."""
+
+    MAX = 500
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.rows: list[dict] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:                                   # noqa: BLE001
+            msg = record.getMessage()
+        self.rows.append({
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": "warn" if record.levelno == logging.WARNING else record.levelname.lower(),
+            "message": msg[:2000],
+        })
+        if len(self.rows) > self.MAX:
+            del self.rows[: len(self.rows) - self.MAX]
+
+    def drain(self) -> list[dict]:
+        rows, self.rows = self.rows[:200], self.rows[200:]
+        return rows
+
+
+def _ship_agent_logs(cloud: "CrmCloud", handler: _CrmLogHandler) -> None:
+    rows = handler.drain()
+    if not rows:
+        return
+    try:
+        cloud.agent_logs(rows)
+    except (httpx.HTTPError, ValueError):
+        # Put them back (front) so the next tick retries; the handler cap bounds it.
+        handler.rows[:0] = rows
+
+
 def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    crm_log = _CrmLogHandler()
+    if kind == "crm":
+        crm_log.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        logging.getLogger().addHandler(crm_log)
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
@@ -398,6 +445,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     while True:
         if kind == "crm":
             _poll_command(cloud)
+            _ship_agent_logs(cloud, crm_log)
         try:
             _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:
