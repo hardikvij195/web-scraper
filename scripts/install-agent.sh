@@ -73,6 +73,10 @@ done
 chmod 600 .env
 
 step "5/6 autostart + start"
+# Re-running the installer = "update + restart" for a machine whose agent predates remote
+# commands (2026-08-26): stop whatever is running the old code first.
+pkill -f "run-agent-loop.sh" 2>/dev/null || true
+pkill -f "webscraper agent" 2>/dev/null || true
 if [ "$(uname)" = "Darwin" ]; then
   bash scripts/install-agent-autostart-mac.sh
 else

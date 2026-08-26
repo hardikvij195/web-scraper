@@ -73,6 +73,12 @@ if ($CrmUrl) { $lines += "VITE_SUPABASE_URL=$CrmUrl" }
 Set-Content ".env" $lines -Encoding utf8
 
 Step "5/6 autostart (scheduled task) + start"
+# Re-running the installer is the "update + restart" path for a machine whose agent
+# predates remote commands (2026-08-26). An old loop/agent left alive would keep the
+# stale code (and the autostart guard would then refuse to start a new loop).
+Get-CimInstance Win32_Process | Where-Object {
+  ($_.CommandLine -like "*run-agent-loop.bat*") -or ($_.CommandLine -like "*webscraper agent*")
+} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
 powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\install-agent-autostart.ps1"
 
 Step "6/6 self-check"
