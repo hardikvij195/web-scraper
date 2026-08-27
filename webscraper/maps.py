@@ -132,7 +132,7 @@ def search_url(query: str, location: str | None, lang: str = "en",
 def zoom_for_radius_km(radius_km: float) -> float:
     """Zoom whose viewport (~1366 px wide) spans roughly 2×radius. z=15 ≈ 1 km, z=12 ≈ 10 km."""
     import math
-    radius_km = max(0.3, min(radius_km, 300))
+    radius_km = max(0.3, min(radius_km, 500))
     return max(8.0, min(17.0, 15.0 - math.log2(radius_km)))
 
 

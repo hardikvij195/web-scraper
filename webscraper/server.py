@@ -471,7 +471,7 @@ class JobIn(BaseModel):
     enrich: bool = True
     # "" / None = auto: per-lead country from the Maps address, job falls back to DEFAULT_COUNTRY
     country: Optional[str] = Field(None, max_length=2)
-    radius_km: Optional[float] = Field(None, ge=0.3, le=300)
+    radius_km: Optional[float] = Field(None, ge=0.3, le=500)
     window_start: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")   # local HH:MM
     window_end: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
     center_lat: Optional[float] = Field(None, ge=-90, le=90)    # pinned on the map picker
