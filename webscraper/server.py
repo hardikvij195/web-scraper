@@ -303,6 +303,11 @@ class Worker(threading.Thread):
                         store.update_job(job_id, message=f"{pfx}couldn't resolve the location on Maps — radius ignored")
                     elif kind == "tiles":
                         store.update_job(job_id, message=f"{pfx}radius split into {data['count']} search tiles…")
+                    elif kind == "tile_split":
+                        # W50: a tile that hit Maps' result cap is being re-searched as 4 finer tiles.
+                        store.log(job_id, "discovery",
+                                  f"tile {data['tile']} was full ({data['hits']} results at {data['from_km']} km) → "
+                                  f"split into {data['children']} tiles of {data['to_km']} km · {data['tiles']} tiles now")
                     elif kind == "links":
                         tile = f" · tile {data['tile']}/{data['tiles']}" if data.get("tiles", 1) > 1 else ""
                         store.update_job(job_id, links_found=agg["links_total"] + data["count"],

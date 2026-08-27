@@ -472,18 +472,32 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 # radius, tile the circle with ~2 km sub-searches and merge.
                 MAPS_PAGE_CAP = 110
                 tiling = bool(center and radius_km) and (unlimited or max_places > MAPS_PAGE_CAP)
+                # W50 — adaptive quadtree. A fixed 2 km grid capped at 150 tiles only ever
+                # covered the central ~22 km of a big circle. Now: a coarse pass over the WHOLE
+                # circle first (tile ≈ radius/8, ≥2 km), then any tile whose feed hit Maps'
+                # ~110-result cap is split into four half-size tiles and searched again, down
+                # to SPLIT_MIN_KM. Dense cities end up on fine tiles, empty land costs one search.
+                SPLIT_AT = MAPS_PAGE_CAP - 10     # a feed this full was probably truncated
+                SPLIT_MIN_KM = 0.5
+                MAX_STEPS = 6000                  # (tile, keyword) pairs — safety, the time budget rules in practice
                 if tiling:
-                    tile_km = min(float(radius_km), 2.0)
+                    tile_km = max(2.0, float(radius_km) / 8.0) if float(radius_km) > 16 else min(float(radius_km), 2.0)
                     centers = grid_centers(center, float(radius_km), tile_km)
-                    tile_zoom = zoom_for_radius_km(tile_km)
                     emit("tiles", {"count": len(centers)})
                 else:
                     centers = [center]
-                    tile_zoom = zoom
+                    tile_km = float(radius_km or 0)
                 # Centre-major, NOT query-major: each centre sweeps every keyword, so a
-                # truncated run still leaves every keyword represented.
-                steps = [(qy, c) for c in centers for qy in queries]
-                for s_i, (qy, c) in enumerate(steps, 1):
+                # truncated run still leaves every keyword represented. `steps` GROWS while
+                # we walk it (children of a saturated tile are appended), so index by hand.
+                steps: list[tuple[str, tuple[float, float], float]] = [(qy, c, tile_km) for c in centers for qy in queries]
+                tile_hits: dict[tuple[float, float], int] = {}
+                tiles_seen: set[tuple[float, float]] = set(centers)
+                s_i = 0
+                while s_i < len(steps):
+                    s_i += 1
+                    qy, c, tk = steps[s_i - 1]
+                    tile_zoom = zoom_for_radius_km(tk) if tiling else zoom
                     if stop_ev.is_set() or len(merged) >= limit:
                         break
                     # Stop collecting while there is still time left to actually open the
@@ -543,6 +557,29 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                         cstore.save_links(job_id, fresh)
                     emit("tile", {"tile": s_i, "tiles": len(steps), "added": len(fresh), "total": len(merged)})
                     emit("links", {"count": len(merged), "tile": s_i, "tiles": len(steps)})
+                    # W50 — split a saturated tile once its last keyword has run.
+                    if tiling:
+                        tile_hits[c] = max(tile_hits.get(c, 0), len(cards))
+                        last_for_tile = s_i == len(steps) or steps[s_i][1] != c
+                        if (last_for_tile and tile_hits[c] >= SPLIT_AT and tk > SPLIT_MIN_KM
+                                and len(steps) + 4 * len(queries) <= MAX_STEPS):
+                            import math as _m
+                            half = tk / 2.0
+                            off = tk * 0.4                                   # children cover the parent's 1.6×tile square
+                            kids = []
+                            for dx, dy in ((-off, -off), (-off, off), (off, -off), (off, off)):
+                                kc = (c[0] + dy / 111.0, c[1] + dx / (111.0 * max(0.2, _m.cos(_m.radians(c[0])))))
+                                if haversine_km(center[0], center[1], kc[0], kc[1]) > float(radius_km) + half:
+                                    continue
+                                if kc in tiles_seen:
+                                    continue
+                                tiles_seen.add(kc)
+                                kids.append(kc)
+                            if kids:
+                                steps.extend((q2, kc, half) for kc in kids for q2 in queries)
+                                emit("tiles", {"count": len(tiles_seen)})
+                                emit("tile_split", {"tile": s_i, "hits": tile_hits[c], "from_km": round(tk, 2),
+                                                    "to_km": round(half, 2), "children": len(kids), "tiles": len(tiles_seen)})
                     if len(steps) > 1:
                         time.sleep(random.uniform(1.5, 3.5))
             finally:
