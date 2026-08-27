@@ -97,4 +97,6 @@ Step "6/6 self-check"
 .\.venv\Scripts\python.exe -m webscraper doctor
 Write-Host ""
 Write-Host "Done. This machine is '$Device' in the CRM's Run-on list within ~10 s. Log: $Dir\data\agent.log" -ForegroundColor Green
-Write-Host "WhatsApp verification also needs: .venv\Scripts\python.exe -m webscraper wa-login main"
+Write-Host "WhatsApp verification (one-time QR scan): double-click wa-login.bat in $Dir" -ForegroundColor Yellow
+Write-Host "  or click 'Start WhatsApp session' on the CRM Lead Finder Setup tab for this device."
+Write-Host "  (Do NOT run bare 'python -m webscraper ...' - system Python lacks the deps; use .venv\Scripts\python.exe or the .bat)"
