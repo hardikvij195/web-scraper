@@ -575,8 +575,29 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 else:
                     result = "empty name"
             elif cmd["command"] == "checks":
-                # "Verify": re-run the self-check now instead of at the next 5-min mark.
-                ok, result = True, "self-check re-sent"
+                # "Re-check" (T220): run the self-check NOW and narrate every line to the
+                # device log, shipped before command_done so the CRM's re-check dialog
+                # can show them live. The report itself rides on the next poll (≤5 s).
+                from .healthcheck import run_checks
+                log.info("self-check requested by the CRM - running checks")
+                rep = run_checks()
+                rep["running_git"] = RUNNING_GIT
+                fine = 0
+                for name, c in rep.get("checks", {}).items():
+                    tag = "OK" if c["ok"] else ("opt" if c.get("optional") else "FAIL")
+                    fine += 1 if c["ok"] else 0
+                    line = f"check {name:<12} {tag:<4} {c['detail']}"
+                    if not c["ok"] and c.get("fix"):
+                        line += f"  -> {c['fix']}"
+                    (log.info if c["ok"] else log.warning)(line)
+                total = len(rep.get("checks", {}))
+                log.info("self-check done: %d/%d fine, agent %s (%s), %s, python %s, root %s",
+                         fine, total, rep.get("version"), rep.get("git"), rep.get("os"),
+                         rep.get("python"), rep.get("root"))
+                if _CRM_LOG:
+                    _ship_agent_logs(cloud, _CRM_LOG[0])
+                ok = True
+                result = f"self-check: {fine}/{total} fine" + ("" if rep.get("ok") else " (required check failing)")
             elif cmd["command"] == "update":
                 # "Update agent" (T209): pull main, reinstall deps, then exit — the
                 # supervisor loop (run-agent-loop.sh/.bat) restarts us on the new code.
