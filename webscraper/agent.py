@@ -764,6 +764,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 # checkout on main tracking origin/main first.
                 on_branch = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=ROOT,
                                            capture_output=True, text=True).returncode == 0
+                log.info("update: on %s (%s) - pulling origin/main", before, "branch" if on_branch else "detached HEAD, re-attaching to main first")
                 if not on_branch:
                     subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT,
                                    capture_output=True, text=True, timeout=120)
@@ -773,9 +774,15 @@ def _poll_command(cloud: "CrmCloud") -> None:
                                       capture_output=True, text=True, timeout=120)
                 if pull.returncode != 0:
                     result = f"git pull failed: {(pull.stderr or pull.stdout).strip()[:200]}"
+                    # W48: say it in the CRM log too - the dialog used to spin with nothing to read.
+                    log.error("update: %s", result)
                 else:
-                    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
-                                   cwd=ROOT, capture_output=True, text=True, timeout=600)
+                    log.info("update: pulled - %s", (pull.stdout or "").strip().splitlines()[-1][:120] if pull.stdout.strip() else "up to date")
+                    log.info("update: pip install -r requirements.txt ...")
+                    pip = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+                                         cwd=ROOT, capture_output=True, text=True, timeout=600)
+                    if pip.returncode != 0:
+                        log.warning("update: pip install reported %s", (pip.stderr or pip.stdout).strip()[-200:])
                     after = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
                                            capture_output=True, text=True).stdout.strip()
                     ok, result = True, (f"already on {after}" if after == before
@@ -796,11 +803,17 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 _os._exit(0)
             else:
                 result = f"unknown command {cmd['command']}"
+                log.error("command %s: unknown on agent %s - Update agent first", cmd["command"], AGENT_VERSION if 'AGENT_VERSION' in globals() else '?')
         except Exception as e:                                    # noqa: BLE001
-            log.warning("command %s failed: %s", cmd.get("command"), e)
+            log.error("command %s failed: %s", cmd.get("command"), e)
             result = str(e)[:300]
         finally:
             cloud._checks_sent_at = 0.0          # re-send the self-check on the next tick
+            if not ok and _CRM_LOG:
+                try:
+                    _ship_agent_logs(cloud, _CRM_LOG[0])   # the failure line lands before 'failed'
+                except Exception:                               # noqa: BLE001
+                    pass
             try:
                 cloud.command_done(int(cmd["id"]), ok, result)
             except httpx.HTTPError as e:
