@@ -139,7 +139,19 @@ if ($alive -and ($tail -join "`n") -match "agent up") {
 Write-Host "Done. This machine is '$Device' in the CRM's Run-on list within ~10 s. Log: $logPath" -ForegroundColor Green
 # 7/7 - WhatsApp link, INLINE, so the one-time QR scan happens before the window closes.
 # Skipped when this machine already holds a linked account (re-runs/updates).
-$linked = & .\.venv\Scripts\python.exe -c "from webscraper.store import Store; from webscraper.wa_verify import profile_dir; print(int(any(not a['disabled'] and (profile_dir(a['name'])/'Default').exists() for a in Store().list_wa_accounts())))" 2>$null
+# W45: under $ErrorActionPreference=Stop any stderr from python.exe (a traceback - e.g.
+# "database is locked" while the freshly started agent holds data/leads.db) becomes a
+# terminating NativeCommandError, which killed the installer HERE on a Dell Vostro on
+# 2026-08-27 - after "Done" but before the QR step, so the machine never linked WhatsApp.
+# Treat any failure as "not linked" and carry on to the QR scan.
+$linked = "0"
+try {
+  $prevEap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+  $probe = & .\.venv\Scripts\python.exe -c "from webscraper.store import Store; from webscraper.wa_verify import profile_dir; print(int(any(not a['disabled'] and (profile_dir(a['name'])/'Default').exists() for a in Store().list_wa_accounts())))" 2>&1
+  $ErrorActionPreference = $prevEap
+  $linked = ($probe | Where-Object { $_ -is [string] -and $_.Trim() -match '^[01]$' } | Select-Object -Last 1)
+  if (-not $linked) { $linked = "0" }
+} catch { $ErrorActionPreference = $prevEap; $linked = "0" }
 if ($SkipWaLogin) {
   Write-Host "WhatsApp link skipped (-SkipWaLogin). Later: double-click wa-login.bat in $Dir" -ForegroundColor Yellow
 } elseif ("$linked".Trim() -eq "1") {
