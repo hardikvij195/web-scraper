@@ -120,7 +120,24 @@ fi
 step "6/7 self-check"
 .venv/bin/python -m webscraper doctor || true
 echo
-echo "Done. This machine is '$DEVICE' in the CRM's Run-on list within ~10 s. Log: $DIR/data/agent.log"
+# Prove the agent is alive before saying "Done" (2026-08-27): wait for the loop to start
+# it, then show the log tail — "agent up" means the CRM sees this machine within ~10 s.
+echo "waiting for the agent to start..."
+ALIVE=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  sleep 5
+  if pgrep -f "webscraper agent" >/dev/null 2>&1; then ALIVE=1; break; fi
+done
+LOG="$DIR/data/agent.log"
+if [ "$ALIVE" = "1" ] && [ -f "$LOG" ] && tail -n 12 "$LOG" | grep -q "agent up"; then
+  echo "agent is running and talking to the CRM."
+elif [ "$ALIVE" = "1" ]; then
+  echo "agent process is running; last log lines (look for errors):"; [ -f "$LOG" ] && tail -n 12 "$LOG" | sed 's/^/  /'
+else
+  echo "agent did NOT start. Last log lines:"; [ -f "$LOG" ] && tail -n 12 "$LOG" | sed 's/^/  /'
+  echo "Try: cd '$DIR' && ./run-agent.sh to see the error, or send $LOG"
+fi
+echo "Done. This machine is '$DEVICE' in the CRM's Run-on list within ~10 s. Log: $LOG"
 # 7/7 - WhatsApp link, inline, so the one-time QR scan happens before the terminal closes.
 LINKED=$(.venv/bin/python -c "from webscraper.store import Store; from webscraper.wa_verify import profile_dir; print(int(any(not a['disabled'] and (profile_dir(a['name'])/'Default').exists() for a in Store().list_wa_accounts())))" 2>/dev/null || echo 0)
 if [ "${SKIP_WA_LOGIN:-0}" = "1" ]; then

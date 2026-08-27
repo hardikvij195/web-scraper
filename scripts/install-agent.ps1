@@ -115,7 +115,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\install-agent-autos
 Step "6/7 self-check"
 .\.venv\Scripts\python.exe -m webscraper doctor
 Write-Host ""
-Write-Host "Done. This machine is '$Device' in the CRM's Run-on list within ~10 s. Log: $Dir\data\agent.log" -ForegroundColor Green
+# Prove the agent is actually alive before saying "Done" (2026-08-27: an install that
+# reported 6/6 OK never appeared in the CRM). Wait for the loop to start it, then show
+# what the log says — "agent up" means the CRM sees this machine within ~10 s.
+Write-Host "waiting for the agent to start..." -ForegroundColor Cyan
+$alive = $false
+for ($i = 0; $i -lt 12 -and -not $alive; $i++) {
+  Start-Sleep -Seconds 5
+  $alive = [bool](Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*webscraper agent*" })
+}
+$logPath = Join-Path $Dir "data\agent.log"
+$tail = if (Test-Path $logPath) { Get-Content $logPath -Tail 12 } else { @() }
+if ($alive -and ($tail -join "`n") -match "agent up") {
+  Write-Host "agent is running and talking to the CRM." -ForegroundColor Green
+} elseif ($alive) {
+  Write-Host "agent process is running; last log lines below (look for errors):" -ForegroundColor Yellow
+  $tail | ForEach-Object { Write-Host "  $_" }
+} else {
+  Write-Host "agent did NOT start. Last log lines:" -ForegroundColor Red
+  $tail | ForEach-Object { Write-Host "  $_" }
+  Write-Host "Try: double-click run-agent.bat in $Dir to see the error, or send $logPath" -ForegroundColor Red
+}
+Write-Host "Done. This machine is '$Device' in the CRM's Run-on list within ~10 s. Log: $logPath" -ForegroundColor Green
 # 7/7 - WhatsApp link, INLINE, so the one-time QR scan happens before the window closes.
 # Skipped when this machine already holds a linked account (re-runs/updates).
 $linked = & .\.venv\Scripts\python.exe -c "from webscraper.store import Store; from webscraper.wa_verify import profile_dir; print(int(any(not a['disabled'] and (profile_dir(a['name'])/'Default').exists() for a in Store().list_wa_accounts())))" 2>$null

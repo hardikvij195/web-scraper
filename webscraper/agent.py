@@ -67,6 +67,85 @@ def _device_name_path():
     return ROOT / "data" / "device_name"
 
 
+def _inspect_folder(raw: str) -> dict:
+    """`verify_folder` (T221): what a path on THIS machine is, before the CRM asks us to
+    move there. {'ok': bool, 'path': str, 'text': str} — text is what the card shows."""
+    import os
+    from pathlib import Path
+    from webscraper.config import ROOT
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s:
+        return {"ok": False, "path": "", "text": "empty path"}
+    p = Path(os.path.expandvars(os.path.expanduser(s)))
+    try:
+        p = p.resolve()
+    except OSError:
+        p = p.absolute()
+    if p == ROOT:
+        return {"ok": True, "path": str(p), "text": "this is the current folder — nothing to move"}
+    if p.is_file():
+        return {"ok": False, "path": str(p), "text": "that is a file, not a folder"}
+    if p.is_dir():
+        if (p / "webscraper" / "agent.py").exists():
+            git = "git checkout" if (p / ".git").exists() else "no .git (updates by re-install only)"
+            venv = "venv present" if (p / ".venv").exists() else "no venv yet"
+            return {"ok": True, "path": str(p), "text": f"holds the scraper ({git}, {venv}) — the agent will run from here"}
+        try:
+            empty = not any(p.iterdir())
+        except OSError as e:
+            return {"ok": False, "path": str(p), "text": f"cannot read it: {e}"}
+        if empty:
+            return {"ok": True, "path": str(p), "text": "empty folder — the scraper will be cloned into it"}
+        return {"ok": False, "path": str(p), "text": "exists, is not empty, and is not the scraper — pick another folder or a new sub-folder"}
+    parent = p.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    if not parent.is_dir():
+        return {"ok": False, "path": str(p), "text": f"no such drive/folder: {parent}"}
+    if not os.access(parent, os.W_OK):
+        return {"ok": False, "path": str(p), "text": f"cannot create it — no write access to {parent}"}
+    return {"ok": True, "path": str(p), "text": f"does not exist yet — will be created under {parent}"}
+
+
+def _relocate(target: str, device: str) -> str:
+    """`relocate` (T221): move this agent to `target` by running our own installer with
+    -Dir/--dir. The installer pulls-or-clones there, builds the venv, writes .env, re-points
+    the autostart (task / launchd) at the new folder and starts it — and kills THIS process
+    on the way (step 5), so the caller must command_done BEFORE calling this. data/ (SQLite,
+    device_name, WhatsApp profiles) is copied first when the target has none, so linked
+    WhatsApp sessions survive the move. The old folder is left in place, untouched."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+    from webscraper.config import ROOT
+    dst = Path(target)
+    dst.mkdir(parents=True, exist_ok=True)
+    if (ROOT / "data").is_dir() and not (dst / "data").exists():
+        shutil.copytree(ROOT / "data", dst / "data",
+                        ignore=shutil.ignore_patterns("*.log", "*.log.*", "relocate.log"))
+    token = os.getenv("CRM_AGENT_TOKEN") or ""
+    crm_url = os.getenv("VITE_SUPABASE_URL") or ""
+    (ROOT / "data").mkdir(exist_ok=True)
+    out = open(ROOT / "data" / "relocate.log", "ab")
+    if sys.platform == "win32":
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+               "-File", str(ROOT / "scripts" / "install-agent.ps1"),
+               "-Token", token, "-Device", device, "-Dir", str(dst), "-SkipWaLogin"]
+        if crm_url:
+            cmd += ["-CrmUrl", crm_url]
+        flags = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=subprocess.STDOUT, creationflags=flags)
+    else:
+        cmd = ["bash", str(ROOT / "scripts" / "install-agent.sh"),
+               "--token", token, "--device", device, "--dir", str(dst), "--skip-wa-login"]
+        if crm_url:
+            cmd += ["--crm-url", crm_url]
+        subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    return f"moving to {dst} — installer running there (log: {ROOT / 'data' / 'relocate.log'}); back online in a few minutes"
+
+
 def _remember_device_name(name: str) -> None:
     """Persist the label so it survives reboots — see _device_name."""
     try:
@@ -574,6 +653,29 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     ok, result = True, f"now reporting as {new}"
                 else:
                     result = "empty name"
+            elif cmd["command"] == "verify_folder":
+                v = _inspect_folder(cmd.get("arg") or "")
+                log.info("verify folder %s: %s", v["path"] or "?", v["text"])
+                ok, result = v["ok"], f"{v['path']}: {v['text']}" if v["path"] else v["text"]
+            elif cmd["command"] == "relocate":
+                v = _inspect_folder(cmd.get("arg") or "")
+                if not v["ok"]:
+                    result = f"{v['path']}: {v['text']}" if v["path"] else v["text"]
+                elif "current folder" in v["text"]:
+                    ok, result = True, "already running from that folder"
+                else:
+                    log.info("CRM asked to relocate to %s (%s)", v["path"], v["text"])
+                    result = _relocate(v["path"], DEVICE_NAME)
+                    log.info("relocate: %s", result)
+                    ok = True
+                    cloud.command_done(int(cmd["id"]), True, result)
+                    if _CRM_LOG:
+                        _ship_agent_logs(cloud, _CRM_LOG[0])
+                    # The installer kills this process in its step 5 anyway; leave cleanly
+                    # now so the loop in the OLD folder does not restart us meanwhile.
+                    time.sleep(2)
+                    import os as _os
+                    _os._exit(0)
             elif cmd["command"] == "checks":
                 # "Re-check" (T220): run the self-check NOW and narrate every line to the
                 # device log, shipped before command_done so the CRM's re-check dialog

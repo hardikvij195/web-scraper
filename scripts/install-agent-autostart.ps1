@@ -40,3 +40,8 @@ Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger `
   -Description 'Keeps the HVT CRM Lead Finder scraper agent running so jobs created in the CRM start on their own.' | Out-Null
 
 Write-Output "registered: $name"
+# Registering does not run it: the "Once at now" trigger can already be in the past by
+# the time the task exists, so the first fire could be a 10-minute tick — or the next
+# logon (the ASUS install of 2026-08-27 never showed up in the CRM). Start it now.
+Start-ScheduledTask -TaskName $name
+Write-Output "started: $name"
