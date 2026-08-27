@@ -417,6 +417,51 @@ def _ship_logs(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
     store.update_job(job_id, logs_synced_upto=int(rows[-1]["id"]))
 
 
+#: A claimed job the worker has not started in this long is failed with a reason (user
+#: rule 2026-08-27: "if worker does not start in 5 mins, stop the job and give reason").
+START_GRACE_SEC = 5 * 60
+
+
+def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> None:
+    """Job #32 on the Dell Vostro (2026-08-27) sat at 'queued' for 11 minutes: the agent
+    claimed it, the heartbeat stayed green, and nothing ever ran. Here every mirrored
+    job still on 'queued' after START_GRACE_SEC is failed locally + in the cloud with
+    the most specific reason we can tell, so the CRM shows a red tag instead of
+    'running' for ever."""
+    from datetime import datetime, timezone
+    rows = store.conn.execute(
+        "SELECT id, cloud_id, created_at FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
+        "AND phase='queued'", (kind,)).fetchall()
+    if not rows:
+        return
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        try:
+            created = datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        age = (now - created).total_seconds()
+        if age < START_GRACE_SEC:
+            continue
+        worker = getattr(srv, "worker", None)
+        if worker is not None and not worker.is_alive():
+            why = "the agent's worker thread is dead"
+        elif worker is not None and worker.current_job not in (None, int(r["id"])):
+            why = f"the worker is still busy with local job #{worker.current_job}"
+        else:
+            why = "the worker never picked it up (browser launch or SQLite lock hung)"
+        reason = (f"did not start within {START_GRACE_SEC // 60} min — {why}. "
+                  f"Restart the agent on this machine (Update agent / re-run the installer), then Re-run.")
+        store.update_job(int(r["id"]), phase="error", message=reason)
+        log.error("job #%s (cloud #%s) %s", r["id"], r["cloud_id"], reason)
+        try:
+            cloud.done(int(r["cloud_id"]), "error", reason[:300])
+        except httpx.HTTPError as e:
+            log.warning("could not report the unstarted job to the cloud: %s", e)
+
+
 def _requeue_orphans(store: Store, kind: str) -> int:
     """Put jobs the last agent died mid-run back on the Worker's queue.
 
@@ -593,6 +638,10 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             _poll_command(cloud)
             _ship_agent_logs(cloud, crm_log)
         try:
+            _fail_unstarted(cloud, store, kind, srv)
+        except Exception as e:                                    # noqa: BLE001
+            log.warning("start-watchdog: %s", e)
+        try:
             _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:
             log.warning("cloud unreachable: %s", e)
@@ -709,6 +758,17 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 from webscraper.config import ROOT
                 before = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
                                         capture_output=True, text=True).stdout.strip()
+                # W47: a detached HEAD (submodule checkout, or a clone that ended up off
+                # its branch — the Dell Vostro, 2026-08-27) makes `git pull` refuse with
+                # "You are not currently on a branch". Same cure as the installer: put the
+                # checkout on main tracking origin/main first.
+                on_branch = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=ROOT,
+                                           capture_output=True, text=True).returncode == 0
+                if not on_branch:
+                    subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT,
+                                   capture_output=True, text=True, timeout=120)
+                    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=ROOT,
+                                   capture_output=True, text=True, timeout=60)
                 pull = subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT,
                                       capture_output=True, text=True, timeout=120)
                 if pull.returncode != 0:
