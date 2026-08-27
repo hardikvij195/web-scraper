@@ -412,6 +412,7 @@ def _launch_kwargs(profile_dir: Path, headless: bool) -> dict:
 
 
 def _open_context(pw, launch_kwargs: dict):
+    log.info("launching %s Chrome (profile %s)…", "headless" if launch_kwargs.get("headless") else "headed", launch_kwargs.get("user_data_dir"))
     c = pw.chromium.launch_persistent_context(**launch_kwargs)
     # images/fonts/media add nothing we read — skipping them cuts bandwidth ~80%
     c.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),

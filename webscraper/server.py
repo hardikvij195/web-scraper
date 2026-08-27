@@ -183,6 +183,8 @@ class Worker(threading.Thread):
                 continue
             job_id = int(job["id"])
             self.current_job = job_id
+            # W46: a job that never logs its first tile is invisible from the CRM otherwise.
+            log.info("job #%s starting: %r near %r (headless=%s)", job_id, job["query"][:60], job["location"], bool(job["headless"]))
             # ── time budget ─────────────────────────────────────────────────────────
             # `max_minutes` is the GOOGLE MAPS cap, not the whole job (settings.
             # maps_budget_frac defaults to 1.0): "search leads on google maps for 30 mins

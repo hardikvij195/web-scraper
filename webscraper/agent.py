@@ -725,6 +725,15 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
                     import os as _os
                     _os._exit(0)
+            elif cmd["command"] == "restart":
+                # W46: plain restart from the CRM — no pull. Same exit path as update; the
+                # supervisor loop brings us back and _requeue_orphans resumes the job.
+                ok, result = True, "restarting"
+                log.info("restart requested by the CRM")
+                cloud.command_done(int(cmd["id"]), True, result)
+                _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
+                import os as _os
+                _os._exit(0)
             else:
                 result = f"unknown command {cmd['command']}"
         except Exception as e:                                    # noqa: BLE001
