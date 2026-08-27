@@ -6,7 +6,9 @@
 # Idempotent: re-running updates the checkout, deps and .env, then restarts the agent.
 set -euo pipefail
 
-TOKEN=""; DEVICE=""; DIR="$HOME/hvt-lead-finder-agent"; CRM_URL=""
+# DIR empty = auto-detect: an earlier install (launchd plist's WorkingDirectory), else a
+# checkout holding webscraper/agent.py at/above the current folder, else ~/hvt-lead-finder-agent.
+TOKEN=""; DEVICE=""; DIR=""; CRM_URL=""
 REPO="${LEAD_FINDER_AGENT_REPO:-https://github.com/hardikvij195/web-scraper.git}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -17,15 +19,32 @@ while [ $# -gt 0 ]; do
     # The CRM's Supabase URL. A CLONED tenant CRM lives on its own project; without this
     # the agent would talk to HVT's (the built-in default) and never see the tenant's jobs.
     --crm-url) CRM_URL="$2"; shift 2;;
+    --skip-wa-login) SKIP_WA_LOGIN=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
 [ -n "$TOKEN" ] || { echo "need --token wsk_… (CRM → Lead Finder → Setup → Agent tokens)" >&2; exit 2; }
 DEVICE="${DEVICE:-$(scutil --get ComputerName 2>/dev/null || hostname)}"
+is_checkout() { [ -n "$1" ] && [ -f "$1/webscraper/agent.py" ]; }
+if [ -z "$DIR" ]; then
+  PLIST="$HOME/Library/LaunchAgents/app.hvtechnologies.leadfinder-agent.plist"
+  if [ -f "$PLIST" ]; then
+    WD=$(sed -n 's|.*<key>WorkingDirectory</key><string>\(.*\)</string>.*||p' "$PLIST" | head -1)
+    if is_checkout "$WD"; then DIR="$WD"; echo "using the existing install: $DIR"; fi
+  fi
+fi
+if [ -z "$DIR" ]; then
+  D="$PWD"
+  while [ -n "$D" ] && [ "$D" != "/" ]; do
+    if is_checkout "$D"; then DIR="$D"; echo "using the checkout found at: $DIR"; break; fi
+    D=$(dirname "$D")
+  done
+fi
+[ -n "$DIR" ] || DIR="$HOME/hvt-lead-finder-agent"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
-step "1/6 tools (git, python3.11+)"
+step "1/7 tools (git, python3.11+)"
 if ! command -v git >/dev/null 2>&1; then
   if [ "$(uname)" = "Darwin" ]; then
     echo "git missing — installing Xcode Command Line Tools (a dialog opens; re-run this installer after it finishes)"
@@ -46,7 +65,7 @@ if [ -z "$PY" ]; then
 fi
 echo "using $($PY --version) at $(command -v "$PY")"
 
-step "2/6 code → $DIR"
+step "2/7 code → $DIR"
 # An existing checkout is PULLED, never re-cloned. `.git` is a FILE inside a mono-repo
 # submodule (hv-technologies/web-scraper), so test with git itself, not `-d .git`
 # (2026-08-26: the Mac hit "destination path already exists and is not an empty directory").
@@ -68,13 +87,13 @@ else
 fi
 cd "$DIR"
 
-step "3/6 python deps"
+step "3/7 python deps"
 [ -x .venv/bin/python ] || "$PY" -m venv .venv
 .venv/bin/python -m pip install --quiet --upgrade pip
 .venv/bin/python -m pip install --quiet -r requirements.txt
 .venv/bin/python -m playwright install chromium
 
-step "4/6 .env"
+step "4/7 .env"
 touch .env
 # replace-or-append each key; keep everything else the user put there
 for kv in "CRM_AGENT_TOKEN=$TOKEN" "LEAD_FINDER_DEVICE=$DEVICE" ${CRM_URL:+"VITE_SUPABASE_URL=$CRM_URL"}; do
@@ -86,7 +105,7 @@ for kv in "CRM_AGENT_TOKEN=$TOKEN" "LEAD_FINDER_DEVICE=$DEVICE" ${CRM_URL:+"VITE
 done
 chmod 600 .env
 
-step "5/6 autostart + start"
+step "5/7 autostart + start"
 # Re-running the installer = "update + restart" for a machine whose agent predates remote
 # commands (2026-08-26): stop whatever is running the old code first.
 pkill -f "run-agent-loop.sh" 2>/dev/null || true
@@ -98,8 +117,18 @@ else
   echo "started run-agent-loop.sh in the background (no launchd/systemd on this OS — add one if you need boot start)"
 fi
 
-step "6/6 self-check"
+step "6/7 self-check"
 .venv/bin/python -m webscraper doctor || true
 echo
 echo "Done. This machine is '$DEVICE' in the CRM's Run-on list within ~10 s. Log: $DIR/data/agent.log"
-echo "WhatsApp verification also needs: cd '$DIR' && .venv/bin/python -m webscraper wa-login main"
+# 7/7 - WhatsApp link, inline, so the one-time QR scan happens before the terminal closes.
+LINKED=$(.venv/bin/python -c "from webscraper.store import Store; from webscraper.wa_verify import profile_dir; print(int(any(not a['disabled'] and (profile_dir(a['name'])/'Default').exists() for a in Store().list_wa_accounts())))" 2>/dev/null || echo 0)
+if [ "${SKIP_WA_LOGIN:-0}" = "1" ]; then
+  echo "WhatsApp link skipped (--skip-wa-login). Later: cd '$DIR' && .venv/bin/python -m webscraper wa-login main"
+elif [ "$LINKED" = "1" ]; then
+  echo "WhatsApp already linked on this machine - skipping the QR step."
+else
+  step "7/7 WhatsApp link (one-time QR scan)"
+  echo "A WhatsApp Web window opens now. On the phone: WhatsApp > Linked devices > Link a device > scan the QR (2 min)."
+  .venv/bin/python -m webscraper wa-login main || echo "wa-login did not finish - re-run any time: cd '$DIR' && .venv/bin/python -m webscraper wa-login main"
+fi

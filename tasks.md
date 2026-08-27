@@ -13,6 +13,12 @@
 
 ---
 
+## Session 2026-08-27 — Vivobook install: wrong python, closing window, wrong folder
+
+| # | What | State |
+|---|---|---|
+| **W42** | Vivobook (`3 - ASUS`) "could not install": the installer had in fact finished 6/6 OK, but (a) the final hint said run `python -m webscraper wa-login main` → user ran bare system `python` → `ModuleNotFoundError: No module named 'typer'`; (b) "Press any key" closed the window before any WhatsApp link; (c) a run without `-Dir` clones a second copy to `%USERPROFILE%\hvt-lead-finder-agent` instead of using the mono-repo checkout already on disk | `[x]` 2026-08-27 — both installers gained **step 7/7: `wa-login main` runs INLINE** (headed QR window, 2 min) unless a linked account already exists on the machine (`wa_accounts` row + profile `Default/`); opt out with `-SkipWaLogin` / `--skip-wa-login`. Empty `-Dir` now **auto-detects**: the existing scheduled task's / launchd plist's working dir → a checkout holding `webscraper/agent.py` at or above cwd or the script → only then the `~/hvt-lead-finder-agent` default. Final hint points at `wa-login.bat` / the CRM "Start WhatsApp session" button and warns against bare `python`. Installer-only change, `VERSION` unchanged (1.0.2). |
+
 ## Session 2026-08-26 — installer 404 → repo PUBLIC; Mac pip fix; CRM-driven wa-login; honest AI-research failures
 
 | # | What | State |
