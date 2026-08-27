@@ -9,7 +9,7 @@ param(
   [Parameter(Mandatory = $true)][string]$Token,
   [string]$Device = "",
   # Empty = auto-detect: an earlier install (the scheduled task's folder), else a checkout
-  # containing webscrapergent.py at/above the current folder or this script, else
+  # containing webscraper\agent.py at/above the current folder or this script, else
   # %USERPROFILE%\hvt-lead-finder-agent. Pass -Dir to force a folder.
   [string]$Dir = "",
   [string]$Repo = "https://github.com/hardikvij195/web-scraper.git",
@@ -21,7 +21,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 if (-not $Device) { $Device = $env:COMPUTERNAME }
-function Is-Checkout($d) { $d -and (Test-Path (Join-Path $d "webscrapergent.py")) }
+function Is-Checkout($d) { $d -and (Test-Path (Join-Path $d "webscraper\agent.py")) }
 if (-not $Dir) {
   $task = Get-ScheduledTask -TaskName "HVT Lead Finder Agent" -ErrorAction SilentlyContinue
   $wd = if ($task) { $task.Actions[0].WorkingDirectory } else { $null }

@@ -29,7 +29,7 @@ is_checkout() { [ -n "$1" ] && [ -f "$1/webscraper/agent.py" ]; }
 if [ -z "$DIR" ]; then
   PLIST="$HOME/Library/LaunchAgents/app.hvtechnologies.leadfinder-agent.plist"
   if [ -f "$PLIST" ]; then
-    WD=$(sed -n 's|.*<key>WorkingDirectory</key><string>\(.*\)</string>.*||p' "$PLIST" | head -1)
+    WD=$(sed -n 's|.*<key>WorkingDirectory</key><string>\(.*\)</string>.*|\1|p' "$PLIST" | head -1)
     if is_checkout "$WD"; then DIR="$WD"; echo "using the existing install: $DIR"; fi
   fi
 fi
