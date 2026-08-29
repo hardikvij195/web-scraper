@@ -86,7 +86,7 @@ def _enrich_line(r: dict, status: str, f: dict) -> str:
 
 
 #: Where a checked number came from, as the log line says it (W26).
-WA_SOURCE_LABEL = {"maps": "maps", "wa_link": "whatsapp link", "site": "website"}
+WA_SOURCE_LABEL = {"maps": "maps", "wa_link": "whatsapp link", "site": "website", "leads": "CRM lead"}
 
 
 def _wa_line(r: dict, status: str, num: str | None, source: str | None = None) -> str:

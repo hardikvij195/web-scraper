@@ -823,9 +823,15 @@ def _poll_command(cloud: "CrmCloud") -> None:
     _cmd_thread.start()
 
 
-def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
+def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool = False) -> None:
     """Verify an existing CRM job's numbers on WhatsApp and sync wa_verified back.
-    No scraping/enriching — operates purely on the job's already-synced results."""
+    No scraping/enriching — operates purely on the job's already-synced results.
+
+    W51 / CRM T263 — `leads_verify`: the job targets CRM *leads*, not its own results. The
+    Edge Function's `results` already returns one candidate per lead (`number`, `source=
+    'leads'`, place_key = the lead id) and has applied the skip / force-recheck rule, so
+    there is no `wa_candidates` expansion and no local skip here; `set_wa` writes the
+    verdict onto the lead. Everything else (progress, lanes, logs) is the same lane."""
     from webscraper import wa_verify
     try:
         rows = cloud.results(jid)
@@ -833,15 +839,22 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         log.warning("re-verify #%s: could not fetch results: %s", jid, e)
         cloud.done(jid, "error", "could not fetch results")
         return
-    # Only rows with a number AND not already decided — a 'yes'/'no' is final, re-checking
-    # it wastes the daily cap. 'unknown'/null are re-tried. W26: every candidate number of
-    # a place is checked (Maps phone + WhatsApp link — the CRM `results` action does not
-    # carry `site_phones`, so website numbers are only covered by the live job, not here),
-    # and the unit of progress is NUMBERS.
     from webscraper.store import aggregate_wa, wa_candidates
-    targets = [r for r in rows if wa_candidates(r) and r.get("wa_verified") not in ("yes", "no")]
-    already = sum(1 for r in rows if r.get("wa_verified") in ("yes", "no"))
-    total = sum(len(wa_candidates(r)) for r in targets)
+    if leads_verify:
+        # One number per lead, decided server-side. A lead without a number is not a target.
+        targets = [dict(r, source=r.get("source") or "leads") for r in rows if r.get("number")]
+        already = 0
+        total = len(targets)
+        log.info("leads-verify #%s: %d lead(s) to check on WhatsApp", jid, total)
+    else:
+        # Only rows with a number AND not already decided — a 'yes'/'no' is final, re-checking
+        # it wastes the daily cap. 'unknown'/null are re-tried. W26: every candidate number of
+        # a place is checked (Maps phone + WhatsApp link — the CRM `results` action does not
+        # carry `site_phones`, so website numbers are only covered by the live job, not here),
+        # and the unit of progress is NUMBERS.
+        targets = [r for r in rows if wa_candidates(r) and r.get("wa_verified") not in ("yes", "no")]
+        already = sum(1 for r in rows if r.get("wa_verified") in ("yes", "no"))
+        total = sum(len(wa_candidates(r)) for r in targets)
     src_by_pk = {r["place_key"]: r.get("whatsapp_source") for r in targets}
     if already:
         log.info("re-verify #%s: skipping %d already-verified", jid, already)
@@ -905,7 +918,8 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
             except Exception:                                     # noqa: BLE001
                 pass
 
-    _jlog(f"re-verify: checking {total} number(s) on WhatsApp — accounts: "
+    _jlog((f"leads-verify: checking {total} CRM lead(s) on WhatsApp" if leads_verify
+           else f"re-verify: checking {total} number(s) on WhatsApp") + " — accounts: "
           f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
           + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
 
@@ -928,10 +942,12 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         # 'unverified' guess). Every number a miss on a guessed number -> clear it.
         # 'assumed_mobile' is the retired spelling of 'unverified' (2026-08-23); still
         # accepted here so rows written before the migration still clear correctly.
+        # A CRM lead (leads_verify) keeps its number on a miss — the Edge Function only
+        # records the verdict; a lead's phone is never a scraper guess to be cleared.
         if agg == "yes" and wa_num:
             upd["whatsapp_number"] = wa_num
             upd["whatsapp_source"] = "verified"
-        elif agg == "no" and src_by_pk.get(pk) in ("unverified", "assumed_mobile"):
+        elif agg == "no" and not leads_verify and src_by_pk.get(pk) in ("unverified", "assumed_mobile"):
             upd["whatsapp_number"] = None
             upd["whatsapp_source"] = None
         # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
@@ -966,8 +982,9 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int) -> None:
         log.warning("re-verify #%s: final progress failed: %s", jid, e)
     msg = (f"WhatsApp daily cap reached ({settings.wa_daily_cap}/account/day) — {n_checked} numbers checked, "
            f"{left} left; re-run tomorrow or add another WhatsApp account (wa-login)") if capped else None
-    _jlog(f"re-verify finished: {n_checked} numbers checked across {len(collected)} lead(s), {left} left"
-          + (" — daily cap hit" if capped else ""), "warn" if capped else "info")
+    _jlog(f"{'leads-verify' if leads_verify else 're-verify'} finished: {n_checked} numbers checked across "
+          f"{len(collected)} lead(s), {left} left" + (" — daily cap hit" if capped else ""),
+          "warn" if capped else "info")
     cloud.done(jid, "done", msg)
     log.info("re-verify #%s: %d numbers checked%s", jid, n_checked, " (daily cap hit)" if capped else "")
 
@@ -1033,7 +1050,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         if kind == "crm" and cj.get("wa_verify_only"):
             if cloud.claim(cj["id"]) is None:
                 continue
-            _reverify_wa(cloud, store, cj["id"])
+            # W51: `leads_verify` = the CRM's own leads, not this job's results.
+            _reverify_wa(cloud, store, cj["id"], leads_verify=bool(cj.get("leads_verify")))
             continue
         if cj["id"] in mirrored:
             # ALREADY MIRRORED — but the CRM may have queued it AGAIN. "Re-enrich" and
