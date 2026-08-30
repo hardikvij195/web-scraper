@@ -2,7 +2,7 @@
 
 `[x]` done · `[~]` in progress · `[ ]` todo. Newest on top.
 
-> **State 2026-08-25: W26 done (uncommitted)** — discovery is a collector + opener pair, WhatsApp checks every number; 117 tests pass. Earlier: **W0-W10 are all done** (W11 open — a pre-existing SaaS-sync break found by the live smoke). Remote is `hardikvij195/web-scraper`, HEAD
+> **State 2026-08-25: W26 done (uncommitted)** — discovery is a collector + opener pair, WhatsApp checks every number; 117 tests pass. Earlier: **W0-W10 are all done** (W11 closed 2026-08-30 — SaaS columns added). Remote is `hardikvij195/web-scraper`, HEAD
 > `a544ae7`, tree clean, 0 unpushed. Cross-repo backlog index:
 > `../hvt-ai-crm-live/tasks.md` — the items below are the agent half of its **T136**
 > (closed); the CRM half (UI, ETA display, job phases in the DB) lives there.
@@ -522,7 +522,7 @@ arbitrarily broken. New `places.enrich_error` (`http_403` | `http_<code>` | `dns
 browser**. httpx stays the fast path - a browser is ~15x slower per site and that speed is
 why enrichment keeps up with discovery.
 
-### W11 - SaaS lead sync is broken on a missing column  [ ]  (pre-existing, found 2026-08-23)
+### W11 - SaaS lead sync is broken on a missing column  [x]  (found 2026-08-23, FIXED 2026-08-30)
 Surfaced by the live lane smoke, NOT caused by the lane work:
 `supabase push 400 {"code":"PGRST204", "message":"Could not find the 'wa_verified' column of
 'web_scraper_leads' in the schema cache"}`. `wa_verified` was added to the local `places`
@@ -533,6 +533,11 @@ table** - `grep -rn wa_verified supabase_migrations/` returns nothing. So every
 `web-scraper-leads.vercel.app` product is. Fix = a migration adding `wa_verified`
 (plus `whatsapp_source`, `enrich_error`, and the other columns added since) to
 `web_scraper_leads`, applied against Supabase `gfgkcnjxvxlusplwmvae`.
+**FIXED 2026-08-30:** `supabase_migrations/004_leads_wa_columns.sql` adds `wa_verified` /
+`enrich_error` / `wa_numbers` (types mirror the CRM's `lead_gen_results`); applied via
+`python scripts/apply_migrations.py 004` + `NOTIFY pgrst, 'reload schema'`. Verified: every
+column in `supa._COLS` now exists on the SaaS table. (`whatsapp_source` etc. were already
+there — only these 3 were missing.) Leftover: `synced_upto` still in-memory.
 
 ### W10 - "Assumed Mobile" retired, and every WA number gets a `+`  [x]
 Prompt: "remove => Assumed Mobile tag => verify it and show the wa link tag, donot assume any

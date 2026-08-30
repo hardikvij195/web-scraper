@@ -41,13 +41,11 @@ _COLS = ["place_key", "name", "category", "phone", "whatsapp_number", "whatsapp_
          # WHY a crawl found nothing (http_403 | dns | timeout | non_html | no_pages).
          # Without it the CRM can show THAT enrichment failed but never why — the state
          # that made job #6's 9 WAF-blocked leads look arbitrarily broken.
-         # ⚠ The SaaS `web_scraper_leads` table lacks this column AND `wa_verified` (no
-         # migration ever added them, see W11), so that push already 400s. The CRM's
-         # `lead_gen_results`, which is the path actually in use, has both.
+         # W11 FIXED 2026-08-30: 004_leads_wa_columns.sql added wa_verified/enrich_error/
+         # wa_numbers to the SaaS table, so supa.push_job no longer 400s.
          "enrich_error",
          # W26: [{number, source, verdict}] per checked number. The CRM Edge Function
-         # ignores keys outside its LEAD_COLS, so this is harmless there until the CRM
-         # adds the column; the SaaS table lacks it too (already 400s — W11).
+         # ignores keys outside its LEAD_COLS; the SaaS table has it since W11's fix.
          "wa_numbers",
          "scraped_at", "job_id", "job_query", "job_location"]
 
