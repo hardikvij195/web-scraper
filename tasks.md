@@ -633,3 +633,18 @@ venv, while the old D:\ agent stayed alive (its supervisor loop restarts it 15s 
 2s sleep in `_relocate`) and kept reporting `root D:`. With W50 the correct sequence is now
 possible: **Stop agent → delete/move the folder → re-run the installer at the new path.**
 Making relocate itself fully atomic is follow-up work; the race is documented here.
+
+## W50b — relocate: stop the old supervisor resurrecting the agent (2026-08-31)
+
+Follow-up to the "folder still shows D:" report, which was never a display bug.
+`_relocate` spawns the installer at the new path, then the agent exits ~2s later —
+but `run-agent-loop` in the OLD folder restarts it after 15s, while the installer
+is still building a venv (minutes). The old agent therefore came back, kept
+reporting `root <old folder>`, and won. Two agents, and the wrong one alive.
+
+Fixed by reusing W50's stop sentinel: `_relocate` writes `data/agent.stop` in the
+OLD root after spawning the installer, so that supervisor exits instead of
+restarting. Written AFTER the `data/` copytree, so the new folder never inherits
+it. If the install fails the machine is left with no agent — deliberately visible
+as "offline" in the CRM rather than silently running from the wrong folder;
+running run-agent-loop by hand clears the sentinel and revives it.

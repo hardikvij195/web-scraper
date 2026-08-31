@@ -143,6 +143,26 @@ def _relocate(target: str, device: str) -> str:
         if crm_url:
             cmd += ["--crm-url", crm_url]
         subprocess.Popen(cmd, cwd=str(ROOT), stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+
+    # W50b (2026-08-31): stop the OLD supervisor from resurrecting us mid-move.
+    #
+    # The caller exits ~2s after this returns, but run-agent-loop restarts the
+    # agent 15s later while the installer at `dst` is still building a venv —
+    # minutes of work. The old agent therefore came back, kept reporting
+    # `root <old folder>`, and the CRM's Folder: line never changed. It looked
+    # like a display bug; it was two agents and the old one winning.
+    #
+    # Reuses the stop sentinel: the loop here exits instead of restarting. Written
+    # AFTER the data/ copytree above, so the new folder never inherits it. If the
+    # install fails, this machine is left with no agent — deliberately visible as
+    # "offline" in the CRM rather than silently running from the wrong folder;
+    # running run-agent-loop by hand clears the sentinel and revives it.
+    try:
+        (ROOT / "data" / "agent.stop").write_text(
+            f"relocating to {dst} at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass                                   # best effort; the move still proceeds
     return f"moving to {dst} — installer running there (log: {ROOT / 'data' / 'relocate.log'}); back online in a few minutes"
 
 
