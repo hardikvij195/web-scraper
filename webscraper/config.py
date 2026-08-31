@@ -76,8 +76,13 @@ class Settings:
     # 0 = NO cap (user directive 2026-08-25: "remove daily cap logic from wa verify").
     # Set a number to restore the per-account per-day ceiling.
     wa_daily_cap: int = _int(os.getenv("WA_DAILY_CAP"), 0)
-    wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 8.0)
-    wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 20.0)
+    # Pause between one number and the next. 8-20s (avg ~14s) allowed ~250
+    # numbers an hour; 3-8s (avg ~5.5s) is roughly 2.5x that. Still random and
+    # still seconds apart on purpose: what gets an account challenged is a
+    # fixed, machine-looking cadence more than the raw rate. If challenges do
+    # start, raise both — that signal costs a logged-in session to ignore.
+    wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 3.0)
+    wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 8.0)
     # Headed by default: WhatsApp Web treats a headless Chromium as a NEW device and
     # shows the QR again (session doesn't carry over), so headless verify sees every
     # account as logged-out. On a headless VPS set WA_VERIFY_HEADLESS=true + run under
