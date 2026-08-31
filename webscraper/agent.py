@@ -756,23 +756,58 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 import subprocess
                 import sys
                 from webscraper.config import ROOT
-                before = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
-                                        capture_output=True, text=True).stdout.strip()
+                # W49 (Dell Vostro, 2026-08-31): the folder may not be a git checkout at
+                # all — an installer/zip deployment has no .git, so every `git pull` here
+                # died with "fatal: not a git repository: (NULL)" and the agent could
+                # never be updated from the CRM again. Repair it in place rather than
+                # reporting a dead end: init, point at origin, hard-check out main.
+                # Safe because data/ and .env are gitignored, so the SQLite DB, the
+                # WhatsApp profiles and CRM_AGENT_TOKEN all survive.
+                import os
+                repair_failed = None
+                is_repo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT,
+                                         capture_output=True, text=True).returncode == 0
+                if not is_repo:
+                    log.warning("update: %s is not a git checkout - repairing it in place", ROOT)
+                    repo = os.getenv("WEBSCRAPER_REPO") or "https://github.com/hardikvij195/web-scraper.git"
+                    for step in (["git", "init", "-q"],
+                                 ["git", "remote", "add", "origin", repo],
+                                 ["git", "fetch", "-q", "origin", "main"],
+                                 ["git", "checkout", "-f", "-B", "main", "origin/main"]):
+                        r = subprocess.run(step, cwd=ROOT, capture_output=True, text=True, timeout=300)
+                        # `remote add` fails harmlessly when a remote already exists.
+                        if r.returncode != 0 and step[1] != "remote":
+                            repair_failed = (f"could not repair the checkout ({step[1]}): "
+                                             f"{(r.stderr or r.stdout).strip()[:160]}")
+                            break
+                    if repair_failed:
+                        log.error("update: %s", repair_failed)
+                        result = repair_failed
+                    else:
+                        log.info("update: checkout repaired - continuing with the normal update")
+
+                before = "" if repair_failed else subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                    capture_output=True, text=True).stdout.strip()
                 # W47: a detached HEAD (submodule checkout, or a clone that ended up off
                 # its branch — the Dell Vostro, 2026-08-27) makes `git pull` refuse with
                 # "You are not currently on a branch". Same cure as the installer: put the
                 # checkout on main tracking origin/main first.
-                on_branch = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=ROOT,
-                                           capture_output=True, text=True).returncode == 0
+                on_branch = repair_failed is not None or subprocess.run(
+                    ["git", "symbolic-ref", "-q", "HEAD"], cwd=ROOT,
+                    capture_output=True, text=True).returncode == 0
                 log.info("update: on %s (%s) - pulling origin/main", before, "branch" if on_branch else "detached HEAD, re-attaching to main first")
                 if not on_branch:
                     subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT,
                                    capture_output=True, text=True, timeout=120)
                     subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=ROOT,
                                    capture_output=True, text=True, timeout=60)
-                pull = subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT,
-                                      capture_output=True, text=True, timeout=120)
-                if pull.returncode != 0:
+                pull = (subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT,
+                                       capture_output=True, text=True, timeout=120)
+                        if not repair_failed else None)
+                if repair_failed:
+                    pass                                  # `result` is already the reason
+                elif pull.returncode != 0:
                     result = f"git pull failed: {(pull.stderr or pull.stdout).strip()[:200]}"
                     # W48: say it in the CRM log too - the dialog used to spin with nothing to read.
                     log.error("update: %s", result)
@@ -792,6 +827,45 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
                     import os as _os
                     _os._exit(0)
+            elif cmd["command"] == "stop":
+                # W50 (2026-08-31): "Stop agent". Exiting is NOT enough — run-agent-loop
+                # restarts us 15s later, and the scheduled task restarts the loop at
+                # logon, which is why the old folder could never be deleted ("folder is
+                # still in use"). So: drop a sentinel the loop checks, disable the
+                # autostart task, and only then exit.
+                #
+                # One-way from the CRM by design: a stopped agent polls nothing, so it
+                # cannot be started again remotely. Restart it by running run-agent-loop
+                # on the machine (which clears the sentinel) or by re-running the
+                # installer.
+                import os as _os
+                import subprocess as _sp
+                import sys as _sys
+                from webscraper.config import ROOT
+                notes = []
+                try:
+                    (ROOT / "data").mkdir(exist_ok=True)
+                    (ROOT / "data" / "agent.stop").write_text(
+                        "stopped by the CRM at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n",
+                        encoding="utf-8")
+                    notes.append("supervisor loop will not restart it")
+                except Exception as e:                      # noqa: BLE001
+                    notes.append(f"could not write the stop sentinel ({e})")
+                if _sys.platform == "win32":
+                    r = _sp.run(["schtasks", "/Change", "/TN", "HVT Lead Finder Agent", "/DISABLE"],
+                                capture_output=True, text=True)
+                    notes.append("autostart disabled" if r.returncode == 0
+                                 else "autostart task left enabled (needs admin)")
+                else:
+                    notes.append("autostart (launchd) left in place — unload it manually if needed")
+                result = "agent stopped — " + "; ".join(notes)
+                ok = True
+                log.info("stop requested by the CRM: %s", result)
+                cloud.command_done(int(cmd["id"]), True, result)
+                if _CRM_LOG:
+                    _ship_agent_logs(cloud, _CRM_LOG[0])
+                time.sleep(1)
+                _os._exit(0)
             elif cmd["command"] == "restart":
                 # W46: plain restart from the CRM — no pull. Same exit path as update; the
                 # supervisor loop brings us back and _requeue_orphans resumes the job.

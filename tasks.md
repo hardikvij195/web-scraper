@@ -603,3 +603,33 @@ finish in seconds), then history, then nothing, which renders "estimating…". T
 ETA is **null if any remaining phase is unestimable**, because a partial sum silently
 under-promises. The old hardcoded `PLACE_OVERHEAD_SEC` / `ENRICH_SEC_PER_SITE` constants are
 gone. Verified: pytest 26/26, and a scraping ETA of 2400s correctly clamped to the 1800s cap.
+
+## W49 / W50 — Dell Vostro: update impossible, agent unstoppable (2026-08-31)
+
+Three symptoms from one machine, three different causes. Diagnosed from the screenshots
+plus the agent's own self-check line: `root D:\hv-technologies\web-scraper`.
+
+**W49 — "not able to update".** `git pull failed: fatal: not a git repository: (NULL)`.
+`D:\hv-technologies\web-scraper` was never a git checkout (installer/zip deployment), so
+`git pull` could never work there and the CRM could never update that agent again. The
+`update` command now detects a non-repo ROOT and repairs it in place — `git init`,
+`remote add origin`, `fetch`, `checkout -f -B main origin/main` — then continues with the
+normal pull. Safe because `data/` and `.env` are gitignored, so the SQLite DB, the WhatsApp
+profiles and `CRM_AGENT_TOKEN` all survive. A failed repair reports the reason instead of
+the raw git error.
+
+**W50 — "make logic to stop agent" / "folder is still in use".** There was no way to stop an
+agent, and exiting was never enough: `run-agent-loop` restarts it 15s later and the
+scheduled task restarts the loop at logon. That is exactly why the old folder could not be
+deleted. New `stop` command: writes `data/agent.stop`, disables the "HVT Lead Finder Agent"
+scheduled task (Windows), then exits. Both supervisor loops (`.bat` and `.sh`) now exit when
+the sentinel is present, and clear it when started by hand — otherwise a stopped machine
+could never be started again locally, since a stopped agent polls nothing. CRM gained a red
+**Stop agent** button.
+
+**"folder not changing on the 2nd line" — NOT a display bug.** The `Folder:` line was telling
+the truth: the relocate never completed. The C:\ copy got as far as a git checkout with no
+venv, while the old D:\ agent stayed alive (its supervisor loop restarts it 15s after the
+2s sleep in `_relocate`) and kept reporting `root D:`. With W50 the correct sequence is now
+possible: **Stop agent → delete/move the folder → re-run the installer at the new path.**
+Making relocate itself fully atomic is follow-up work; the race is documented here.

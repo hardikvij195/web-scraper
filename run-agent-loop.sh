@@ -16,7 +16,22 @@ if ! grep -q '^LEAD_FINDER_DEVICE=' .env 2>/dev/null && [ -z "${LEAD_FINDER_DEVI
   _name="$(scutil --get ComputerName 2>/dev/null || true)"
   [ -n "$_name" ] && export LEAD_FINDER_DEVICE="$_name"
 fi
+# Starting by hand (or via launchd) clears a previous CRM "Stop agent" — otherwise
+# the sentinel would keep the machine stopped for ever with no local way back, since
+# a stopped agent polls nothing and cannot be told to start.
+if [ -f data/agent.stop ]; then
+  echo "[$(date '+%d-%m-%Y %H.%M.%S')] clearing stop sentinel - starting again" >> data/agent.log
+  rm -f data/agent.stop
+fi
+
 while true; do
+  # W50: the CRM's "Stop agent" drops data/agent.stop. Without this check the loop
+  # restarted the agent 15s later and the folder stayed locked, which is why an old
+  # folder could not be deleted after a move.
+  if [ -f data/agent.stop ]; then
+    echo "[$(date '+%d-%m-%Y %H.%M.%S')] stop sentinel present - supervisor exiting" >> data/agent.log
+    exit 0
+  fi
   # Self-update before every start (2026-08-26): a CRM feature that needs new agent code
   # (the Start-WhatsApp-session button) sat at "waiting for <Mac> to pick it up" because
   # the Mac still ran the commit it was installed from. Fast-forward only, never blocks:
