@@ -58,6 +58,11 @@ class Cloud:
         expected and handled by the caller, never fatal to the job."""
         self.c.post(f"/api/agent/jobs/{jid}/logs", json={"rows": rows}).raise_for_status()
 
+    def ai_usage(self, jid: int, rows: list[dict]) -> None:
+        """Ship one row per LLM call (provider, model, tokens, ok/error) — 2026-09-04.
+        Same 'may 404 on an older/different API' contract as logs()."""
+        self.c.post(f"/api/agent/jobs/{jid}/ai_usage", json={"rows": rows}).raise_for_status()
+
     def config(self) -> dict:
         return {}  # SaaS members set AI keys in their cloud Settings tab, not here
 
@@ -299,6 +304,11 @@ class CrmCloud:
         """
         self._post(crm_payload("logs", job_id=jid, rows=rows)).raise_for_status()
 
+    def ai_usage(self, jid: int, rows: list[dict]) -> None:
+        """Ship one row per LLM call this job made — 2026-09-04 (`lead_gen_ai_usage`).
+        Same append-only, retry-safe contract as logs(); a 404 (old CRM) is fine."""
+        self._post(crm_payload("ai_usage", job_id=jid, rows=rows)).raise_for_status()
+
     def config(self) -> dict:
         """API keys set on the CRM Lead Finder Setup tab (gemini_api_key, ...)."""
         r = self._post(crm_payload("config"))
@@ -435,6 +445,30 @@ def _ship_logs(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
                     cid, len(rows), e)
         return
     store.update_job(job_id, logs_synced_upto=int(rows[-1]["id"]))
+
+
+def _ship_ai_usage(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
+    """Send this job's unshipped ai_usage rows up — same watermark-after-2xx pattern as
+    _ship_logs(): job_id is a LOCAL id here, but ai_usage.job_id must be the CLOUD id
+    (what the CRM's lead_gen_jobs.id actually is), so translate before sending."""
+    cid = _col(row, "cloud_id")
+    if not cid:
+        return
+    job_id = int(row["id"])
+    rows = store.ai_usage_since(job_id, after_id=int(_col(row, "ai_usage_synced_upto", 0) or 0),
+                                limit=LOG_BATCH)
+    if not rows:
+        return
+    try:
+        cloud.ai_usage(int(cid), [{"kind": r["kind"], "provider": r["provider"], "model": r["model"],
+                                   "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"],
+                                   "ok": bool(r["ok"]), "status_code": r["status_code"], "error": r["error"],
+                                   "ts": r["ts"]} for r in rows])
+    except Exception as e:                                       # noqa: BLE001
+        log.warning("ai_usage ship to #%s failed (%d row(s) held for the next tick): %s",
+                    cid, len(rows), e)
+        return
+    store.update_job(job_id, ai_usage_synced_upto=int(rows[-1]["id"]))
 
 
 #: A claimed job the worker has not started in this long is failed with a reason (user
@@ -1194,6 +1228,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # its closing lines (lane reasons, the failure text) waiting to be shipped, and
         # once the terminal branch marks it 'synced' this loop never looks at it again.
         _ship_logs(cloud, store, row)
+        _ship_ai_usage(cloud, store, row)
         if row["phase"] in ("scraping", "enriching", "queued", "waiting", "researching", "verifying_wa"):
             # Stream leads up AS THEY LAND. Results used to be uploaded only once the job
             # reached a terminal phase, so a job stopped by the user or by its time limit

@@ -125,8 +125,18 @@ def available_providers() -> list[str]:
     return out
 
 
+#: One LLM call's outcome, whether it succeeded or not — CRM-side token/cost tracking
+#: (2026-09-04) needs every ATTEMPT, not just the winning one, so a run that fell
+#: through 3 rate-limited free providers before Gemini finally answered shows all 4.
+def _usage_row(provider: str, model: str | None, ok: bool, status_code: int | None = None,
+               error: str | None = None, prompt_tokens: int | None = None,
+               completion_tokens: int | None = None) -> dict[str, Any]:
+    return {"provider": provider, "model": model, "ok": ok, "status_code": status_code,
+            "error": error, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+
+
 async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, base: str, model: str,
-                             prompt: str, errors: dict[str, Any] | None) -> dict[str, Any] | None:
+                             prompt: str, errors: dict[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     try:
         r = await client.post(
             f"{base}/chat/completions",
@@ -136,48 +146,58 @@ async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, bas
                                {"role": "user", "content": prompt}]},
             timeout=45)
         r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"] or ""
-        return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+        body = r.json()
+        usage = body.get("usage") or {}   # OpenAI-standard field name — every one of these 6 providers uses it
+        txt = body["choices"][0]["message"]["content"] or ""
+        data = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+        return data, _usage_row(name, model, True, r.status_code,
+                                 prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"))
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
         log.warning("%s research failed: %s", name, e)
+        code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+        msg = (f"{name}: quota exhausted (HTTP 429)" if code == 429
+               else f"{name}: HTTP {code}" if code
+               else f"{name}: {type(e).__name__}")
         if errors is not None:
-            code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
-            errors["error"] = (f"{name}: quota exhausted (HTTP 429)" if code == 429
-                               else f"{name}: HTTP {code}" if code
-                               else f"{name}: {type(e).__name__}")
-        return None
+            errors["error"] = msg
+        return None, _usage_row(name, model, False, code, msg)
 
 
-async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any]) -> dict[str, Any] | None:
+async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Walk the provider chain; the first answer wins. `errors['error']` keeps the LAST
-    failure and `errors['provider']` the provider that answered."""
+    failure and `errors['provider']` the provider that answered. The second return value
+    is every attempt made (2026-09-04, CRM token/cost tracking) — a run that fell through
+    3 rate-limited free providers before one answered ships all 4 attempts, not just the
+    winner, so a 429 shows up even on a lead that ultimately succeeded."""
     tried = 0
+    attempts: list[dict[str, Any]] = []
     for name in _provider_order():
         if name == "gemini":
             key = _gemini_key()
             if not key:
                 continue
             tried += 1
-            data = await _ask_gemini(client, key, prompt, errors)
+            data, usage = await _ask_gemini(client, key, prompt, errors)
         else:
             spec = next((p for p in _PROVIDERS if p[0] == name), None)
             if not spec or not os.getenv(spec[1]):
                 continue
             tried += 1
             model = os.getenv(f"AI_RESEARCH_MODEL_{name.upper()}") or spec[3]
-            data = await _ask_openai_compat(client, name, os.environ[spec[1]], spec[2], model, prompt, errors)
+            data, usage = await _ask_openai_compat(client, name, os.environ[spec[1]], spec[2], model, prompt, errors)
+        attempts.append(usage)
         if data:
             errors["provider"] = name
-            return data
+            return data, attempts
     if tried == 0:
         errors["error"] = "no AI key configured"
     else:
         errors["gemini_failed"] = errors.get("gemini_failed", 0) + 1   # counts "all providers failed"
-    return None
+    return None, attempts
 
 
 async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
-                      errors: dict[str, Any] | None = None) -> dict[str, Any] | None:
+                      errors: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     # The other 6 providers already honour AI_RESEARCH_MODEL_<NAME> (set by the
     # CRM's AI APIs tab); Gemini was hardcoded to _MODEL and could not be changed
     # from there. Same override, same fallback.
@@ -191,13 +211,20 @@ async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
                                        "thinkingConfig": {"thinkingBudget": 0}}},
             timeout=40)
         r.raise_for_status()
-        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+        body = r.json()
+        usage = body.get("usageMetadata") or {}
+        txt = body["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+        return data, _usage_row("gemini", model, True, r.status_code,
+                                 prompt_tokens=usage.get("promptTokenCount"),
+                                 completion_tokens=usage.get("candidatesTokenCount"))
     except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
         log.warning("gemini research failed: %s", e)
+        msg = _gemini_error_text(e)
+        code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
         if errors is not None:
-            errors["error"] = _gemini_error_text(e)
-        return None
+            errors["error"] = msg
+        return None, _usage_row("gemini", model, False, code, msg)
 
 
 async def research_places(store: Store, rows: list[dict[str, Any]], concurrency: int = 3,
@@ -231,9 +258,11 @@ async def research_places(store: Store, rows: list[dict[str, Any]], concurrency:
                     if on_progress: on_progress(r, "failed")
                     return
                 site_emails = extract_emails(text)
-                data = await _ask_llm(client, _PROMPT.format(
+                data, attempts = await _ask_llm(client, _PROMPT.format(
                     name=r.get("name") or "", category=r.get("category") or "", website=website,
                     linkedin=r.get("linkedin") or "none", text=text), counts)
+            for a in attempts:
+                store.record_ai_usage(job_id=r["job_id"], place_key=r["place_key"], kind="research", **a)
             if not data:
                 store.update_enrichment(r["job_id"], r["place_key"], {"research_status": "failed"})
                 counts["failed"] += 1

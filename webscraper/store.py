@@ -87,6 +87,26 @@ CREATE TABLE IF NOT EXISTS job_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id, id);
 
+-- One row per LLM call research.py makes (2026-09-04): which provider/model answered,
+-- how many tokens it used, and whether it failed (429 = hit that provider's free-tier
+-- rate limit). Same shipped-to-CRM shape as job_logs — see ai_usage_since() /
+-- record_ai_usage() and agent.py's _ship_ai_usage().
+CREATE TABLE IF NOT EXISTS ai_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER,                 -- NULL for a Suggest-button call (not tied to a job)
+  place_key TEXT,
+  kind TEXT NOT NULL DEFAULT 'research',   -- research | suggest
+  provider TEXT NOT NULL,
+  model TEXT,
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
+  ok INTEGER NOT NULL DEFAULT 1,
+  status_code INTEGER,
+  error TEXT,
+  ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_job ON ai_usage(job_id, id);
+
 -- Every link the Google Maps feed offered a job, and whether it was opened. Before this
 -- the links lived only in memory, so a run that hit the Maps time limit with 37 of 237
 -- unopened could only "search again" — now a `discovery_pending` re-run opens exactly
@@ -340,6 +360,7 @@ class Store:
             ("enr_ended_at", "TEXT"), ("enr_ok", "INTEGER"), ("enr_reason", "TEXT"),
             ("wa_ended_at", "TEXT"), ("wa_ok", "INTEGER"), ("wa_reason", "TEXT"),
             ("logs_synced_upto", "INTEGER NOT NULL DEFAULT 0"),
+            ("ai_usage_synced_upto", "INTEGER NOT NULL DEFAULT 0"),
             # Leads in flight RIGHT NOW per lane (batch size while a batch runs, 0 between),
             # so the CRM can show done / in progress / queued instead of "1 / >= 1" (T170).
             ("enrich_active", "INTEGER NOT NULL DEFAULT 0"), ("wa_active", "INTEGER NOT NULL DEFAULT 0"),
@@ -418,6 +439,28 @@ class Store:
         return [dict(r) for r in self.conn.execute(
             "SELECT id, ts, lane, level, message FROM job_logs WHERE job_id=? AND id>? "
             "ORDER BY id LIMIT ?", (job_id, after_id, limit))]
+
+    # ── AI token usage (2026-09-04) ───────────────────────────────────────────────
+    def record_ai_usage(self, *, job_id: int | None, place_key: str | None, kind: str,
+                         provider: str, model: str | None,
+                         prompt_tokens: int | None, completion_tokens: int | None,
+                         ok: bool, status_code: int | None = None, error: str | None = None) -> None:
+        """One row per LLM call. Never raises — a usage-tracking failure must not take
+        down the research call it is describing (same contract as log())."""
+        try:
+            self.conn.execute(
+                "INSERT INTO ai_usage(job_id, place_key, kind, provider, model, prompt_tokens, "
+                "completion_tokens, ok, status_code, error, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, place_key, kind, provider, model, prompt_tokens, completion_tokens,
+                 1 if ok else 0, status_code, (error or None) and str(error)[:500], now_iso()))
+            self.conn.commit()
+        except sqlite3.Error:                                    # noqa: BLE001
+            log.debug("ai_usage write failed for job %s", job_id, exc_info=True)
+
+    def ai_usage_since(self, job_id: int, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT id, kind, provider, model, prompt_tokens, completion_tokens, ok, status_code, error, ts "
+            "FROM ai_usage WHERE job_id=? AND id>? ORDER BY id LIMIT ?", (job_id, after_id, limit))]
 
     #: lane key -> (started column, ended column, ok column, reason column)
     LANE_COLS = {
