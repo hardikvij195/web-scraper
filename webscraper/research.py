@@ -98,7 +98,10 @@ _PROVIDERS: list[tuple[str, str, str, str]] = [
     # name, env key, base url, default model
     ("groq",       "GROQ_API_KEY",       "https://api.groq.com/openai/v1",       "openai/gpt-oss-20b"),
     ("cerebras",   "CEREBRAS_API_KEY",   "https://api.cerebras.ai/v1",           "gpt-oss-120b"),
-    ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "openai/gpt-oss-20b"),
+    # ':free' suffix — OpenRouter's paid catalogue is the same model IDs without it;
+    # dropping the suffix silently starts billing (user directive 2026-09-03: default
+    # to free tiers everywhere they exist).
+    ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "openai/gpt-oss-20b:free"),
     ("nvidia",     "NVIDIA_API_KEY",     "https://integrate.api.nvidia.com/v1",  "meta/llama-3.3-70b-instruct"),
     ("xai",        "XAI_API_KEY",        "https://api.x.ai/v1",                  "grok-3-mini"),
     ("openai",     "OPENAI_API_KEY",     "https://api.openai.com/v1",            "gpt-4o-mini"),
@@ -175,9 +178,13 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
 
 async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
                       errors: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    # The other 6 providers already honour AI_RESEARCH_MODEL_<NAME> (set by the
+    # CRM's AI APIs tab); Gemini was hardcoded to _MODEL and could not be changed
+    # from there. Same override, same fallback.
+    model = os.getenv("AI_RESEARCH_MODEL_GEMINI") or _MODEL
     try:
         r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{_MODEL}:generateContent?key={key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1200,
                                        "responseMimeType": "application/json",
