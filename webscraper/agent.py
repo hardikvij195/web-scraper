@@ -1161,6 +1161,78 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     log.info("cloud job #%s re-queued -> local job #%s", cj["id"], local_id)
 
 
+def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, local_id: int, cloud_job_id: int) -> int:
+    """T359 — "resume job on some other system": rebuild a local `places` mirror for a
+    re-enrich/both re-run claimed by an agent that never ran this job before, so
+    `EnrichmentLane`'s `pending_enrichment()` (a LOCAL sqlite query) has something to
+    find instead of silently seeing zero rows and reporting a false "nothing to do".
+
+    Scoped to re-enrich/both ONLY — discovery re-runs are NOT hydrated here:
+    `discovery_pending` needs `job_links` (which unopened Maps links to open), and that
+    table is never synced to the CRM at all, so there is nothing to reconstruct it from.
+    A `discovery_missed`/`discovery_more` re-run does a fresh Maps search instead and
+    does not need existing local rows either. Only `reenrich_only` jobs hit this path
+    (checked by the caller).
+
+    Safety, worked through deliberately rather than assumed:
+    - Source is `cloud.results()` — the SAME narrow endpoint (`place_key, name, phone,
+      whatsapp_number, whatsapp_source, wa_verified, country, website, email, emails,
+      enrich_status, enrich_error, maps_url`) `_reverify_wa` already uses safely. It is
+      missing lat/lng/category/socials/etc that a full local scrape would have.
+    - That is fine because `agent.py::_flat()` (used by every `cloud.sync()` call) DROPS
+      any None/"" field before sending a sync patch, and the CRM's `sync` action is
+      already a partial patch (only columns present in the payload are written) — the
+      exact mechanism built for subset re-enrich runs. So the fields this hydration
+      cannot fill are simply never mentioned in the next sync, and the CRM's existing
+      values for them are left untouched, not nulled. Verified by reading both sides
+      (`supabase/functions/lead-finder-agent/index.ts`'s `sync` handler comment block,
+      and `_flat()`'s docstring here) — not assumed.
+    - `Place.detail_status` defaults to `"done"`, which is correct for every row here:
+      `lead_gen_results` only ever holds places that were already opened/saved, so
+      `pending_enrichment()`'s `COALESCE(detail_status,'done')='done'` passes them.
+    - `upsert_place()`'s own COALESCE-don't-overwrite behaviour is irrelevant on a
+      genuinely fresh local job (nothing to preserve yet) but is left completely
+      unmodified — this function is a plain caller of it, not a variant.
+    - Known, accepted gap: local `wa_checks` (per-number WhatsApp history) is NOT
+      synced to the CRM anywhere, so a hydrated `both`-mode re-run's WhatsApp lane will
+      re-check numbers that a prior run already decided — wasted daily-cap budget, not
+      a correctness bug (re-confirming a known "yes"/"no" just reconfirms it). Left as
+      a known limitation rather than guessed at with synthetic `wa_checks` rows.
+    """
+    rows = cloud.results(cloud_job_id)
+    if not rows:
+        return 0
+    from webscraper.models import Place
+    n = 0
+    for r in rows:
+        pk = r.get("place_key")
+        if not pk:
+            continue
+        p = Place(
+            job_id=local_id, place_key=str(pk), name=r.get("name"), country=r.get("country"),
+            phone=r.get("phone"), website=r.get("website"), email=r.get("email"),
+            emails=r.get("emails") or [], whatsapp_number=r.get("whatsapp_number"),
+            whatsapp_source=r.get("whatsapp_source"), maps_url=r.get("maps_url"),
+            enrich_status=r.get("enrich_status") or "pending",
+        )
+        store.upsert_place(p)
+        err = r.get("enrich_error")
+        if err:
+            # Not a Place/PLACE_COLS field (see store.py's _migrate) — same column
+            # `_enrich_line`'s failed-lane log message already reads.
+            store.conn.execute(
+                "UPDATE places SET enrich_error=? WHERE job_id=? AND place_key=?",
+                (err, local_id, str(pk)))
+        n += 1
+    store.conn.commit()
+    log.info("hydrated %d place(s) for cloud job #%s -> local job #%s from CRM results",
+              n, cloud_job_id, local_id)
+    store.log(local_id, "job",
+              f"resumed on this machine: rebuilt {n} lead(s) from the CRM's already-synced "
+              f"results (this job previously ran on another machine)")
+    return n
+
+
 #: local job id -> `changed_at` watermark of updates already streamed. In memory like
 #: `synced_upto`; a restart re-sends one tick's worth of updates, absorbed by the upsert.
 _changed_upto: dict[int, str] = {}
@@ -1219,6 +1291,20 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                          place_keys=_place_keys_json(cj),
                          locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
+        # T359 — "resume job on some other system": THIS agent has never mirrored this
+        # cloud job before (`cj["id"] not in mirrored`, or it would have taken the
+        # `_requeue_rerun` branch above) but it is a re-enrich/both re-run, not a fresh
+        # first pass — its local `places` table is genuinely empty, so a re-enrich right
+        # now would just be handed nothing. `discovery_pending` is excluded even though
+        # it also carries `reenrich_only` — it needs `job_links`, never synced.
+        if kind == "crm" and cj.get("reenrich_only") and not cj.get("discovery_pending"):
+            try:
+                _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
+            except Exception:                                     # noqa: BLE001
+                log.exception("hydration failed for cloud job #%s -> local job #%s", cj["id"], local_id)
+                store.log(local_id, "job",
+                          "could not rebuild this job's leads from the CRM after moving to this "
+                          "machine — it will report no pending work; re-run again or move it back", "error")
     # mirror running/finished local state up
     for row in store.conn.execute(
             "SELECT * FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
