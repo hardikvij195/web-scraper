@@ -140,20 +140,24 @@ def login(name: str) -> bool:
             user_data_dir=str(profile_dir(name)), headless=False, locale="en",
             viewport={"width": 1100, "height": 820},
             args=["--disable-blink-features=AutomationControlled"])
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto("https://web.whatsapp.com/", timeout=60_000)
-        log.info("[%s] scan the QR in the window (2 min)...", name)
         try:
-            page.wait_for_selector(
-                'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
-                timeout=_LOGIN_TIMEOUT_MS)
-            log.info("[%s] logged in - session saved to %s", name, profile_dir(name))
-            ok = True
-        except PWTimeout:
-            log.warning("[%s] timed out waiting for QR scan", name)
-            ok = False
-        time.sleep(1.5)   # let WA flush the session to disk before we close
-        ctx.close()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto("https://web.whatsapp.com/", timeout=60_000)
+            log.info("[%s] scan the QR in the window (2 min)...", name)
+            try:
+                page.wait_for_selector(
+                    'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
+                    timeout=_LOGIN_TIMEOUT_MS)
+                log.info("[%s] logged in - session saved to %s", name, profile_dir(name))
+                ok = True
+            except PWTimeout:
+                log.warning("[%s] timed out waiting for QR scan", name)
+                ok = False
+            time.sleep(1.5)   # let WA flush the session to disk before we close
+        finally:
+            # T336: a goto that throws (offline, DNS hiccup) must not leak this window —
+            # it stayed open at about:blank until the process was killed by hand.
+            ctx.close()
     return ok
 
 
@@ -234,6 +238,7 @@ def verify_places(
         number in the caller, so a crash can never eat into the daily cap. Pacing is
         untouched too - the caller's randomised sleep still happens once per number.
         """
+        nav_retries = 0
         while True:
             page = open_ctx[name][1]
             try:
@@ -244,11 +249,24 @@ def verify_places(
             except PWTimeout:                 # subclass of PWError - must stay above it
                 return "unknown"
             except PWError as e:
-                # maps.py has had this since job #3 died mid-feed with TargetClosedError;
-                # the lanes split (2026-08-23) gave WhatsApp its own long-lived browser
-                # and no recovery at all, so one dead Chrome took the entire lane with it.
-                if not is_closed(e) or not _relaunch(name, f"number {num}"):
-                    raise
+                if is_closed(e):
+                    # maps.py has had this since job #3 died mid-feed with TargetClosedError;
+                    # the lanes split (2026-08-23) gave WhatsApp its own long-lived browser
+                    # and no recovery at all, so one dead Chrome took the entire lane with it.
+                    if not _relaunch(name, f"number {num}"):
+                        raise
+                    continue
+                # T338: a plain navigation failure (net::ERR_CONNECTION_CLOSED/RESET/…) is
+                # NOT "the browser died" — `is_closed()` correctly says no, but before this
+                # fix that meant the error was re-raised anyway and killed the whole lane
+                # (screenshot: 2h46m of good checks thrown away by one flaky request). The
+                # browser and page are still alive here, so just retry navigation in place.
+                if nav_retries >= 2:
+                    log.warning("[%s] number %s: navigation kept failing (%s) - skipping",
+                                name, num, e)
+                    return "unknown"
+                nav_retries += 1
+                time.sleep(3.0)
                 # loop: retry this ONE number on the relaunched browser.
 
     # Expand to (row, bare digits, source) — one entry per number to check.
@@ -350,14 +368,21 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             user_data_dir=str(profile_dir(name)), headless=settings.wa_verify_headless, locale="en",
             viewport={"width": 1100, "height": 820},
             args=["--disable-blink-features=AutomationControlled"])
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto("https://web.whatsapp.com/", timeout=60_000)
-        if not _is_logged_in(page):
-            # Raised, not returned: a relaunch happens deep inside `_check`, and this is
-            # its only way to report "profile came back unlinked" through Relauncher.open().
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto("https://web.whatsapp.com/", timeout=60_000)
+            if not _is_logged_in(page):
+                # Raised, not returned: a relaunch happens deep inside `_check`, and this is
+                # its only way to report "profile came back unlinked" through Relauncher.open().
+                raise WaNotLoggedIn(f"[{name}] profile has no live WhatsApp Web session")
+            return ctx, page
+        except BaseException:
+            # T336: `ctx` is a real Chrome process the moment launch_persistent_context
+            # returns. Before this, a goto that threw (offline, DNS hiccup, WA down) skipped
+            # straight past `ctx.close()` and left the window sitting at about:blank forever
+            # — the reported "opened a lot, lagged my Mac". Any failure here closes it.
             ctx.close()
-            raise WaNotLoggedIn(f"[{name}] profile has no live WhatsApp Web session")
-        return ctx, page
+            raise
 
     rl = Relauncher(_open, on_restart=lambda where, n: log.warning(
         "[%s] WhatsApp browser died during %s - relaunching from %s (%d/%d)",

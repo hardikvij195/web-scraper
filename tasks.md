@@ -13,6 +13,12 @@
 
 ---
 
+## Session 2026-09-04 — bug reports (CRM tasks.md T336/T338): orphaned Chrome windows + lane auto-retry
+
+| # | What | State |
+|---|---|---|
+| **W52** | Mac agent opened many orphaned `about:blank` Chrome windows over time, lagging the machine (bug report, screenshots); plus a follow-up "add logic to restart and try again" ask, and later "add more details in logs and how we can fix it" | `[x]` 2026-09-04 — root cause: `wa_verify.py`'s `_ensure_session._open()` and `login()` launched a persistent Chrome context then called `page.goto()` with no try/finally; a goto that threw (offline, DNS hiccup, WA down) skipped `ctx.close()` and left a real Chrome process sitting at `about:blank` forever. Both now close the context on any failure. `_check()`'s per-number WhatsApp goto no longer treats a plain `net::ERR_CONNECTION_CLOSED`-class navigation error as fatal (it was being mis-routed past `is_closed()`'s "browser died" check straight to `raise`, killing the entire WA lane on one flaky request — the exact screenshot: 133/2894 numbers checked over 2h46m, then Failed): it now retries navigation on the same page up to 2 times before giving that one number an `unknown` verdict and moving on. **Tried and reverted:** a blanket `Lane.run()` retry-the-whole-lane wrapper (`MAX_LANE_RETRIES=2`, 15s backoff) — the test suite caught that it broke `test_crashed_feeder_releases_the_lane_waiting_on_it` and `test_enrichment_bails_instead_of_looping_on_a_stuck_queue` (a lane that fails deterministically must give up fast, not get blindly re-run 3×, per this file's own "a hot infinite loop is a much worse failure than giving up"). Removed; retry stays at the per-number/per-browser-crash grain above, which each lane already had. **Error messages:** `_ask_openai_compat`'s except-block (`research.py`) now explains AI-provider HTTP errors instead of just the code — 404 means the model id doesn't exist on that provider any more (fix: pick a different model in Lead Finder → AI APIs), 429 is a quota/rate limit, 401/403 a bad key, 400 includes the provider's own message. `lanes.py`'s `_enrich_line` similarly expands `enrich_error` tokens (`dns`, `timeout`, `http_404`, Cloudflare variants, …) into a plain sentence + whether retrying could ever help. 98/98 tests pass. |
+
 ## Session 2026-08-27 — Vivobook install: wrong python, closing window, wrong folder
 
 | # | What | State |

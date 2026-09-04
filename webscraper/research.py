@@ -91,6 +91,32 @@ def _gemini_error_text(e: BaseException) -> str:
     return f"Gemini call failed: {type(e).__name__}: {str(e)[:120]}"
 
 
+def _openai_compat_error_text(name: str, model: str, code: int | None,
+                              body_snippet: str | None = None) -> str:
+    """Same idea as `_gemini_error_text`, for the 6 OpenAI-compatible fallback providers
+    (user report 2026-09-04: "groq: HTTP 404" logged with no explanation of what it means
+    or how to fix it). These providers share the OpenAI chat-completions error shape, so
+    one status-code map covers all of them; the model id is included because 404 here is
+    almost always "this exact model id doesn't exist on this provider" rather than a
+    reachability problem — unlike a website's HTTP 404, which is the site itself."""
+    if code == 429:
+        return f"{name}: rate/quota limit hit (HTTP 429) — its free tier resets on its own schedule (often daily); either wait or pick a different provider in Lead Finder → AI APIs"
+    if code == 404:
+        return (f"{name}: model '{model}' not found (HTTP 404) — the provider does not "
+                f"recognise this model id, usually because it was renamed/retired on their "
+                f"end. Fix: Lead Finder → AI APIs → {name.title()}, pick a current model "
+                f"from the list (or check {name}'s docs for the live id)")
+    if code in (401, 403):
+        return f"{name}: key rejected (HTTP {code}) — check the {name.upper()}_API_KEY in Lead Finder → Setup & Tokens"
+    if code == 400:
+        return f"{name}: request rejected (HTTP 400){f' — {body_snippet}' if body_snippet else ''} — usually a bad/unsupported model id or parameter for '{model}'"
+    if code is not None and code >= 500:
+        return f"{name}: server error (HTTP {code}) — {name}'s own service is having trouble, not a config issue; it will likely work again on retry"
+    if code is not None:
+        return f"{name}: HTTP {code}"
+    return f"{name}: could not reach the API (network/timeout, not a key or model issue)"
+
+
 #: OpenAI-compatible fallbacks, tried in order after Gemini — first one with a key wins,
 #: any failure moves on (T208, after the Gemini quota outage of 2026-08-26). Model per
 #: provider overridable with AI_RESEARCH_MODEL_<NAME>; order with AI_RESEARCH_PROVIDERS.
@@ -155,9 +181,16 @@ async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, bas
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
         log.warning("%s research failed: %s", name, e)
         code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
-        msg = (f"{name}: quota exhausted (HTTP 429)" if code == 429
-               else f"{name}: HTTP {code}" if code
-               else f"{name}: {type(e).__name__}")
+        # Body snippet only for 400s — that's the one code where the provider's own
+        # message (bad param name, unsupported field) is worth surfacing verbatim;
+        # for the others the status code alone already says what to do (see below).
+        snippet = None
+        if code == 400 and isinstance(e, httpx.HTTPStatusError):
+            try:
+                snippet = (e.response.json().get("error", {}) or {}).get("message", "")[:160] or None
+            except Exception:                                     # noqa: BLE001
+                snippet = e.response.text[:160] or None
+        msg = _openai_compat_error_text(name, model, code, snippet)
         if errors is not None:
             errors["error"] = msg
         return None, _usage_row(name, model, False, code, msg)

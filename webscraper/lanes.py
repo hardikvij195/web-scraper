@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -64,8 +65,61 @@ R_DISABLED = "disabled"            # the job did not ask for this lane
 
 
 
+#: enrich_error token -> (what it means, whether re-enriching could ever help). User
+#: report 2026-09-04: "FAILED: dns" logged with no explanation. Matches the tokens
+#: `enrich.py::transport_error`/`crawl_error`/`http_error` actually store — keep in sync
+#: with those if a new one is added there.
+_ENRICH_ERROR_EXPLAIN = {
+    "dns": ("the domain does not resolve — the site is offline, the domain expired, or "
+            "the URL Google Maps listed is wrong", "not fixable by retrying; check/replace the website URL"),
+    "timeout": ("the site took too long to answer (slow host, or it silently dropped the request)",
+                "worth a re-enrich later — can be a temporary slowdown"),
+    "network": ("a connection-level failure (reset, refused, TLS handshake, etc.)",
+                "worth a re-enrich later — often transient"),
+    "no_pages": ("the site answered but the crawl came back with nothing usable",
+                 "worth a re-enrich, ideally with 'Show window' so you can see what the page actually rendered"),
+    "blocked": ("the site returned a block/deny page (not a Cloudflare one we recognise)",
+                "unlikely to change on a plain retry — a proxy or a headed re-run may get past it"),
+    "recaptcha": ("the site is gated behind a Google reCAPTCHA image challenge",
+                  "cannot be solved automatically — no fix here, that lead's contact info has to come from elsewhere (Maps phone, etc.)"),
+    "cf_non_interactive": ("Cloudflare showed a wall with nothing to click (JS challenge / fingerprint check)",
+                           "a proxy sometimes helps; otherwise this site is out of reach for the crawler"),
+    "cf_managed": ("Cloudflare's managed challenge page (may include a checkbox)",
+                   "re-enrich with ENRICH_CF_CLICK on (default) already tries the checkbox — if it's still failing, a proxy may help"),
+    "cf_interactive": ("Cloudflare's interactive Turnstile checkbox challenge",
+                       "the crawler already tries to click it automatically — a repeat failure usually means a proxy is needed"),
+    "cf_embedded": ("an embedded Cloudflare Turnstile widget inside the page, not a full-page wall",
+                    "same as the other Cloudflare reasons — a proxy is the next thing to try"),
+}
+
+
+def _enrich_error_detail(token: str | None) -> str:
+    """Turn a raw `enrich_error` token into a sentence a non-engineer can act on."""
+    if not token:
+        return "unknown"
+    m = re.match(r"^http_(\d{3})$", token)
+    if m:
+        code = int(m.group(1))
+        if code == 404:
+            return "HTTP 404 — the page/site returned 'not found'. The URL Google Maps has on file for this business is likely dead or wrong; not something a retry fixes"
+        if code == 403:
+            return "HTTP 403 — the site actively blocked this request (bot protection). A proxy or a headed re-run sometimes gets past it"
+        if code == 429:
+            return "HTTP 429 — the site itself is rate-limiting us. Worth a re-enrich after a pause"
+        if code == 503:
+            return "HTTP 503 — the site (or something in front of it, e.g. Cloudflare) is temporarily unavailable. Worth a re-enrich later"
+        if code >= 500:
+            return f"HTTP {code} — the site's own server is erroring, not something on our end. Worth a re-enrich later"
+        return f"HTTP {code} — the site rejected the request"
+    info = _ENRICH_ERROR_EXPLAIN.get(token)
+    if info:
+        meaning, fix = info
+        return f"{token} — {meaning}. {fix}"
+    return token
+
+
 def _enrich_line(r: dict, status: str, f: dict) -> str:
-    """'Name · site → done via tls · 1 email, instagram, whatsapp' / '… → FAILED: http_403'."""
+    """'Name · site → done via tls · 1 email, instagram, whatsapp' / '… → FAILED: dns — ... '."""
     name = (r.get("name") or r.get("place_key") or "?")[:50]
     site = (r.get("website") or "").strip()
     if status == "no_website":
@@ -80,7 +134,7 @@ def _enrich_line(r: dict, status: str, f: dict) -> str:
         found.append(f"whatsapp ({f.get('whatsapp_source') or '?'})")
     via = f" via {f['enrich_via']}" if f.get("enrich_via") else ""
     if status == "failed":
-        return f"{name} · {site} → FAILED: {f.get('enrich_error') or 'unknown'}"
+        return f"{name} · {site} → FAILED: {_enrich_error_detail(f.get('enrich_error'))}"
     tail = ", ".join(found) if found else "no contacts found"
     return f"{name} · {site} → {status}{via} · {tail}"
 
@@ -148,6 +202,22 @@ class Lane(threading.Thread):
         except Exception as e:                                    # noqa: BLE001
             # Deliberately broad: an unhandled error in one lane must degrade to "this lane
             # failed, with a reason you can read" and never abort the other two.
+            #
+            # T338 ("add logic to restart and try again") is deliberately NOT a blanket
+            # retry-the-whole-lane-thread here: tried that first (MAX_LANE_RETRIES loop with
+            # a 15s backoff around this whole block) and it broke two existing invariants —
+            # `test_crashed_feeder_releases_the_lane_waiting_on_it` (WhatsApp must stop
+            # waiting on a dead enrichment feeder in well under 10s, not 30s+) and
+            # `test_enrichment_bails_instead_of_looping_on_a_stuck_queue` (a deterministic,
+            # instantly-failing lane must not be re-run 3x for nothing — "a hot infinite
+            # loop is a much worse failure than giving up", this file's own module
+            # docstring). Retrying belongs at the grain that can actually recover: one
+            # number, one browser relaunch, one site — not the whole lane thread. That's
+            # what's built: `wa_verify.py`'s WhatsApp lane now retries a single number's
+            # navigation instead of raising and killing the lane, and browser crashes on any
+            # lane already relaunch via `browser_recovery.Relauncher`. Enrichment's own
+            # "stuck queue" bail-out (3 fruitless passes, above) is that same grain applied
+            # to its own retry loop.
             log.exception("lane %s failed for job %s", self.key, self.job_id)
             self.reason = f"error:{str(e)[:160]}"
             try:
