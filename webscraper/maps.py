@@ -367,8 +367,17 @@ def scrape_place(page: Page, href: str, job_id: int, country: str) -> Place:
     key = place_id or cid or hashlib.sha1(href.encode()).hexdigest()[:16]
 
     # Country: the address names it for foreign places ("…, United Kingdom"); Maps drops it
-    # for places in the browser's own region, so fall back to the job's country.
-    place_country = country_from_address(address) or country
+    # for places in the browser's own region. A service-area listing has NO address at all,
+    # and falling straight through to the job's country (itself often unset → the agent's
+    # default region) tagged 808 London businesses with +44 numbers as 'IN' on job #45
+    # (2026-09-05). An international-format phone names its country unambiguously, so it
+    # ranks above the job/default fallback — but only when it carries a '+': a national
+    # number parsed against the wrong region would just launder the same mistake.
+    place_country = country_from_address(address)
+    if not place_country and phone_raw and phone_raw.strip().startswith("+"):
+        e164_guess, _ = normalise_phone(phone_raw, country or "ZZ")
+        place_country = region_of_phone(e164_guess, "") or None
+    place_country = place_country or country
     phone_e164, phone_digits = normalise_phone(phone_raw, place_country)
     wa_links = _panel_whatsapp_links(page)
     wa_number = None

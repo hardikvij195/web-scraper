@@ -149,6 +149,10 @@ launch (one pick per launch); httpx/curl_cffi rotate per attempt.
   `upsert_place` fills it and sets `detail_status='done'`. `upsert_place` COALESCEs every
   column so a NULL from the panel never wipes what the stub had. Enrichment queues only
   `detail_status='done'` rows (a stub has no website); WhatsApp does not wait for enrichment.
+  A stub the opener rejects as outside the radius becomes `detail_status='far'` (W54,
+  2026-09-05) — never DELETE it: the row may already be on the CRM, and `agent._flat()`
+  turns a `far` row into a `{place_key, _delete: true}` sync patch that removes it there.
+  Any new query that means "a real place" must keep the `COALESCE(detail_status,'done')='done'` filter.
 - **WhatsApp is per NUMBER (`wa_checks`).** Candidates = `wa_candidates(row)`: a WhatsApp
   link (`wa_link`) > the Maps phone (`maps`) > every number the website lists
   (`site_phones`, `site`), deduped on digits. The Maps phone is checked as soon as the

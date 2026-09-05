@@ -688,10 +688,19 @@ class Store:
         return n
 
     def drop_stub(self, job_id: int, place_key: str) -> bool:
-        """Remove a stub the opener decided not to keep (exact coords outside the radius).
-        Only ever removes a row still at detail_status='pending'."""
+        """Retire a stub the opener decided not to keep (exact coords outside the radius).
+
+        Marks it `detail_status='far'` instead of deleting it: the collector may already
+        have streamed the stub to the CRM (`places_after` runs every tick), and a row that
+        vanishes locally can never be un-sent. A kept row flows through
+        `places_changed_since` / `places_after`, where `agent._flat()` turns 'far' into a
+        delete patch the CRM's `sync` action honours. Job #45 shipped 3 blank far stubs
+        to the CRM the old way, and every count read off `lead_gen_results` was off by
+        exactly those (2026-09-05). Every reader that means "a real place" already filters
+        on `COALESCE(detail_status,'done')='done'`, so a 'far' row is invisible to the
+        lanes. Only ever touches a row still at detail_status='pending'."""
         cur = self.conn.execute(
-            "DELETE FROM places WHERE job_id=? AND place_key=? AND detail_status='pending'",
+            "UPDATE places SET detail_status='far' WHERE job_id=? AND place_key=? AND detail_status='pending'",
             (job_id, place_key))
         self.conn.commit()
         return bool(cur.rowcount)

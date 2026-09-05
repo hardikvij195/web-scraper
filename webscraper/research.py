@@ -127,8 +127,11 @@ _PROVIDERS: list[tuple[str, str, str, str]] = [
     # ':free' suffix — OpenRouter's paid catalogue is the same model IDs without it;
     # dropping the suffix silently starts billing (user directive 2026-09-03: default
     # to free tiers everywhere they exist).
-    ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "openai/gpt-oss-20b:free"),
-    ("nvidia",     "NVIDIA_API_KEY",     "https://integrate.api.nvidia.com/v1",  "meta/llama-3.3-70b-instruct"),
+    # 2026-09-05: OpenRouter dropped `openai/gpt-oss-20b:free` (404) and NVIDIA retired
+    # `meta/llama-3.3-70b-instruct` (410) — every research call on jobs #45/#46 fell
+    # through both. Picked from each catalogue's live /models on that day.
+    ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "nvidia/nemotron-3-super-120b-a12b:free"),
+    ("nvidia",     "NVIDIA_API_KEY",     "https://integrate.api.nvidia.com/v1",  "openai/gpt-oss-20b"),
     ("xai",        "XAI_API_KEY",        "https://api.x.ai/v1",                  "grok-3-mini"),
     ("openai",     "OPENAI_API_KEY",     "https://api.openai.com/v1",            "gpt-4o-mini"),
 ]

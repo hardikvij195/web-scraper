@@ -364,6 +364,11 @@ def _flat(r: dict) -> dict:
     through the `set_wa` action, never through `sync`.
     """
     from webscraper.supa import _row
+    if r.get("detail_status") == "far":
+        # A retired far stub (`store.drop_stub`): tell the CRM to remove the provisional
+        # row it may already hold instead of re-sending a blank lead. The Edge Function's
+        # `sync` action deletes rows flagged `_delete` (2026-09-05).
+        return {"place_key": r["place_key"], "_delete": True}
     return {k: v for k, v in _row(r).items() if v is not None and v != ""}
 
 
