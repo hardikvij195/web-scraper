@@ -132,7 +132,6 @@ _PROVIDERS: list[tuple[str, str, str, str]] = [
     # through both. Picked from each catalogue's live /models on that day.
     ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "nvidia/nemotron-3-super-120b-a12b:free"),
     ("nvidia",     "NVIDIA_API_KEY",     "https://integrate.api.nvidia.com/v1",  "openai/gpt-oss-20b"),
-    ("xai",        "XAI_API_KEY",        "https://api.x.ai/v1",                  "grok-3-mini"),
     ("openai",     "OPENAI_API_KEY",     "https://api.openai.com/v1",            "gpt-4o-mini"),
 ]
 

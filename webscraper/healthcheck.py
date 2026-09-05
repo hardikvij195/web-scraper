@@ -116,7 +116,7 @@ def _wa_session() -> dict:
 
 def _ai_keys() -> dict:
     have = [k for k in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY",
-                        "NVIDIA_API_KEY", "XAI_API_KEY", "OPENAI_API_KEY") if os.getenv(k)]
+                        "NVIDIA_API_KEY", "OPENAI_API_KEY") if os.getenv(k)]
     # research step degrades without it; the chain tries them in this order (T208)
     return _check(bool(have), f"AI keys: {', '.join(have) or 'none'}",
                   "Set any AI key on the CRM Lead Finder Setup tab (pushed to the agent on start)",
