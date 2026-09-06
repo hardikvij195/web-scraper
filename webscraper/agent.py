@@ -521,6 +521,30 @@ def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> 
             log.warning("could not report the unstarted job to the cloud: %s", e)
 
 
+def known_profile_dirs() -> list:
+    """Every persistent Chrome profile this agent can own (T397)."""
+    base = settings.profile_dir.parent
+    dirs = [settings.profile_dir, base / "browser-profile-open", base / "fetch-profile",
+            base / "camoufox-profile"]
+    try:
+        dirs += [d for d in settings.wa_profiles_dir.iterdir() if d.is_dir()]
+    except OSError:
+        pass
+    return dirs
+
+
+def _close_browsers(reason: str = "agent exiting") -> None:
+    """T397: `os._exit` skips every finally, so the Chromes the lanes launched would
+    outlive us, hold their profiles, and swallow the next agent's launches as blank
+    tabs (the Mac's dozen `about:blank`). Kill them by profile before leaving."""
+    from webscraper.browser_recovery import kill_profile_holder
+    for d in known_profile_dirs():
+        try:
+            kill_profile_holder(d, reason)
+        except Exception:                                         # noqa: BLE001
+            pass
+
+
 def _requeue_orphans(store: Store, kind: str) -> int:
     """Put jobs the last agent died mid-run back on the Worker's queue.
 
@@ -658,6 +682,12 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
+    # T397: a previous agent process that died hard leaves its Chromes running on
+    # OUR profile dirs; every launch from here would then land as a blank tab in them.
+    from webscraper.browser_recovery import reap_orphan_browsers
+    reaped = reap_orphan_browsers(known_profile_dirs(), "agent start")
+    if reaped:
+        log.warning("killed %d orphan Chrome(s) left by a previous agent process", reaped)
     orphans = _requeue_orphans(store, kind)
     if orphans:
         log.info("requeued %d job(s) left mid-run by a previous agent", orphans)
@@ -783,7 +813,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     # now so the loop in the OLD folder does not restart us meanwhile.
                     time.sleep(2)
                     import os as _os
-                    _os._exit(0)
+                    _close_browsers(); _os._exit(0)
             elif cmd["command"] == "checks":
                 # "Re-check" (T220): run the self-check NOW and narrate every line to the
                 # device log, shipped before command_done so the CRM's re-check dialog
@@ -885,7 +915,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     cloud.command_done(int(cmd["id"]), True, result)
                     _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
                     import os as _os
-                    _os._exit(0)
+                    _close_browsers(); _os._exit(0)
             elif cmd["command"] == "stop":
                 # W50 (2026-08-31): "Stop agent". Exiting is NOT enough — run-agent-loop
                 # restarts us 15s later, and the scheduled task restarts the loop at
@@ -924,7 +954,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 if _CRM_LOG:
                     _ship_agent_logs(cloud, _CRM_LOG[0])
                 time.sleep(1)
-                _os._exit(0)
+                _close_browsers(); _os._exit(0)
             elif cmd["command"] == "restart":
                 # W46: plain restart from the CRM — no pull. Same exit path as update; the
                 # supervisor loop brings us back and _requeue_orphans resumes the job.
@@ -933,7 +963,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 cloud.command_done(int(cmd["id"]), True, result)
                 _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
                 import os as _os
-                _os._exit(0)
+                _close_browsers(); _os._exit(0)
             else:
                 result = f"unknown command {cmd['command']}"
                 log.error("command %s: unknown on agent %s - Update agent first", cmd["command"], AGENT_VERSION if 'AGENT_VERSION' in globals() else '?')

@@ -168,6 +168,7 @@ launch (one pick per launch); httpx/curl_cffi rotate per attempt.
 - `max_minutes` caps **discovery only**. Enrichment and WhatsApp drain the backlog afterwards.
 - A lane must never report success when it gave up: end every lane through
   `Store.lane_end(job_id, lane, reason)` with a real reason token.
+- **T397 (2026-09-06): every persistent Chrome profile is OURS to kill.** A launch on a profile another Chrome still holds is swallowed by Chrome's process singleton as a blank tab (`Opening in existing browser session`) — so `Relauncher` takes `profile_dir=` and evicts the holder (`kill_profile_holder`), the agent reaps orphans at start and before `os._exit`, `close_blank_pages` prunes `about:blank` tabs, `mark_profile_clean` + `RESTORE_BUBBLE_ARGS` stop "Restore pages?". Never launch a persistent context without those three.
 - Browser crash recovery is shared — `browser_recovery.Relauncher` / `is_closed`. Any new
   Playwright surface uses it rather than growing its own copy.
 - New extracted field = add to `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()` and

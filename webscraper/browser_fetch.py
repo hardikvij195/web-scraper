@@ -27,9 +27,12 @@ import queue
 import random
 import re
 import threading
+import time
 from typing import Any, Callable
 
-from webscraper.browser_recovery import Relauncher, is_closed
+from webscraper.browser_recovery import (RELAUNCH_SETTLE_SEC, Relauncher, close_blank_pages,
+                                         is_closed, is_profile_busy, kill_profile_holder,
+                                         mark_profile_clean, reap_orphan_browsers)
 from webscraper.config import _bool, settings
 
 log = logging.getLogger("webscraper.browser_fetch")
@@ -100,6 +103,8 @@ _CF_TURNSTILE_RE = re.compile(r"<script[^>]+src=[\"'][^\"']*challenges\.cloudfla
 LAUNCH_ARGS = [
     "--no-first-run", "--no-default-browser-check", "--disable-infobars", "--disable-breakpad",
     "--disable-dev-shm-usage", "--disable-session-crashed-bubble",
+    # T397: the line above is a DEAD switch in modern Chrome; this is the live one.
+    "--hide-crash-restore-bubble",
     "--disable-search-engine-choice-screen", "--no-pings", "--password-store=basic",
     "--test-type", "--force-color-profile=srgb", "--font-render-hinting=none",
     "--lang=en-GB", "--accept-lang=en-GB,en",
@@ -131,6 +136,11 @@ SETTLE_MS = 1_500
 CHALLENGE_WAIT_MS = 12_000
 CHALLENGE_STEP_MS = 1_500
 BOOT_TIMEOUT_SEC = 90.0
+#: T397: Playwright's default launch timeout is 180 s — longer than BOOT_TIMEOUT_SEC, so
+#: the caller gave up at 90 s while the launch was still running, and the Chrome that
+#: eventually came up belonged to nobody. It then held the profile for the rest of the
+#: job and turned every later launch into one more blank tab in its window.
+LAUNCH_TIMEOUT_MS = int((BOOT_TIMEOUT_SEC - 15) * 1000)
 #: Generous because calls queue behind each other on the single worker thread.
 FETCH_TIMEOUT_SEC = 180.0
 MAX_BYTES = 1_500_000
@@ -260,6 +270,12 @@ class BrowserFetcher:
             self._closed = True
         self._jobs.put(None)
         self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            # T397: the worker is wedged mid-fetch (or inside context.close()); its Chrome
+            # would outlive this object, hold the profile, and swallow the next launch as
+            # a blank tab. Kill it by profile — the thread then errors out and exits.
+            log.warning("browser fetch worker did not stop in 30s — killing its Chrome")
+            kill_profile_holder(self._profile_dir(), "fetcher close timed out")
 
     # -- worker thread -------------------------------------------------------------
     #: Overridable by the Camoufox tier: which Playwright to drive (patchright here).
@@ -272,8 +288,9 @@ class BrowserFetcher:
     def _run(self) -> None:
         try:
             self._profile_dir().mkdir(parents=True, exist_ok=True)
+            reap_orphan_browsers([self._profile_dir()], "browser fetch boot")
             with self._playwright() as pw:
-                rl = Relauncher(self._opener(pw))
+                rl = Relauncher(self._opener(pw), profile_dir=self._profile_dir())
                 rl.open()
                 self._ready.set()
                 try:
@@ -336,9 +353,10 @@ class BrowserFetcher:
             args.append(AUTOMATION_FLAG)
 
         def _launch(use_chrome: bool, user_agent: str | None = None) -> Any:
-            kw: dict[str, Any] = dict(user_data_dir=str(PROFILE_DIR), headless=self._headless,
+            mark_profile_clean(self._profile_dir())
+            kw: dict[str, Any] = dict(user_data_dir=str(self._profile_dir()), headless=self._headless,
                                       args=args, ignore_default_args=IGNORE_DEFAULT_ARGS,
-                                      **self._context_options())
+                                      timeout=LAUNCH_TIMEOUT_MS, **self._context_options())
             # channel="chrome" = the machine's installed Google Chrome, not the bundled
             # chromium; a real fingerprint Cloudflare trusts. Omitted when Chrome is absent.
             if use_chrome:
@@ -354,7 +372,9 @@ class BrowserFetcher:
             try:
                 ctx = _launch(use_chrome, _HEADLESS_UA.get("ua"))
             except Exception as e:  # noqa: BLE001 — Chrome not installed / channel unusable
-                if not USE_REAL_CHROME:
+                # T397: a BUSY profile is not "Chrome unavailable" — the bundled fallback
+                # would hit the same lock. Let Relauncher evict the holder and retry.
+                if not USE_REAL_CHROME or is_profile_busy(e):
                     raise
                 log.info("real Chrome unavailable (%s) — falling back to bundled Chromium", e)
                 use_chrome = False
@@ -369,6 +389,7 @@ class BrowserFetcher:
                 _HEADLESS_UA["ua"] = real.replace("HeadlessChrome/", "Chrome/") if "Headless" in real else None
                 if _HEADLESS_UA["ua"]:
                     ctx.close()
+                    time.sleep(RELAUNCH_SETTLE_SEC)   # T397: let it drop the profile lock
                     ctx = _launch(use_chrome, _HEADLESS_UA["ua"])
                     pg = ctx.pages[0] if ctx.pages else ctx.new_page()
             log.debug("browser fetch launched (chrome=%s, stealth=%s, proxy=%s)",
@@ -392,6 +413,7 @@ class BrowserFetcher:
         as the Maps lane: a dead Chromium is worth rebuilding, a misbehaving page is not."""
         for attempt in (0, 1):
             _ctx, page = rl.current
+            close_blank_pages(_ctx, keep=page)   # T397: singleton hand-offs leave blank tabs
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 page.wait_for_timeout(SETTLE_MS)

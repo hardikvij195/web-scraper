@@ -27,7 +27,8 @@ from webscraper.extractors import (
     region_of_phone,
 )
 from webscraper.models import Place
-from webscraper.browser_recovery import Relauncher, is_closed
+from webscraper.browser_recovery import (RESTORE_BUBBLE_ARGS, Relauncher, close_blank_pages,
+                                         is_closed, mark_profile_clean)
 from webscraper.store import Store, now_iso
 
 log = logging.getLogger("webscraper.maps")
@@ -410,10 +411,11 @@ def opener_profile_dir() -> Path:
 
 def _launch_kwargs(profile_dir: Path, headless: bool) -> dict:
     profile_dir.mkdir(parents=True, exist_ok=True)
+    mark_profile_clean(profile_dir)   # T397: no "Restore pages?" after a hard agent exit
     kw: dict = dict(
         user_data_dir=str(profile_dir), headless=headless, locale="en-IN",
         viewport={"width": 1366, "height": 850},
-        args=["--disable-blink-features=AutomationControlled", "--lang=en-IN"],
+        args=["--disable-blink-features=AutomationControlled", "--lang=en-IN", *RESTORE_BUBBLE_ARGS],
     )
     if settings.maps_proxy:
         kw["proxy"] = {"server": settings.maps_proxy}
@@ -427,6 +429,7 @@ def _open_context(pw, launch_kwargs: dict):
     c.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),
             lambda route: route.abort())
     pg = c.pages[0] if c.pages else c.new_page()
+    close_blank_pages(c, keep=pg)   # T397
     pg.set_default_timeout(20000)
     return c, pg
 
@@ -463,7 +466,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
     try:
         with sync_playwright() as pw:
             kw = _launch_kwargs(settings.profile_dir, headless)
-            rl = Relauncher(lambda: _open_context(pw, kw),
+            rl = Relauncher(lambda: _open_context(pw, kw), profile_dir=settings.profile_dir,
                             on_restart=lambda where, n: emit("browser_restart", {"where": where, "attempt": n}))
             ctx, page = rl.open()
             try:
@@ -693,7 +696,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
     try:
         with sync_playwright() as pw:
             kw = _launch_kwargs(opener_profile_dir(), headless)
-            rl = Relauncher(lambda: _open_context(pw, kw),
+            rl = Relauncher(lambda: _open_context(pw, kw), profile_dir=opener_profile_dir(),
                             on_restart=lambda where, n: emit_direct("browser_restart", {"where": where, "attempt": n}))
             ctx, page = rl.open()
             try:

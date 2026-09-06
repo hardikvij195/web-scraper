@@ -30,7 +30,8 @@ from typing import Any, Callable
 
 from playwright.sync_api import Error as PWError, Page, TimeoutError as PWTimeout, sync_playwright
 
-from webscraper.browser_recovery import MAX_RELAUNCH, Relauncher, is_closed
+from webscraper.browser_recovery import (MAX_RELAUNCH, RESTORE_BUBBLE_ARGS, Relauncher,
+                                         is_closed, mark_profile_clean)
 from webscraper.config import settings
 from webscraper.extractors import normalise_phone
 from webscraper.store import Store, plus
@@ -135,11 +136,12 @@ def _dismiss_popup(page: Page) -> None:
 def login(name: str) -> bool:
     """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success."""
     Store().add_wa_account(name)
+    mark_profile_clean(profile_dir(name))
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)), headless=False, locale="en",
             viewport={"width": 1100, "height": 820},
-            args=["--disable-blink-features=AutomationControlled"])
+            args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto("https://web.whatsapp.com/", timeout=60_000)
@@ -163,10 +165,11 @@ def login(name: str) -> bool:
 
 def account_status(name: str) -> str:
     """Quick headless probe: 'logged_in' | 'logged_out'."""
+    mark_profile_clean(profile_dir(name))
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)), headless=True, locale="en",
-            args=["--disable-blink-features=AutomationControlled"])
+            args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.goto("https://web.whatsapp.com/", timeout=60_000)
@@ -364,10 +367,11 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
         return open_ctx[name][1]
 
     def _open() -> tuple[Any, Page]:
+        mark_profile_clean(profile_dir(name))
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)), headless=settings.wa_verify_headless, locale="en",
             viewport={"width": 1100, "height": 820},
-            args=["--disable-blink-features=AutomationControlled"])
+            args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto("https://web.whatsapp.com/", timeout=60_000)
@@ -384,7 +388,7 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             ctx.close()
             raise
 
-    rl = Relauncher(_open, on_restart=lambda where, n: log.warning(
+    rl = Relauncher(_open, profile_dir=profile_dir(name), on_restart=lambda where, n: log.warning(
         "[%s] WhatsApp browser died during %s - relaunching from %s (%d/%d)",
         name, where, profile_dir(name), n, MAX_RELAUNCH))
     try:
