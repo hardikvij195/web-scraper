@@ -116,6 +116,7 @@ data/            gitignored: leads.db, browser-profile/, browser-profile-open/, 
 | Var | Default | Effect |
 |---|---|---|
 | `ENRICH_TLS_IMPERSONATE` | `true` | W12: curl_cffi Chrome-fingerprint retry between httpx and the browser |
+| `ENRICH_TLS_ROTATION` | `chrome` | W56: comma list of curl_cffi identities tried in turn on a 403 / interstitial (e.g. `chrome,safari18_0,firefox147`). Off by default: measured +0 on 20 real 403 sites from the home IP (the walls left are JS challenges); a VPS IP may see different rules |
 | `ENRICH_BROWSER_FALLBACK` / `_HEADLESS` / `_REAL_CHROME` | `true` / `true` / `true` | W13: browser tier on/off, window, use installed Chrome |
 | `ENRICH_PROXY` | — | W13: ONE proxy URL for the curl_cffi + browser tiers (httpx stays direct) |
 | `ENRICH_PROXIES` | — | W15: comma/newline list (`user:pass@host:port` ok). **Supersedes `ENRICH_PROXY`.** Every tier: direct attempt, then if blocked one attempt via the pool's next proxy; a 407 / unreachable gateway earns one retry with the next proxy before the tier escalates |
@@ -174,6 +175,7 @@ launch (one pick per launch); httpx/curl_cffi rotate per attempt.
 - New extracted field = add to `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()` and
   `EXPORT_COLS` in `store.py`. Schema changes on an existing DB go through `_migrate()`.
 - Pure parsing goes in `extractors.py` with a test; Playwright code stays in `maps.py`.
+- **W56 (2026-09-07): every scraper change is measured against `docs/test-sites.md` with `python scripts/regress-sites.py` (all sections; `--section`, `--csv docs/test-sites.csv --class http_403`, `--headed`, `--json`).** The list is generated from every job run so far (16,563 distinct websites, `docs/test-sites.csv` has all of them with outcome / blocker class / tier). Vocabulary since W56: `enrich_error` gains `tls` / `reset` / `refused` (the old `network` catch-all split) and `cf_deny` (Cloudflare 1020/1015 — a static IP deny the ladder no longer escalates without a proxy); `cf_deny` is the only block-shaped reason `is_block()` says no to. JS-only shells (`is_js_shell`) go straight to the browser; JSON-LD `email` / `telephone` / `sameAs` is read (`extract_structured`); contact links are ranked contact > about > find-us; `site_phones` finally rides the CRM sync (it never did — the CRM had zero website phone numbers).
 - No Supabase/CRM wiring yet — when added, write to HVT CRM via REST/service role from a
   separate `sync.py`, never from `maps.py`/`enrich.py`.
 

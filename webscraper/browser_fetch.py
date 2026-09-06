@@ -93,6 +93,7 @@ _RECAPTCHA_ANCHOR_RE = re.compile(r"/recaptcha/(api2|enterprise)/anchor", re.I)
 _RECAPTCHA_BFRAME_RE = re.compile(r"/recaptcha/(api2|enterprise)/bframe", re.I)
 _RECAPTCHA_HTML_RE = re.compile(r"g-recaptcha|grecaptcha|www\.google\.com/recaptcha|recaptcha/(api|enterprise)", re.I)
 _CF_CTYPE_RE = re.compile(r"cType:\s*'([a-z_-]+)'")
+_CF_DENY_RE = re.compile(r"error code:?\s*10(?:15|20)\b|error 10(?:15|20)\b", re.I)
 _CF_TURNSTILE_RE = re.compile(r"<script[^>]+src=[\"'][^\"']*challenges\.cloudflare\.com/turnstile/v", re.I)
 
 #: W22: Scrapling's DEFAULT_ARGS + STEALTH_ARGS, minus `--disable-features=IsolateOrigins,
@@ -135,6 +136,8 @@ SETTLE_MS = 1_500
 #: on its own, so we stop rather than wait forever.
 CHALLENGE_WAIT_MS = 12_000
 CHALLENGE_STEP_MS = 1_500
+#: W56: how long to wait out a page that is still navigating after the settle.
+NAV_SETTLE_RETRY_MS = 9_000
 BOOT_TIMEOUT_SEC = 90.0
 #: T397: Playwright's default launch timeout is 180 s — longer than BOOT_TIMEOUT_SEC, so
 #: the caller gave up at 90 s while the launch was still running, and the Chrome that
@@ -146,7 +149,7 @@ FETCH_TIMEOUT_SEC = 180.0
 MAX_BYTES = 1_500_000
 
 _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking your browser",
-                  "access denied", "error 1015", "request blocked", "are you a robot",
+                  "access denied", "error 1015", "error 1020", "error code: 1020", "request blocked", "are you a robot",
                   # Google reCAPTCHA interstitial (osbournepinner.com etc., 2026-08-25)
                   "verifying that you are not a robot", "i'm not a robot", "bot verification",
                   "exceeding recaptcha")
@@ -192,6 +195,9 @@ def detect_cloudflare(html: str | None) -> str | None:
         return m.group(1)
     if _CF_TURNSTILE_RE.search(html):
         return "embedded"
+    if _CF_DENY_RE.search(html[:6000]):
+        # W56: Error 1020 (firewall rule) / 1015 (rate limit) — a static page, no challenge.
+        return "deny"
     # Google reCAPTCHA is a different wall (not Cloudflare) but handled on the same path:
     # a checkbox we can press, an image challenge we cannot (no solver — the line we drew).
     if _RECAPTCHA_HTML_RE.search(html):
@@ -417,7 +423,19 @@ class BrowserFetcher:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 page.wait_for_timeout(SETTLE_MS)
-                html = page.content()
+                # W56: `page.content()` raises "Unable to retrieve content because the page is
+                # navigating" when the settle ends mid-redirect (a Cloudflare document swap, a
+                # www. → bare hop, a JS `location=` on load). That used to be stored as
+                # 'network' after 4 s — 2 of 11 real-Chrome fetches in the T398 diagnostic.
+                # Wait the navigation out instead: the page is doing exactly what we want.
+                html = self._content_or_none(page)
+                settled = 0
+                while html is None and settled < NAV_SETTLE_RETRY_MS:
+                    page.wait_for_timeout(CHALLENGE_STEP_MS)
+                    settled += CHALLENGE_STEP_MS
+                    html = self._content_or_none(page)
+                if html is None:
+                    raise PWError("page kept navigating for %d ms" % (SETTLE_MS + settled))
                 if not looks_blocked(html):
                     return html[:MAX_BYTES], None
                 # A Cloudflare JS challenge swaps the document for the real page once its

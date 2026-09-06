@@ -50,6 +50,16 @@ ENABLED = _bool(os.getenv("ENRICH_TLS_IMPERSONATE"), True)
 #: Which browser fingerprint curl_cffi replays. A recent stable Chrome is the safest default;
 #: override with ENRICH_TLS_IMPERSONATE_TARGET if a newer one lands in curl_cffi.
 IMPERSONATE = os.getenv("ENRICH_TLS_IMPERSONATE_TARGET") or "chrome"
+#: W56: optional identity rotation — `ENRICH_TLS_ROTATION=chrome,safari18_0,firefox147`
+#: gives each 403 / interstitial one more GET per identity (~0.5 s each). OFF by default
+#: (just `IMPERSONATE`): measured on 20 real fingerprint-403 sites on 2026-09-07 the
+#: chrome identity rescued 4 and safari/firefox added 0 — the walls that remain are JS
+#: challenges, which no TLS handshake passes. Kept as a knob because a datacenter/VPS IP
+#: sees different rules than the home IP that measurement ran on. A target the installed
+#: curl_cffi does not know is skipped, not fatal.
+ROTATION = [t.strip() for t in (os.getenv("ENRICH_TLS_ROTATION") or IMPERSONATE).split(",") if t.strip()]
+#: Only these outcomes are worth another identity; a 404 / timeout is the same for all of them.
+_ROTATE_ON = ("http_403", "http_406", "http_418", "http_429", "http_503", "blocked")
 
 NAV_TIMEOUT_SEC = 20.0
 MAX_BYTES = 1_500_000
@@ -117,7 +127,19 @@ async def impersonate_fetch_ex(url: str, proxy: str | None = None) -> tuple[str 
     # Route through a proxy when one is configured. curl_cffi takes the requests-style
     # {"http": url, "https": url} shape. Inert without one.
     use_proxy = settings.enrich_proxy if proxy is None else (proxy or None)
-    kw: dict[str, Any] = dict(impersonate=IMPERSONATE, timeout=NAV_TIMEOUT_SEC,
+    last: tuple[str | None, str | None] = (None, "network")
+    for target in ROTATION or [IMPERSONATE]:
+        last = await _fetch_as(session_cls, target, url, use_proxy)
+        if last[0] is not None or last[1] not in _ROTATE_ON:
+            return last
+        log.debug("tls impersonate as %s got %s on %s — trying the next identity", target, last[1], url)
+    return last
+
+
+async def _fetch_as(session_cls: Callable[..., Any], target: str, url: str,
+                    use_proxy: str | None) -> tuple[str | None, str | None]:
+    """One identity's GET (with the W22 single connection-level retry)."""
+    kw: dict[str, Any] = dict(impersonate=target, timeout=NAV_TIMEOUT_SEC,
                               headers=dict(EXTRA_HEADERS))
     if use_proxy:
         kw["proxies"] = {"http": use_proxy, "https": use_proxy}
@@ -128,7 +150,7 @@ async def impersonate_fetch_ex(url: str, proxy: str | None = None) -> tuple[str 
                 if r.status_code == 407:
                     return None, "proxy_407"
                 if r.status_code >= 400:
-                    log.debug("tls impersonate still refused %s: %s", url, r.status_code)
+                    log.debug("tls impersonate (%s) still refused %s: %s", target, url, r.status_code)
                     return None, f"http_{r.status_code}"
                 ctype = (r.headers.get("content-type") or "").lower()
                 if ctype and "html" not in ctype and "xml" not in ctype:
@@ -144,6 +166,11 @@ async def impersonate_fetch_ex(url: str, proxy: str | None = None) -> tuple[str 
             log.debug("tls impersonate failed %s: %s", url, e)
             return None, _classify_exception(e, bool(use_proxy))
         except Exception as e:  # noqa: BLE001 — fall through to the browser, never crash the run
+            msg = str(e).lower()
+            if "impersonate" in msg or "not supported" in msg or "unknown" in msg and "target" in msg:
+                # This curl_cffi does not know the identity — skip it, do not blame the site.
+                log.debug("tls impersonate target %s unavailable: %s", target, e)
+                return None, "blocked"
             log.debug("tls impersonate failed %s: %s", url, e)
             return None, _classify_exception(e, bool(use_proxy))
     return None, "network"

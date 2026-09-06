@@ -6,6 +6,7 @@ local UI had created it. This loop watches local state and mirrors it up.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -369,7 +370,21 @@ def _flat(r: dict) -> dict:
         # row it may already hold instead of re-sending a blank lead. The Edge Function's
         # `sync` action deletes rows flagged `_delete` (2026-09-05).
         return {"place_key": r["place_key"], "_delete": True}
-    return {k: v for k, v in _row(r).items() if v is not None and v != ""}
+    out = {k: v for k, v in _row(r).items() if v is not None and v != ""}
+    # W56 (2026-09-07): `site_phones` was never in `_row` (`supa._COLS` is the SaaS table's
+    # shape, which lacks the column), so the CRM held NO website phone numbers at all —
+    # 47 of 72 leads the CRM showed as "done, nothing found" had numbers sitting in the
+    # local DB. The CRM's `sync` action has accepted `site_phones` (jsonb) since
+    # 20260825T1200; only the CRM path gets it, the SaaS push stays as it was.
+    phones = r.get("site_phones")
+    if isinstance(phones, str):
+        try:
+            phones = json.loads(phones)
+        except (TypeError, ValueError):
+            phones = None
+    if isinstance(phones, list) and phones:
+        out["site_phones"] = phones
+    return out
 
 
 #: Log lines shipped per tick. Bounded so a job that logged for an hour while the CRM was

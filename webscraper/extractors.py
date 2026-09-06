@@ -4,6 +4,7 @@ No I/O here — everything is unit-testable with plain strings.
 """
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
@@ -370,11 +371,24 @@ def domain_of(url: str | None) -> str | None:
     return host[4:] if host.startswith("www.") else (host or None)
 
 
+#: W56: a contact page beats an about page beats a "find us" page — the crawler only follows
+#: two, so order matters more than recall. Scores are per (path + link text).
+_CONTACT_RANK = (
+    (3, re.compile(r"contact|get-in-touch|getintouch|reach-us|reach us|enquir|inquir|quote")),
+    (2, re.compile(r"about|team|our-story|who-we-are|meet")),
+    (1, re.compile(r"find-us|findus|visit|location|where-to-find|support|help|connect|book")),
+)
+
+
 def contact_page_links(html: str, base_url: str) -> list[str]:
-    """Same-site links that look like contact/about pages, in order found (max 4)."""
+    """Same-site links that look like contact/about pages, best first (max 4).
+
+    W56: ranked (contact > about/team > find-us/visit/location/support) instead of document
+    order — a nav bar lists "About" before "Contact", so the two pages the crawler follows
+    used to be About + Team while the email sat on /contact-us."""
     tree = HTMLParser(html)
     base_dom = domain_of(base_url)
-    out: list[str] = []
+    scored: dict[str, int] = {}
     for a in tree.css("a[href]"):
         href = (a.attributes.get("href") or "").strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
@@ -384,10 +398,80 @@ def contact_page_links(html: str, base_url: str) -> list[str]:
             continue
         path = urlparse(full).path.lower()
         text = (a.text() or "").strip().lower()
-        if re.search(r"contact|reach|get-in-touch|about|connect|enquir|inquir", path + " " + text):
-            full = full.split("#", 1)[0]
-            if full not in out and full.rstrip("/") != base_url.rstrip("/"):
-                out.append(full)
-        if len(out) >= 4:
-            break
+        hay = path + " " + text
+        score = next((s for s, rx in _CONTACT_RANK if rx.search(hay)), 0)
+        if not score:
+            continue
+        full = full.split("#", 1)[0]
+        if full.rstrip("/") == base_url.rstrip("/"):
+            continue
+        # Same score keeps document order (dict insertion); a better score wins outright.
+        if full not in scored or scored[full] < score:
+            scored[full] = score
+    ranked = sorted(scored.items(), key=lambda kv: -kv[1])
+    return [u for u, _ in ranked[:4]]
+
+
+# ── structured data / JS shells (W56) ─────────────────────────────────────────
+_JSONLD_RE = re.compile(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", re.I | re.S)
+_TEXT_STRIP_RE = re.compile(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<[^>]+>", re.I | re.S)
+_SHELL_MOUNT_RE = re.compile(r"<div[^>]+id=[\"'](?:root|app|__next|__nuxt|___gatsby|q-app|svelte)[\"'][^>]*>\s*</div>", re.I)
+
+
+def extract_structured(html: str) -> dict:
+    """Emails / phones / social profiles from JSON-LD blocks (`LocalBusiness`,
+    `Organization`, `ContactPoint`, `sameAs`). Builder sites (Wix, Squarespace, Shopify
+    themes) often put the only machine-readable contact details here. Pure; never raises.
+    Returns {'emails': [...], 'phones': [raw strings], 'socials': {net: url}}."""
+    out: dict = {"emails": [], "phones": [], "socials": {}}
+    if not html or "ld+json" not in html:
+        return out
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = str(k).lower()
+                if kl == "email" and isinstance(v, str):
+                    e = clean_email(v.replace("mailto:", ""))
+                    if e and e not in out["emails"]:
+                        out["emails"].append(e)
+                elif kl == "telephone" and isinstance(v, (str, int)):
+                    s = str(v).strip()
+                    if s and s not in out["phones"]:
+                        out["phones"].append(s)
+                elif kl == "sameas":
+                    for u in (v if isinstance(v, list) else [v]):
+                        hit = classify_social(u) if isinstance(u, str) else None
+                        if hit and hit[0] not in out["socials"]:
+                            out["socials"][hit[0]] = hit[1]
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for m in _JSONLD_RE.finditer(html):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            try:
+                data = json.loads(raw.replace("\n", " ").replace("\t", " "))
+            except ValueError:
+                continue
+        walk(data)
     return out
+
+
+def is_js_shell(html: str | None, min_text: int = 200) -> bool:
+    """True when the page is an app shell that only renders in a browser: a mount node such
+    as `<div id="root"></div>` and almost no visible text once scripts/styles/tags are gone.
+    A real (if short) page keeps its text; a shell has bundles and nothing else."""
+    if not html or len(html) < 1500:
+        return False
+    if not _SHELL_MOUNT_RE.search(html):
+        return False
+    text = re.sub(r"\s+", " ", _TEXT_STRIP_RE.sub(" ", html)).strip()
+    return len(text) < min_text

@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from webscraper.config import settings
 from webscraper.extractors import (
-    contact_page_links, extract_emails, extract_phones, extract_socials, extract_whatsapp, is_probably_mobile,
-    normalise_wa, region_of_phone,
+    contact_page_links, extract_emails, extract_phones, extract_socials, extract_structured, extract_whatsapp,
+    is_js_shell, is_probably_mobile, normalise_wa, region_of_phone,
 )
 from webscraper.config import settings
 from webscraper.impersonate_fetch import impersonate_fetch_ex
@@ -122,6 +124,12 @@ def is_block(error: str | None) -> bool:
     """
     if error and "@" in error:
         error = error.split("@", 1)[0]          # 'http_403@gw:7777' — the proxy tag (W15)
+    if error == "cf_deny":
+        # W56: Cloudflare's IP/ASN/country rule (Error 1020 / 1015) — a static deny with no
+        # challenge to solve. Every tier on this same IP gets the same page, so escalating
+        # only burns ~5 s of browser per site. A proxy is the one thing that can change it
+        # (`_with_proxies` treats it as a block when a pool is configured).
+        return False
     if error and (error.startswith("cf_") or error in ("blocked", "recaptcha")):
         # W22: a Cloudflare wall classified by the browser tier (cf_non_interactive /
         # cf_managed / cf_interactive / cf_embedded) or a 200 whose body was an
@@ -129,6 +137,23 @@ def is_block(error: str | None) -> bool:
         return True
     return error == "timeout" or error in tuple(http_error(c) for c in BLOCK_CODES)
 
+
+def is_ip_deny(error: str | None) -> bool:
+    """A Cloudflare 1020/1015 deny: only a different exit IP can help (W56)."""
+    return (error or "").split("@", 1)[0] == "cf_deny"
+
+
+#: W56: the audit's 'network' bucket (435 of 1,708 failures) hid three different things.
+#: These markers split it so the CRM can say which — and so `_fetch_home` knows which ones
+#: are host-level (worth the www./non-www variant) rather than a verdict on the page.
+_TLS_MARKERS = ("ssl", "tls", "certificate", "handshake", "wrong_version_number",
+                "unexpected_eof", "sslv3", "alert internal error")
+_RESET_MARKERS = ("connection reset", "econnreset", "10054", "remoteprotocolerror",
+                  "server disconnected", "connection closed", "peer closed")
+_REFUSED_MARKERS = ("connection refused", "econnrefused", "10061", "actively refused")
+#: Failures that are about the HOST, not the page — the only ones where trying the other
+#: hostname spelling (www. ⇄ bare) can change the answer.
+HOST_ERRORS = ("dns", "tls", "reset", "refused", "timeout")
 
 #: getaddrinfo's message differs per platform; all of them mean the same dead domain.
 _DNS_MARKERS = ("getaddrinfo", "name or service not known", "nodename nor servname",
@@ -142,12 +167,40 @@ def transport_error(e: Exception) -> str:
     'dns' is worth separating out because it is terminal: `atypesourcing.com` (job #6) does
     not resolve, so no retry, browser or otherwise, will ever help — that lead's website is
     dead and only its phone is left. 'timeout' and the 'network' catch-all can both be
-    transient, so re-enriching those is worth queueing."""
+    transient, so re-enriching those is worth queueing. W56 splits 'network' further into
+    'tls' (handshake / certificate), 'reset' (the host dropped us mid-connection — often a
+    soft block) and 'refused' (nothing listening on that port)."""
     if isinstance(e, httpx.TimeoutException):
         return "timeout"
-    if any(m in str(e).lower() for m in _DNS_MARKERS):
+    msg = str(e).lower()
+    if any(m in msg for m in _DNS_MARKERS):
         return "dns"
+    if any(m in msg for m in _TLS_MARKERS):
+        return "tls"
+    if isinstance(e, httpx.RemoteProtocolError) or any(m in msg for m in _RESET_MARKERS):
+        return "reset"
+    if any(m in msg for m in _REFUSED_MARKERS):
+        return "refused"
     return "network"
+
+
+#: W56: Cloudflare's static deny pages. 1020 = an IP/ASN/country firewall rule, 1015 = its
+#: rate limiter. Both arrive as a 403/429 whose BODY names the code; neither offers a
+#: challenge, so `http_403` (which earns the whole ladder) is the wrong verdict for them.
+_CF_DENY_RE = re.compile(r"error code:?\s*10(?:15|20)\b|error 10(?:15|20)\b|"
+                         r"<title>\s*access denied\s*\|.*cloudflare", re.I | re.S)
+#: 429 back-off: one pause then one retry, honouring Retry-After when it is short. A
+#: straight retry at the same pace is exactly what the audit's 429s got, and it is a 429 twice.
+RATE_LIMIT_WAIT_SEC = 8.0
+RATE_LIMIT_MAX_WAIT_SEC = 20.0
+
+
+def classify_deny(status_code: int, body: str | None) -> str:
+    """The stored reason for a 4xx: 'cf_deny' when the body is Cloudflare's 1020/1015 page,
+    else the plain 'http_<code>'."""
+    if status_code in (403, 429, 503) and body and _CF_DENY_RE.search(body[:6000]):
+        return "cf_deny"
+    return http_error(status_code)
 
 
 def crawl_error(pages_fetched: int, reason: str | None) -> str | None:
@@ -180,14 +233,29 @@ async def _fetch_ex(client: httpx.AsyncClient, url: str, retries: int = 1,
             got = Fetched(error="proxy_connect")
         got.proxy = proxy
         return got
-    for attempt in range(retries + 1):
+    backed_off = False
+    attempt, budget = 0, retries + 1
+    while attempt < budget:
+        attempt += 1
         try:
             r = await client.get(url)
             ctype = r.headers.get("content-type", "")
             if r.status_code == 407:
                 return Fetched(error="proxy_407")
+            if r.status_code == 429 and not backed_off:
+                # W56: the site is pacing us, not refusing us — wait once, then one more GET
+                # (on top of the transport-retry budget, which this does not consume).
+                backed_off = True
+                budget += 1
+                try:
+                    wait = min(float(r.headers.get("retry-after") or RATE_LIMIT_WAIT_SEC), RATE_LIMIT_MAX_WAIT_SEC)
+                except ValueError:
+                    wait = RATE_LIMIT_WAIT_SEC
+                log.debug("429 from %s — backing off %.0fs", url, wait)
+                await asyncio.sleep(wait)
+                continue
             if r.status_code >= 400:
-                return Fetched(error=http_error(r.status_code))
+                return Fetched(error=classify_deny(r.status_code, r.text[:6000] if "html" in ctype else None))
             if ctype and "html" not in ctype and "xml" not in ctype:
                 # A PDF/image/JSON "website" — a real response, just nothing to parse.
                 return Fetched(error="non_html")
@@ -196,8 +264,8 @@ async def _fetch_ex(client: httpx.AsyncClient, url: str, retries: int = 1,
             log.debug("proxy failed for %s: %s", url, e)
             return Fetched(error="proxy_connect")
         except httpx.TransportError as e:
-            log.debug("fetch failed %s (attempt %d): %s", url, attempt + 1, e)
-            if attempt < retries:
+            log.debug("fetch failed %s (attempt %d): %s", url, attempt, e)
+            if attempt < budget:
                 await asyncio.sleep(1.5)
                 continue
             return Fetched(error=transport_error(e))
@@ -231,12 +299,50 @@ def _merge(into: Contacts, html: str, region: str = "IN") -> None:
         for p in extract_phones(html, region):
             if p not in into.phones:
                 into.phones.append(p)
+    # W56: JSON-LD `LocalBusiness` / `Organization` blocks carry email / telephone / sameAs
+    # that never appear as visible text or <a> links on builder sites (Wix, Squarespace,
+    # Shopify themes) — 1,852 "done" leads in the audit had nothing extracted at all.
+    structured = extract_structured(html)
+    for e in structured["emails"]:
+        if e not in into.emails:
+            into.emails.append(e)
+    for net, url in structured["socials"].items():
+        if getattr(into, net) is None:
+            setattr(into, net, url)
+    if len(into.phones) < 6:
+        for p in extract_phones(" ".join(f'href="tel:{t}"' for t in structured["phones"]), region):
+            if p not in into.phones:
+                into.phones.append(p)
+
+
+def _www_variant(url: str) -> str | None:
+    """'https://www.x.co.uk/' ⇄ 'https://x.co.uk/', or None when the host has no simple
+    variant (an IP, a deeper subdomain, a bare TLD)."""
+    try:
+        s = urlsplit(url)
+    except ValueError:
+        return None
+    host = s.netloc
+    if not host or host.replace(".", "").isdigit():
+        return None
+    if host.lower().startswith("www."):
+        alt = host[4:]
+    elif host.count(".") <= 2:              # x.co.uk / x.com — never  a.b.x.com
+        alt = "www." + host
+    else:
+        return None
+    return urlunsplit((s.scheme, alt, s.path, s.query, s.fragment))
 
 
 async def _fetch_home(client: httpx.AsyncClient, website: str,
                       proxy: str | None = None) -> Fetched:
     """The httpx tier: home page over http, then https when http gave nothing. The URL that
-    ends up in `Fetched.url` is the one the slower tiers should be pointed at."""
+    ends up in `Fetched.url` is the one the slower tiers should be pointed at.
+
+    W56: when BOTH schemes fail at the host level (dns / tls / reset / refused / timeout)
+    the other hostname spelling is tried once — 661 of the audit's failures were 'dns', and
+    a share of those are Maps listings with `www.` on a zone that only publishes the bare
+    name (or the reverse), not dead sites."""
     url = website if "://" in website else "http://" + website
     got = await _fetch_ex(client, url, proxy=proxy)
     if got.html is None and url.startswith("http://"):
@@ -249,7 +355,21 @@ async def _fetch_home(client: httpx.AsyncClient, website: str,
             url, got = url_https, alt
         elif got.error is None:
             got = alt
+    if got.html is None and got.error in HOST_ERRORS:
+        variant = _www_variant("https://" + url.split("://", 1)[1])
+        if variant:
+            v = await _fetch_ex(client, variant, proxy=proxy)
+            if v.html is None and v.error in HOST_ERRORS and got.error == "dns":
+                v = await _fetch_ex(client, "http://" + variant.split("://", 1)[1], proxy=proxy)
+            if v.html is not None or is_block(v.error):
+                log.info("host variant rescued %s (%s said %s)", variant, url, got.error)
+                url, got = variant, v
     got.url = url
+    return got
+
+
+async def _noop_fetch(got: Fetched) -> Fetched:
+    """The already-known direct verdict, for a proxy-only pass (W56 cf_deny)."""
     return got
 
 
@@ -296,7 +416,7 @@ async def _with_proxies(attempt: Callable[[str | None], Awaitable[Fetched]],
         if got is not None and got.html is not None:
             return got
         direct = await attempt(None)
-        if direct.html is not None and got is not None and is_block(got.error):
+        if direct.html is not None and got is not None and (is_block(got.error) or is_ip_deny(got.error)):
             # The site answered the own IP but blocked the proxy's: a 403 on a known-good
             # page is the one case a site block IS evidence against the proxy.
             pool.failure(got.proxy or "", f"{got.error} on known-good page")
@@ -306,7 +426,7 @@ async def _with_proxies(attempt: Callable[[str | None], Awaitable[Fetched]],
         # unless only the direct one is a block the next tier can still act on.
         return got if is_block(got.error) or not is_block(direct.error) else direct
     direct = await attempt(None)
-    if direct.html is not None or not is_block(direct.error):
+    if direct.html is not None or not (is_block(direct.error) or is_ip_deny(direct.error)):
         return direct
     got = await via_pool()
     if got is None or got.error in PROXY_ERRORS:
@@ -339,6 +459,22 @@ async def crawl_site(client: httpx.AsyncClient, website: str,
     got = await _with_proxies(lambda p: _fetch_home(client, website, p), pool, proxy_first)
     url = got.url or (website if "://" in website else "http://" + website)
     via = got.tag("httpx") if got.html is not None else None
+    # W56: a JS-only shell (`<div id="root"></div>` + a bundle, no text) is a 200 that still
+    # tells us nothing — it used to be stored as 'done' with no contacts. Only the browser
+    # renders it, so it goes straight there; the shell stays as the fallback if that fails.
+    if got.html is not None and browser_retry is not None and is_js_shell(got.html):
+        res = await browser_retry(url)
+        html = res[0] if isinstance(res, tuple) else res
+        if html and not is_js_shell(html):
+            log.info("browser rendered JS-only shell %s", url)
+            got, via = Fetched(html=html, url=url), "browser"
+    if got.html is None and is_ip_deny(got.error):
+        # W56: Cloudflare 1020/1015 — same IP, same answer; only a proxy changes it.
+        if pool:
+            got = await _with_proxies(lambda p: _fetch_home(client, website, p) if p else _noop_fetch(got), pool, True)
+            via = got.tag("httpx") if got.html is not None else None
+        else:
+            log.debug("cloudflare deny (%s) for %s — no proxy pool, not escalating", got.error, url)
     # TLS-impersonation retry: cheaper than the browser and beats the fingerprint-403s that
     # make up most blocks (see impersonate_fetch). Sits BEFORE the browser so the ~5 s slow
     # path is only paid for the JS challenges curl_cffi cannot pass. Self-gating and optional

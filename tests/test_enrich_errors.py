@@ -39,11 +39,13 @@ def test_timeout_error():
     assert transport_error(httpx.ReadTimeout("timed out")) == "timeout"
 
 
-def test_other_transport_errors_are_network():
+def test_other_transport_errors_are_not_dns():
     # A TLS/connection-refused failure is not DNS — mislabelling it would say "dead domain"
-    # about a site that is merely down right now.
-    assert transport_error(httpx.ConnectError("[Errno 111] Connection refused")) == "network"
-    assert transport_error(httpx.RemoteProtocolError("server disconnected")) == "network"
+    # about a site that is merely down right now. W56 names them: refused / reset / tls;
+    # only a failure of no recognised kind is still 'network'.
+    assert transport_error(httpx.ConnectError("[Errno 111] Connection refused")) == "refused"
+    assert transport_error(httpx.RemoteProtocolError("server disconnected")) == "reset"
+    assert transport_error(httpx.ConnectError("no route to host")) == "network"
 
 
 def test_crawl_error_reasons():
