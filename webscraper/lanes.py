@@ -326,7 +326,17 @@ class EnrichmentLane(Lane):
             # Pass the job's window choice through: a re-enrich run headed ("Show window"
             # in the CRM) must actually open a visible browser on a blocked site. `headless`
             # is stored 1/0; None leaves the module default when the column is unset.
-            hl = self.job.get("headless")
+            # Re-read it from the store per batch (T382): a "Show window" re-run that lands
+            # while this worker is busy only updates the stored row — the in-memory
+            # self.job kept the value the run started with, so the Mac ran job #8 hidden
+            # for its whole 350-site pass after the user had asked for a window.
+            row = store.get_job(self.job_id)
+            fresh = dict(row) if row is not None else {}
+            hl = fresh.get("headless", self.job.get("headless"))
+            if hl is not None and self.job.get("headless") is not None and bool(hl) != bool(self.job.get("headless")):
+                self.store.log(self.job_id, "enrichment",
+                               "window setting changed mid-run -> " + ("hidden" if hl else "visible") + " from this batch on")
+                self.job["headless"] = hl
             self.store.log(self.job_id, "enrichment",
                            f"crawling {len(batch)} website(s): " + ", ".join(
                                (r.get("name") or r.get("place_key") or "?")[:40] for r in batch[:10])
