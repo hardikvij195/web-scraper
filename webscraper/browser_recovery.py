@@ -144,6 +144,21 @@ def _parent_pid(pid: int) -> int | None:
         return None
 
 
+def _is_descendant_of(pid: int, ancestor: int, max_depth: int = 12) -> bool:
+    """True when `ancestor` is `pid` itself or somewhere up its parent chain. A Chrome we
+    launched hangs off Playwright's node driver, which hangs off THIS process; a Chrome
+    from a previous agent process hangs off a driver whose parent is gone (launchd/init)."""
+    cur = pid
+    for _ in range(max_depth):
+        if cur == ancestor:
+            return True
+        parent = _parent_pid(cur)
+        if parent is None or parent <= 1:
+            return False
+        cur = parent
+    return False
+
+
 def _remove_lock_files(profile_dir: Path) -> None:
     for name in _LOCK_FILES:
         try:
@@ -194,9 +209,12 @@ def kill_profile_holder(profile_dir: Path, reason: str = "") -> bool:
 
 def reap_orphan_browsers(profile_dirs: Iterable[Path], reason: str = "agent start") -> int:
     """For each of OUR profile dirs: a lock whose PID is dead is cleared; a live holder
-    whose parent is gone (re-parented to launchd/init — the agent that started it exited
-    with `os._exit`) is an orphan and is killed. Returns the number killed."""
+    that is not descended from THIS process (the agent that started it exited with
+    `os._exit`, leaving Chrome and its Playwright driver behind) is an orphan and is
+    killed. One agent per machine, so nothing else may legitimately own these dirs.
+    Returns the number killed."""
     n = 0
+    me = os.getpid()
     for d in profile_dirs:
         d = Path(d)
         if not d.exists():
@@ -208,7 +226,7 @@ def reap_orphan_browsers(profile_dirs: Iterable[Path], reason: str = "agent star
             log.info("clearing stale lock on %s (pid %d is gone)", d.name, pid)
             _remove_lock_files(d)
             continue
-        if _parent_pid(pid) in (1, 0, None) and pid != os.getpid():
+        if not _is_descendant_of(pid, me):
             if kill_profile_holder(d, f"orphan, {reason}"):
                 n += 1
     return n
