@@ -251,8 +251,29 @@ class CrmCloud:
         self.c = httpx.Client(timeout=60, headers={"X-Agent-Token": token,
                                                    "Content-Type": "application/json"})
 
+    #: W69 — consecutive 401/403 answers from the CRM. A token that has been revoked or
+    #: deleted answers this way for ever, and the agent used to keep going: the cloud
+    #: calls failed, but the LOCAL worker carried on running its job, opening browsers on
+    #: the machine long after the CRM had cut it off ("I revoked the Mac token and it is
+    #: still opening websites", 2026-09-08).
+    _denied = 0
+
     def _post(self, payload: dict) -> httpx.Response:
-        return self.c.post(self.url, json=payload)
+        r = self.c.post(self.url, json=payload)
+        if r.status_code in (401, 403):
+            CrmCloud._denied += 1
+            if CrmCloud._denied == 1 or CrmCloud._denied % 20 == 0:
+                log.error("the CRM rejected this agent's token (%s) — it has been revoked or "
+                          "deleted. Stopping local work; run the installer again with a new "
+                          "token, or delete data/agent.stop and re-register.", r.status_code)
+        elif r.status_code < 400:
+            CrmCloud._denied = 0
+        return r
+
+    @classmethod
+    def token_revoked(cls) -> bool:
+        """True once the CRM has refused this token often enough to mean it, not a blip."""
+        return cls._denied >= 3
 
     #: Self-check cadence. The checks are cheap but there is no point re-sending an
     #: unchanged picture every second while a job is busy.
@@ -804,6 +825,26 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         if kind == "crm":
             _poll_command(cloud)
             _ship_agent_logs(cloud, crm_log)
+        # W69: a revoked token is not a network hiccup. Stop the work this machine is
+        # doing — the CRM can no longer see it, so anything it opens is unaccountable —
+        # and park, which is the same state Stop leaves the agent in and is recoverable
+        # by re-registering.
+        if kind == "crm" and isinstance(cloud, CrmCloud) and cloud.token_revoked() and not _STANDBY[0]:
+            log.error("standing down: this agent's CRM token is no longer accepted")
+            # There is no "stop this job" API on the worker; the flag in its own store is
+            # what the lanes poll, and it is what the CRM's Stop button sets too.
+            try:
+                cur = getattr(srv.worker, "current_job", None)
+                if cur:
+                    store.update_job(int(cur), stop_requested=1,
+                                     message="stopped — this agent's CRM token was revoked")
+                    store.log(int(cur), "job", "stopped: the CRM no longer accepts this "
+                                               "agent's token", level="error")
+            except Exception:                                     # noqa: BLE001
+                log.debug("could not flag the running job", exc_info=True)
+            _close_browsers()
+            _STANDBY[0] = True
+
         if _STANDBY[0]:
             # Parked: heartbeat and commands only. `jobs()` is what carries the
             # heartbeat and the periodic self-check, and with `enabled` off in the CRM
