@@ -166,52 +166,73 @@ def login_in_progress(name: str | None = None) -> bool:
 
 
 def login(name: str) -> bool:
-    """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success."""
+    """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success.
+
+    W70: a profile whose WhatsApp Web client never gets past the splash is wiped and
+    relaunched once. The ASUS spent two whole windows on that screen (2026-09-08) and
+    never saw a QR; a fresh profile boots to the QR in seconds. A profile that shows
+    the chat list is linked and is never touched. Only a profile that shows NOTHING
+    within the boot window is treated as broken — and nothing linked ever looks like
+    that.
+    """
     Store().add_wa_account(name)
-    mark_profile_clean(profile_dir(name))
     _LOGIN_ACTIVE.add(name)
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir(name)), headless=False, locale="en",
-            viewport={"width": 1100, "height": 820},
-            args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
-        try:
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto("https://web.whatsapp.com/", timeout=60_000)
-            # W63: the two minutes used to start HERE, at the moment the tab opened. But
-            # WhatsApp Web shows its own splash first while it loads its client and
-            # decrypts the local store, and on a machine with an existing profile that can
-            # take most of a minute on its own — the ASUS spent the whole window on the
-            # splash and reported "timed out waiting for QR scan" without ever having
-            # shown a QR (2026-09-08). Wait for the page to actually finish booting, THEN
-            # give the person their full two minutes.
-            try:
-                page.wait_for_selector(
-                    'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref], '
-                    'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
-                    timeout=_BOOT_TIMEOUT_MS)
-            except PWTimeout:
-                log.warning("[%s] WhatsApp Web is still on its loading screen after %ds — "
-                            "waiting for the QR anyway", name, _BOOT_TIMEOUT_MS // 1000)
-            log.info("[%s] scan the QR in the window (2 min)...", name)
-            try:
-                page.wait_for_selector(
-                    'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
-                    timeout=_LOGIN_TIMEOUT_MS)
-                log.info("[%s] logged in - session saved to %s", name, profile_dir(name))
-                Store().set_wa_status(name, "logged_in")           # W64
-                ok = True
-            except PWTimeout:
-                log.warning("[%s] timed out waiting for QR scan", name)
-                Store().set_wa_status(name, "logged_out")          # W64
-                ok = False
-            time.sleep(1.5)   # let WA flush the session to disk before we close
-        finally:
-            # T336: a goto that throws (offline, DNS hiccup) must not leak this window —
-            # it stayed open at about:blank until the process was killed by hand.
-            ctx.close()
-            _LOGIN_ACTIVE.discard(name)                            # W68
+    ok = False
+    try:
+        with sync_playwright() as pw:
+            booted = _login_attempt(pw, name)
+            if booted is None:
+                import shutil
+                log.warning("[%s] WhatsApp Web never rendered on this profile — wiping it and "
+                            "starting fresh", name)
+                shutil.rmtree(profile_dir(name), ignore_errors=True)
+                booted = _login_attempt(pw, name)
+            ok = bool(booted)
+    finally:
+        _LOGIN_ACTIVE.discard(name)                                # W68
     return ok
+
+
+def _login_attempt(pw, name: str) -> bool | None:
+    """One headed login window. True = linked, False = QR shown but not scanned in time,
+    None = the client never rendered anything at all (the profile is the problem)."""
+    mark_profile_clean(profile_dir(name))
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=str(profile_dir(name)), headless=False, locale="en",
+        viewport={"width": 1100, "height": 820},
+        args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://web.whatsapp.com/", timeout=60_000)
+        # W63: the scan window starts once the page has actually rendered — QR or chat
+        # list — not the moment the tab opened; WhatsApp Web's own boot took the whole
+        # window on the ASUS before, and no QR was ever shown.
+        try:
+            page.wait_for_selector(
+                'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref], '
+                'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
+                timeout=_BOOT_TIMEOUT_MS)
+        except PWTimeout:
+            log.warning("[%s] WhatsApp Web is still on its loading screen after %ds",
+                        name, _BOOT_TIMEOUT_MS // 1000)
+            return None
+        log.info("[%s] scan the QR in the window (2 min)...", name)
+        try:
+            page.wait_for_selector(
+                'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
+                timeout=_LOGIN_TIMEOUT_MS)
+            log.info("[%s] logged in - session saved to %s", name, profile_dir(name))
+            Store().set_wa_status(name, "logged_in")               # W64
+            time.sleep(1.5)   # let WA flush the session to disk before we close
+            return True
+        except PWTimeout:
+            log.warning("[%s] timed out waiting for QR scan", name)
+            Store().set_wa_status(name, "logged_out")              # W64
+            return False
+    finally:
+        # T336: a goto that throws (offline, DNS hiccup) must not leak this window —
+        # it stayed open at about:blank until the process was killed by hand.
+        ctx.close()
 
 
 def account_status(name: str) -> str:
