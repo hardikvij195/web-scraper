@@ -202,7 +202,8 @@ def test_verify_places_checks_every_number_and_records_per_number(db, monkeypatc
 
     monkeypatch.setattr(wv, "sync_playwright", lambda: _PW())
     monkeypatch.setattr(wv, "_ensure_session",
-                        lambda pw, open_ctx, rl, name: open_ctx.setdefault(name, (_Ctx(), _Page()))[1])
+                        # W59 added the per-job `headless` argument (None = the agent's setting).
+                        lambda pw, open_ctx, rl, name, headless=None: open_ctx.setdefault(name, (_Ctx(), _Page()))[1])
     monkeypatch.setattr(wv, "_decide", lambda page: verdicts[page.num])
     monkeypatch.setattr(wv, "_dismiss_popup", lambda page: None)
     monkeypatch.setattr(wv.settings, "wa_delay_min", 0.0)

@@ -379,7 +379,26 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto("https://web.whatsapp.com/", timeout=60_000)
+            # W60: retry the first navigation instead of letting one slow load end the lane.
+            # `Page.goto: Timeout 60000ms exceeded` was the recorded end reason on six jobs
+            # (#5797 stopped at 109 of 497 numbers, #5798 at 54 of 272), and the run reported
+            # itself "done" over the top of it. WhatsApp Web is a heavy first paint on a cold
+            # profile, so the timeout is generous and `domcontentloaded` is enough — the
+            # login probe below waits for what actually matters.
+            last: Exception | None = None
+            for attempt in range(3):
+                try:
+                    page.goto("https://web.whatsapp.com/", timeout=90_000,
+                              wait_until="domcontentloaded")
+                    last = None
+                    break
+                except Exception as e:                            # noqa: BLE001
+                    last = e
+                    log.warning("[%s] WhatsApp Web did not load (attempt %d/3): %s",
+                                name, attempt + 1, str(e).splitlines()[0])
+                    time.sleep(3 * (attempt + 1))
+            if last is not None:
+                raise last
             if not _is_logged_in(page):
                 # Raised, not returned: a relaunch happens deep inside `_check`, and this is
                 # its only way to report "profile came back unlinked" through Relauncher.open().

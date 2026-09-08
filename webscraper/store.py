@@ -391,6 +391,11 @@ class Store:
     def update_job(self, job_id: int, **fields: Any) -> None:
         if not fields:
             return
+        # W60: same guard as update_enrichment — a structured value here would take the
+        # whole lane down with a bind error rather than write a row.
+        for k, v in list(fields.items()):
+            if isinstance(v, (list, dict, tuple, set)):
+                fields[k] = json.dumps(list(v) if isinstance(v, (tuple, set)) else v, ensure_ascii=False)
         cols = ",".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", [*fields.values(), job_id])
         self.conn.commit()
@@ -961,9 +966,15 @@ class Store:
 
     def update_enrichment(self, job_id: int, place_key: str, fields: dict[str, Any]) -> None:
         fields = dict(fields)
-        for jc in ("emails", "site_phones"):
-            if jc in fields and not isinstance(fields[jc], str):
-                fields[jc] = json.dumps(fields[jc], ensure_ascii=False)
+        # W60: encode EVERY structured value, not just the two columns that were known to
+        # hold one. sqlite3 refuses a list or dict outright ("Error binding parameter 2:
+        # type 'list' is not supported"), and that exception comes back up through the
+        # enrichment lane as its end reason — job #5801 stopped at 2 of 150 and job #48 at
+        # 3172 of 3320, both reported as "done" by the job. An allow-list of column names
+        # can only ever cover the shapes someone remembered; this covers the next one too.
+        for k, v in list(fields.items()):
+            if isinstance(v, (list, dict, tuple, set)):
+                fields[k] = json.dumps(list(v) if isinstance(v, (tuple, set)) else v, ensure_ascii=False)
         cols = ",".join(f"{k}=?" for k in fields)
         self.conn.execute(
             f"UPDATE places SET {cols} WHERE job_id=? AND place_key=?",
