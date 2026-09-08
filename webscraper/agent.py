@@ -1095,6 +1095,21 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 import sys as _sys
                 from webscraper.config import ROOT
                 if str(cmd.get("arg") or "").strip().lower() != "release":
+                    # W75: park the LOOP and stop the WORK. Parking alone left the worker
+                    # thread running its local job: _close_browsers() killed the Chromes,
+                    # the lanes' Relauncher brought them straight back, and the Mac kept
+                    # checking UK clinic numbers on a job the CRM already called cancelled
+                    # — "I stopped the agent, still it is opening and checking WA"
+                    # (2026-09-08, 17:27:58: "parked" and "relaunching" in the same second).
+                    # The lanes poll stop_requested every batch; set it first, then close.
+                    try:
+                        cur = getattr(srv.worker, "current_job", None)
+                        if cur:
+                            store.update_job(int(cur), stop_requested=1,
+                                             message="stopped — the agent was parked from the CRM")
+                            store.log(int(cur), "job", "stopped: the agent was parked from the CRM", level="warn")
+                    except Exception:                             # noqa: BLE001
+                        log.debug("could not flag the running job on stop", exc_info=True)
                     _close_browsers()
                     _STANDBY[0] = True
                     cloud._checks_sent_at = 0.0
