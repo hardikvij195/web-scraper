@@ -182,11 +182,28 @@ def _autostart() -> dict:
     sysname = platform.system()
     try:
         if sysname == "Windows":
-            r = subprocess.run(["schtasks", "/Query", "/TN", _WIN_TASK], capture_output=True,
-                               text=True, timeout=10)
-            ok = r.returncode == 0
-            return _check(ok, f'scheduled task "{_WIN_TASK}" {"registered" if ok else "not registered"}',
-                          "powershell -ExecutionPolicy Bypass -File scripts\\install-agent-autostart.ps1")
+            r = subprocess.run(["schtasks", "/Query", "/TN", _WIN_TASK, "/V", "/FO", "LIST"],
+                               capture_output=True, text=True, timeout=10)
+            fix = "powershell -ExecutionPolicy Bypass -File scripts\\install-agent-autostart.ps1"
+            if r.returncode != 0:
+                return _check(False, f'scheduled task "{_WIN_TASK}" not registered', fix)
+            # W73: registered is not enough. A task set to "run whether the user is logged
+            # on or not" runs on a window station with no desktop: every headed browser the
+            # agent opens - the Maps window, the WhatsApp window, the retry crawl - exists
+            # and is invisible. "The PC is doing WhatsApp verification but I can't see the
+            # window" (2026-09-08). The installer registers it Interactive; a task made any
+            # other way, or edited since, does not say so anywhere the user would look.
+            mode = ""
+            for line in r.stdout.splitlines():
+                if line.strip().lower().startswith("logon mode"):
+                    mode = line.split(":", 1)[1].strip()
+                    break
+            if "interactive only" in mode.lower():
+                return _check(True, f'scheduled task "{_WIN_TASK}" registered - runs on the desktop', fix)
+            return _check(False,
+                          f'scheduled task "{_WIN_TASK}" registered but its logon mode is '
+                          f'"{mode or "unknown"}" - browser windows will be INVISIBLE. Re-run the '
+                          f'installer, or set the task to "Run only when user is logged on".', fix)
         if sysname == "Darwin":
             ok = _LAUNCHD_PLIST.exists()
             return _check(ok, f"launchd job {'installed' if ok else 'not installed'}",
