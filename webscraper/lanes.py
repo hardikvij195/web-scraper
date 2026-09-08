@@ -293,6 +293,47 @@ class EnrichmentLane(Lane):
         # reset to pending, so also 0. Same denominator rule as before.
         seen = store.count_enriched(self.job_id)
         stuck = 0
+
+        # W76 (user directive 2026-09-08): websites are the LAST priority. After Maps
+        # discovery, WhatsApp verification of the Maps numbers comes first; the site
+        # crawl waits until discovery has ended and WhatsApp has nothing left from it.
+        # A WhatsApp lane that is off, logged out, or already finished releases the wait
+        # at once — otherwise a machine with no session would never crawl anything.
+        # WhatsApp keeps running afterwards on the numbers the crawl turns up.
+        waited = False
+        while not self.stopped():
+            wa = self.ctl.whatsapp
+            wa_busy = wa.enabled() and not wa.done.is_set() and store.count_wa_pending(self.job_id) > 0
+            if self.ctl.discovery_finished() and not wa_busy:
+                break
+            if not waited:
+                self.note("websites wait — WhatsApp is checking the Google Maps numbers first")
+                waited = True
+            time.sleep(IDLE_POLL_SEC)
+        if self.stopped():
+            return R_STOPPED
+        if waited:
+            self.note("WhatsApp has cleared the Maps numbers — crawling websites now")
+
+        # W76: the re-run's choice about websites (see enrich_scope on the job).
+        scope_mode = str(self.job.get("enrich_scope") or "all")
+        if scope_mode == "skip":
+            # "Mark it done without web scraping": every lead this run would have crawled
+            # is settled instead — two attempts is the cutoff the CRM stops counting at —
+            # so the job can finish without a crawl that was never wanted.
+            keys = store.job_place_keys(self.job_id)
+            n = 0
+            for r in store.places(self.job_id):
+                if keys and r["place_key"] not in keys:
+                    continue
+                if r["enrich_status"] in ("pending", "failed", "thin"):
+                    store.update_enrichment(self.job_id, r["place_key"],
+                                            {"enrich_status": "failed" if r["enrich_status"] != "thin" else "thin",
+                                             "enrich_attempts": 2,
+                                             "enrich_error": r["enrich_error"] or "skipped by request"})
+                    n += 1
+            self.note(f"websites skipped by request — {n} lead(s) marked settled without a crawl")
+            return R_NO_TARGETS
         # Set the total BEFORE the first lead is touched, not just after the first batch
         # finishes. Otherwise `enrich_total` keeps the previous run's value (e.g. 180) and
         # the bar reads "3 / 180" while the 9 fixable leads process, flipping to "9 / 9"
@@ -303,6 +344,22 @@ class EnrichmentLane(Lane):
             if self.stopped():
                 return R_STOPPED
             batch = store.pending_enrichment(self.job_id, ENRICH_BATCH)
+            if batch and scope_mode == "wa_missing":
+                # "Only those whose WhatsApp is not found or verified": a lead that already
+                # has a verified WhatsApp needs no website; settle it and crawl the rest.
+                keep = []
+                for r in batch:
+                    if str(r.get("wa_verified") or "") == "yes":
+                        store.update_enrichment(self.job_id, r["place_key"],
+                                                {"enrich_status": "done", "enrich_attempts": 2,
+                                                 "enrich_error": None})
+                    else:
+                        keep.append(r)
+                if len(keep) < len(batch):
+                    self.note(f"{len(batch) - len(keep)} lead(s) already on WhatsApp — websites skipped for them")
+                batch = keep
+                if not batch:
+                    continue
             if not batch:
                 # Nothing waiting. If discovery has finished, nothing ever will be.
                 if self.ctl.discovery_finished():
@@ -504,9 +561,48 @@ class WhatsAppLane(Lane):
                 # case, and every job made before this) means "whatever the agent's
                 # WA_VERIFY_HEADLESS says", which is exactly the old behaviour.
                 wa_hl = self.job.get("wa_headless")
-                res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
-                                              job_id=self.job_id,
-                                              headless=None if wa_hl is None else bool(wa_hl))
+                hl = None if wa_hl is None else bool(wa_hl)
+                # W76: parallel sessions. One WhatsApp Web session per LINKED account —
+                # a number cannot be open twice — so the ceiling is the smaller of the
+                # machine's setting and the accounts that are actually linked. Each slice
+                # pins its own account and its own sqlite connection; the progress
+                # callback is the one shared thing and is locked.
+                accounts = store.enabled_wa_accounts()
+                want = _wa_parallel()
+                n = max(1, min(want, len(accounts)))
+                if n > 1:
+                    self.store.log(self.job_id, "whatsapp",
+                                   f"{n} WhatsApp sessions in parallel — {', '.join(accounts[:n])}")
+                    lock = threading.Lock()
+                    def locked_on_wa(*a, **k):
+                        with lock:
+                            on_wa(*a, **k)
+                    slices = [batch[i::n] for i in range(n)]
+                    results: list[dict] = []
+                    errors: list[BaseException] = []
+                    def run_slice(rows, name):
+                        st = self.ctl.new_store()
+                        try:
+                            results.append(wa_verify.verify_places(
+                                st, rows, locked_on_wa, self.stopped, job_id=self.job_id,
+                                headless=hl, account=name))
+                        except BaseException as e:                # noqa: BLE001
+                            errors.append(e)
+                        finally:
+                            st.close()
+                    ts = [threading.Thread(target=run_slice, args=(sl, accounts[i]),
+                                           name=f"wa-{i}", daemon=True)
+                          for i, sl in enumerate(slices) if sl]
+                    for t in ts:
+                        t.start()
+                    for t in ts:
+                        t.join()
+                    if errors and not results:
+                        raise errors[0]
+                    res = {"capped": any(bool(r.get("capped")) for r in results)}
+                else:
+                    res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
+                                                  job_id=self.job_id, headless=hl)
             except wa_verify.WaNotLoggedIn as e:
                 self.note(f"WhatsApp verification skipped — {e}", "warn")
                 # W67: and take the window with it. The lane gives up in seconds, but the
@@ -536,6 +632,28 @@ class WhatsAppLane(Lane):
                       f"{res['unknown']} unknown ({checked} numbers checked)")
             if res.get("capped"):
                 return R_WA_CAP
+
+
+def _wa_parallel() -> int:
+    """W76: how many WhatsApp sessions this machine may run at once (default 1).
+
+    Set per machine on the CRM Systems tab as the lead_gen_settings key
+    `wa_parallel__<device>`, pushed to the agent with the rest of the config at start
+    (so it takes effect on the next restart), with `WA_PARALLEL` in .env as a local
+    override. Capped at 4: each session is a full Chrome, and a laptop that is also
+    crawling websites has nothing to spare past that.
+    """
+    import os
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    raw = (os.getenv(f"WA_PARALLEL__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
+        or os.getenv("WA_PARALLEL") or "1"
+    try:
+        return max(1, min(4, int(str(raw).strip())))
+    except ValueError:
+        return 1
 
 
 class Pipeline:

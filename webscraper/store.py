@@ -373,6 +373,10 @@ class Store:
             # enrichment is watched to see a block happen, while WhatsApp Web is
             # usually left hidden — one switch could never mean both.
             ("wa_headless", "INTEGER"),
+            # W76: what a re-run does about websites. all (default) | skip (mark the
+            # leads settled without crawling) | wa_missing (crawl only leads with no
+            # verified WhatsApp). Set by the CRM's re-run dialog.
+            ("enrich_scope", "TEXT"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")

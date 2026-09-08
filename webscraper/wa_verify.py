@@ -278,6 +278,10 @@ def verify_places(
     # W59: this job's own window choice for WhatsApp Web. None = the agent's
     # WA_VERIFY_HEADLESS setting, which is what every run used before.
     headless: bool | None = None,
+    # W76: run every number on THIS account instead of rotating. The WhatsApp lane
+    # splits a batch across linked accounts and runs the slices at once; each slice
+    # pins its own account so two threads never share one Chrome profile.
+    account: str | None = None,
 ) -> dict[str, int]:
     """Verify numbers against WhatsApp, one verdict per NUMBER (W26).
 
@@ -393,7 +397,7 @@ def verify_places(
                 break
             pk = r["place_key"]
 
-            name = store.pick_wa_account(cap, today)
+            name = account if account else store.pick_wa_account(cap, today)
             if name is None:
                 if cap > 0:
                     counts["capped"] += 1

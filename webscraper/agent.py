@@ -1396,6 +1396,7 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         do_enrich=int(bool(cj.get("do_enrich", True))),
         do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
         place_keys=_place_keys_json(cj),
+        enrich_scope=str(cj.get("enrich_scope") or "all"),          # W76
         # Carry the re-run's window choice too. Without this the CRM's "Show window"
         # toggle was dropped on every re-run — the local job kept its original headless
         # value, so a re-enrich asked to run headed still ran hidden.
@@ -1552,6 +1553,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                          reenrich_only=int(bool(cj.get("reenrich_only", False))),
                          discovery_pending=int(bool(cj.get("discovery_pending", False))),
                          place_keys=_place_keys_json(cj),
+                         enrich_scope=str(cj.get("enrich_scope") or "all"),   # W76
                          locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
         # T359 — "resume job on some other system": THIS agent has never mirrored this
