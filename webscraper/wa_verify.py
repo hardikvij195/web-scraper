@@ -132,6 +132,11 @@ def _dismiss_popup(page: Page) -> None:
             return
 
 
+#: W63 — how long WhatsApp Web gets to render anything at all (splash → QR or chat list)
+#: before the human's scan window starts counting. It is not the scan time; it is the
+#: client's own boot, which is what a "very slow" session actually is.
+_BOOT_TIMEOUT_MS = 90_000
+
 # -- login (headed, one-time per account) ---------------------------------------
 def login(name: str) -> bool:
     """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success."""
@@ -145,6 +150,21 @@ def login(name: str) -> bool:
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto("https://web.whatsapp.com/", timeout=60_000)
+            # W63: the two minutes used to start HERE, at the moment the tab opened. But
+            # WhatsApp Web shows its own splash first while it loads its client and
+            # decrypts the local store, and on a machine with an existing profile that can
+            # take most of a minute on its own — the ASUS spent the whole window on the
+            # splash and reported "timed out waiting for QR scan" without ever having
+            # shown a QR (2026-09-08). Wait for the page to actually finish booting, THEN
+            # give the person their full two minutes.
+            try:
+                page.wait_for_selector(
+                    'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref], '
+                    'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
+                    timeout=_BOOT_TIMEOUT_MS)
+            except PWTimeout:
+                log.warning("[%s] WhatsApp Web is still on its loading screen after %ds — "
+                            "waiting for the QR anyway", name, _BOOT_TIMEOUT_MS // 1000)
             log.info("[%s] scan the QR in the window (2 min)...", name)
             try:
                 page.wait_for_selector(
