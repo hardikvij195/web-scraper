@@ -347,7 +347,19 @@ class EnrichmentLane(Lane):
             # for its whole 350-site pass after the user had asked for a window.
             row = store.get_job(self.job_id)
             fresh = dict(row) if row is not None else {}
+            # W65 (user directive 2026-09-08): websites run WINDOWLESS on the first pass and
+            # with the window shown on every retry. A first pass is dozens of sites nobody
+            # watches; a retry is the handful that failed, and those are exactly the ones
+            # where seeing the block happen is the point. `reenrich_only` is what a retry
+            # is — the CRM sets it on every "re-run this lane" and every pending run.
+            # An explicit "Show window" on the job still wins: stored `headless=0` means
+            # the operator asked to watch, and nothing here should argue.
+            retry = bool(fresh.get("reenrich_only", self.job.get("reenrich_only")))
             hl = fresh.get("headless", self.job.get("headless"))
+            if retry and hl:
+                self.store.log(self.job_id, "enrichment",
+                               "retry pass — opening a visible browser so blocks are visible")
+                hl = False
             if hl is not None and self.job.get("headless") is not None and bool(hl) != bool(self.job.get("headless")):
                 self.store.log(self.job_id, "enrichment",
                                "window setting changed mid-run -> " + ("hidden" if hl else "visible") + " from this batch on")

@@ -419,7 +419,12 @@ class Worker(threading.Thread):
                         store.update_job(job_id, message=f"opening the {len(pend)} places the last run never reached…")
                         a0 = areas[0]
                         run_scrape(store, job_id, job["query"], a0["location"], 0, pacing,
-                                   headless=bool(job["headless"]), country=job["country"],
+                                   # W65 (user directive 2026-09-08): Google Maps always runs
+                                   # with its window shown. Headless Maps serves the lite
+                                   # layout — no review count, and the panel often never
+                                   # renders at all, which is where the "saved as a stub"
+                                   # leads come from. There is nothing to ask about.
+                                   headless=False, country=job["country"],
                                    on_event=on_event, should_stop=should_stop,
                                    radius_km=a0["radius_km"], wait_if_paused=wait_if_paused,
                                    center=a0["center"], known_keys=None,
@@ -435,7 +440,7 @@ class Worker(threading.Thread):
                                              if len(areas) > 1 else "")
                         known = store.all_place_keys() if job["unique_new"] else None
                         run_scrape(store, job_id, job["query"], area["location"], int(job["max_places"]), pacing,
-                                   headless=bool(job["headless"]), country=job["country"],
+                                   headless=False, country=job["country"],   # W65 — see above
                                    on_event=on_event, should_stop=should_stop,
                                    radius_km=area["radius_km"], wait_if_paused=wait_if_paused,
                                    center=area["center"], known_keys=known,

@@ -186,7 +186,15 @@ def login(name: str) -> bool:
 
 
 def account_status(name: str) -> str:
-    """Quick headless probe: 'logged_in' | 'logged_out'."""
+    """Probe a profile: 'logged_in' | 'logged_out' | 'unknown'.
+
+    W65: 'unknown' matters. `_is_logged_in` returns False both when WhatsApp shows the
+    QR (really logged out) and when the page never rendered at all (slow client, the
+    profile already open in another Chrome, no network). Recording the second as
+    'logged_out' is how a working machine ends up marked dead — the same misread the
+    `disabled` flag was once set by. Only a page that actually showed the link-device
+    screen counts as logged out; anything else leaves the last known answer alone.
+    """
     mark_profile_clean(profile_dir(name))
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
@@ -195,8 +203,14 @@ def account_status(name: str) -> str:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.goto("https://web.whatsapp.com/", timeout=60_000)
-            state = "logged_in" if _is_logged_in(page) else "logged_out"
-            Store().set_wa_status(name, state)                     # W64
+            if _is_logged_in(page):
+                state = "logged_in"
+            elif page.locator('canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]').count():
+                state = "logged_out"        # the link-device screen: it really is unlinked
+            else:
+                state = "unknown"           # never rendered — say nothing rather than lie
+            if state != "unknown":
+                Store().set_wa_status(name, state)                 # W64
         finally:
             ctx.close()
     return state
@@ -397,7 +411,11 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
         mark_profile_clean(profile_dir(name))
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)),
-            headless=settings.wa_verify_headless if headless is None else bool(headless),
+            # W65 (user directive 2026-09-08): WhatsApp always runs with its window shown.
+            # A session that has quietly unlinked looks like nothing at all from the
+            # outside — the DELL and the Mac both went days like that — and hiding the one
+            # browser whose state has to be seen was never worth the memory it saved.
+            headless=False,
             locale="en", viewport={"width": 1100, "height": 820},
             args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
         try:
