@@ -187,7 +187,15 @@ def run_checks() -> dict:
     return {
         "ok": required_ok,
         "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        # `version` is the VERSION this PROCESS started with; `version_disk` is what the
+        # file says right now. They differ from the moment the checkout is pulled until
+        # the agent is restarted, and the CRM needs both to say "already pulled —
+        # restart" about the version rather than only about the commit. Re-reading it
+        # here is what makes the CRM's Re-check button able to show a newer version at
+        # all: AGENT_VERSION is a module constant, so before this a pulled-but-not-
+        # restarted agent re-checked for ever and never reported the new number (T424).
         "version": AGENT_VERSION,
+        "version_disk": _read_version(),
         "git": _git_rev(),
         "python": platform.python_version(),
         # Where this agent lives on disk (T210) — shown on the CRM device card so the

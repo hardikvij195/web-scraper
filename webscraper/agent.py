@@ -960,16 +960,39 @@ def _poll_command(cloud: "CrmCloud") -> None:
                                 capture_output=True, text=True)
                     notes.append("autostart disabled" if r.returncode == 0
                                  else "autostart task left enabled (needs admin)")
+                    boot_out = None
+                elif _sys.platform != "darwin":
+                    boot_out = None
+                    notes.append("autostart not managed on this OS")
                 else:
-                    notes.append("autostart (launchd) left in place — unload it manually if needed")
+                    # T424: the sentinel alone cannot stop a Mac. run-agent-loop.sh does
+                    # exit when it sees the file, but the launchd job is KeepAlive=true,
+                    # so launchd relaunches the loop at once — and the loop's own
+                    # preamble then DELETES the sentinel ("started by hand ⇒ clear a
+                    # previous Stop"). The agent was back within seconds and Stop looked
+                    # like it did nothing at all. Booting the job out is the real stop.
+                    boot_out = f"gui/{_os.getuid()}/app.hvtechnologies.leadfinder-agent"
+                    notes.append("launchd job unloaded")
+
+                # Report BEFORE touching launchd: `bootout` tears down the whole job,
+                # this process included, so anything after it may never run. The CRM
+                # would then sit on "running" for a command that did happen.
                 result = "agent stopped — " + "; ".join(notes)
                 ok = True
                 log.info("stop requested by the CRM: %s", result)
                 cloud.command_done(int(cmd["id"]), True, result)
                 if _CRM_LOG:
                     _ship_agent_logs(cloud, _CRM_LOG[0])
+                _close_browsers()
+                if boot_out:
+                    try:
+                        _sp.run(["launchctl", "bootout", boot_out], capture_output=True,
+                                text=True, timeout=20)
+                    except Exception as e:                  # noqa: BLE001
+                        log.warning("launchctl bootout failed: %s — run "
+                                    "'launchctl bootout %s' on the machine", e, boot_out)
                 time.sleep(1)
-                _close_browsers(); _os._exit(0)
+                _os._exit(0)
             elif cmd["command"] == "restart":
                 # W46: plain restart from the CRM — no pull. Same exit path as update; the
                 # supervisor loop brings us back and _requeue_orphans resumes the job.
