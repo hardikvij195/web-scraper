@@ -741,6 +741,17 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         if kind == "crm":
             _poll_command(cloud)
             _ship_agent_logs(cloud, crm_log)
+        if _STANDBY[0]:
+            # Parked: heartbeat and commands only. `jobs()` is what carries the
+            # heartbeat and the periodic self-check, and with `enabled` off in the CRM
+            # it comes back empty, so calling it here keeps the machine visible (and
+            # startable) without offering to do any work.
+            try:
+                cloud.jobs()
+            except httpx.HTTPError as e:
+                log.debug("standby heartbeat failed: %s", e)
+            time.sleep(poll_sec)
+            continue
         try:
             _fail_unstarted(cloud, store, kind, srv)
         except Exception as e:                                    # noqa: BLE001
@@ -759,6 +770,22 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         fast = (time.monotonic() - last_busy) < FAST_WINDOW_SEC
         time.sleep(BUSY_POLL_SEC if fast else poll_sec)
 
+
+#: W58 — "Stop agent" parks the agent instead of killing it.
+#:
+#: The old Stop exited the process and stopped the supervisor, which meant NOTHING on
+#: that machine was talking to the CRM any more — so there was no way to start it again
+#: from the CRM, only by hand on the machine. Stop now leaves this loop alive and doing
+#: exactly two things: heartbeat, and ask for commands. It takes no jobs (the CRM also
+#: flips the machine's `enabled` switch off, so it is offered none), runs no browsers,
+#: and waits for `start`.
+#:
+#: The old behaviour is still there as `stop --release`: that one is for freeing the
+#: folder so it can be moved or deleted, and it is one-way by definition.
+#:
+#: Standby lives in this process only. A reboot (or anything that restarts the
+#: supervisor) comes back up running — "stopped" is not meant to outlive the machine.
+_STANDBY = [False]
 
 #: The one command thread allowed at a time (a second QR window would only confuse).
 _cmd_thread = None
@@ -931,21 +958,40 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
                     import os as _os
                     _close_browsers(); _os._exit(0)
+            elif cmd["command"] == "start":
+                # W58 — leave standby. A no-op when the agent is already working, so
+                # pressing Start on a healthy machine is harmless.
+                was = _STANDBY[0]
+                _STANDBY[0] = False
+                cloud._checks_sent_at = 0.0
+                ok = True
+                result = "agent started" if was else "agent was already running"
+                log.info("start requested by the CRM: %s", result)
             elif cmd["command"] == "stop":
-                # W50 (2026-08-31): "Stop agent". Exiting is NOT enough — run-agent-loop
-                # restarts us 15s later, and the scheduled task restarts the loop at
-                # logon, which is why the old folder could never be deleted ("folder is
-                # still in use"). So: drop a sentinel the loop checks, disable the
-                # autostart task, and only then exit.
+                # W58: the default Stop PARKS the agent — see _STANDBY. It keeps
+                # heartbeating and asking for commands, so the CRM can start it again;
+                # the CRM turns the machine's `enabled` switch off at the same time, so
+                # it is offered no work while parked.
                 #
-                # One-way from the CRM by design: a stopped agent polls nothing, so it
-                # cannot be started again remotely. Restart it by running run-agent-loop
-                # on the machine (which clears the sentinel) or by re-running the
-                # installer.
+                # `arg == "release"` is the old W50 behaviour, and the only reason it
+                # still exists: to free the folder so it can be moved or deleted
+                # ("folder is still in use"). That one drops a sentinel the supervisor
+                # honours, unloads the autostart job and exits — nothing is left
+                # polling, so it can only be started on the machine itself.
                 import os as _os
                 import subprocess as _sp
                 import sys as _sys
                 from webscraper.config import ROOT
+                if str(cmd.get("arg") or "").strip().lower() != "release":
+                    _close_browsers()
+                    _STANDBY[0] = True
+                    cloud._checks_sent_at = 0.0
+                    ok = True
+                    result = "agent stopped — parked, press Start in the CRM to run it again"
+                    log.info("stop requested by the CRM: %s", result)
+                    # `finally` below reports it; the release path cannot use that, which
+                    # is why it calls command_done itself before exiting the process.
+                    return
                 notes = []
                 try:
                     (ROOT / "data").mkdir(exist_ok=True)
