@@ -509,6 +509,20 @@ class WhatsAppLane(Lane):
                                               headless=None if wa_hl is None else bool(wa_hl))
             except wa_verify.WaNotLoggedIn as e:
                 self.note(f"WhatsApp verification skipped — {e}", "warn")
+                # W67: and take the window with it. The lane gives up in seconds, but the
+                # headed WhatsApp browser it opened was left sitting on the splash — the
+                # Mac had one on screen for an afternoon, which reads as "the job is
+                # stuck" when the job was running perfectly well without it.
+                try:
+                    from webscraper.browser_recovery import reap_orphan_browsers
+                    from webscraper.config import settings as _st
+                    killed = reap_orphan_browsers(
+                        [d for d in _st.wa_profiles_dir.iterdir() if d.is_dir()],
+                        "whatsapp lane gave up")
+                    if killed:
+                        self.note(f"closed {killed} leftover WhatsApp window(s)", "info")
+                except Exception:                                 # noqa: BLE001
+                    pass
                 return R_WA_LOGIN
             store.record_phase_rate(self.job_id, "verifying_wa", checked,
                                     time.monotonic() - t0)

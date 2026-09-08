@@ -75,13 +75,22 @@ def _e164_digits(phone: str | None, wa_number: str | None, country: str | None) 
 
 # -- logged-in-state + per-number decision on WhatsApp Web ----------------------
 def _is_logged_in(page: Page) -> bool:
-    """Chat list present (logged in) vs the QR / link-device landing (not)."""
+    """Chat list present (logged in) vs the QR / link-device landing (not).
+
+    W67: a page that renders NEITHER within the window is a third thing — WhatsApp Web
+    stuck on its own splash, which is what an unlinked-and-half-broken profile looks
+    like. It is logged the moment it happens, because from the outside it is
+    indistinguishable from "slow", and the Mac spent an afternoon that way with a window
+    open on screen and nobody able to say why.
+    """
     try:
         page.wait_for_selector(
             'div[aria-label="Chat list"], [data-testid="chat-list"], '
             'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]',
             timeout=40_000)
     except PWTimeout:
+        log.warning("WhatsApp Web never got past its loading screen in 40s — the profile's "
+                    "local store is likely unusable; delete it and link again")
         return False
     for sel in ('div[aria-label="Chat list"]', '[data-testid="chat-list"]',
                 'header [data-testid="menu-bar-menu"]', '#pane-side'):
