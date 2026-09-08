@@ -147,10 +147,29 @@ def _dismiss_popup(page: Page) -> None:
 _BOOT_TIMEOUT_MS = 90_000
 
 # -- login (headed, one-time per account) ---------------------------------------
+#: W68 — the accounts a `wa-login` is holding a window open for, right now.
+#:
+#: The WhatsApp LANE and the login command are two threads of one process reaching for
+#: the same persistent Chrome profile. The lane gives up in milliseconds when there is no
+#: session — which is exactly when someone is most likely to be linking one — and since
+#: W67 it also reaped the profile's browser on its way out. That killed the very window
+#: the user was scanning: "Page.wait_for_selector: Target page, context or browser has
+#: been closed" on the Mac, 2026-09-08.
+#:
+#: While a name is in here, nothing else opens, probes or reaps that profile.
+_LOGIN_ACTIVE: set[str] = set()
+
+
+def login_in_progress(name: str | None = None) -> bool:
+    """True while a wa-login window is open — for `name`, or for any account."""
+    return bool(_LOGIN_ACTIVE) if name is None else name in _LOGIN_ACTIVE
+
+
 def login(name: str) -> bool:
     """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success."""
     Store().add_wa_account(name)
     mark_profile_clean(profile_dir(name))
+    _LOGIN_ACTIVE.add(name)
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)), headless=False, locale="en",
@@ -191,6 +210,7 @@ def login(name: str) -> bool:
             # T336: a goto that throws (offline, DNS hiccup) must not leak this window —
             # it stayed open at about:blank until the process was killed by hand.
             ctx.close()
+            _LOGIN_ACTIVE.discard(name)                            # W68
     return ok
 
 
@@ -415,6 +435,11 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
     """
     if name in open_ctx:
         return open_ctx[name][1]
+
+    # W68: someone is linking this account right now. Opening the same persistent profile
+    # from here would either fail on its lock or fight the window they are scanning.
+    if login_in_progress(name):
+        raise WaNotLoggedIn(f"[{name}] a WhatsApp login is open on this machine — waiting for it")
 
     def _open() -> tuple[Any, Page]:
         mark_profile_clean(profile_dir(name))

@@ -516,8 +516,12 @@ class WhatsAppLane(Lane):
                 try:
                     from webscraper.browser_recovery import reap_orphan_browsers
                     from webscraper.config import settings as _st
-                    killed = reap_orphan_browsers(
-                        [d for d in _st.wa_profiles_dir.iterdir() if d.is_dir()],
+                    # W68: never while a login is open — that window is the one the user is
+                    # scanning, and killing it is how "Start WhatsApp session" started
+                    # failing with "target page, context or browser has been closed".
+                    killed = 0 if wa_verify.login_in_progress() else reap_orphan_browsers(
+                        [d for d in _st.wa_profiles_dir.iterdir()
+                         if d.is_dir() and not wa_verify.login_in_progress(d.name)],
                         "whatsapp lane gave up")
                     if killed:
                         self.note(f"closed {killed} leftover WhatsApp window(s)", "info")
