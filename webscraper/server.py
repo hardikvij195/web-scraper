@@ -377,6 +377,13 @@ class Worker(threading.Thread):
                     # never visited — one pass, no new Maps search (T172).
                     if int(_col(job, "discovery_pending", 0) or 0):
                         from webscraper.maps import FeedCard
+                        # W62: places whose panel never opened count as pending too. Their
+                        # link says opened=1, so without this they were invisible to every
+                        # re-run the CRM offers (see Store.reopen_stub_links).
+                        again = store.reopen_stub_links(job_id)
+                        if again:
+                            store.log(job_id, "discovery",
+                                      f"re-opening {again} place(s) saved without their details")
                         pend = [FeedCard(href=r["href"], name=r["name"], rating=r["rating"],
                                          reviews_count=r["reviews"], lat=r["lat"], lng=r["lng"])
                                 for r in store.pending_links(job_id)]

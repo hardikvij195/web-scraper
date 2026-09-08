@@ -675,6 +675,24 @@ class Store:
             "SELECT * FROM job_links WHERE job_id=? AND opened=0 ORDER BY rowid LIMIT 1", (job_id,)).fetchone()
         return dict(r) if r else None
 
+    def reopen_stub_links(self, job_id: int) -> int:
+        """Mark the links of places that are still stubs unopened again. Returns how many.
+
+        W62: a link can be `opened=1` while its place row never got past the feed card —
+        Maps served the lite layout, the panel never rendered, and the lead was saved with
+        a name and nothing else. Those places were unreachable from the CRM: "Extend &
+        scrape the pending" only ever looked at links never opened at all, and the two
+        Find buttons run a fresh SEARCH, where "find missed" skips anything already held —
+        which is exactly what a stub is. Clearing the flag hands them back to the ordinary
+        opener, which is the code that knows how to read a panel.
+        """
+        cur = self.conn.execute(
+            "UPDATE job_links SET opened=0 WHERE job_id=? AND opened=1 AND key IN ("
+            "  SELECT place_key FROM places WHERE job_id=? AND detail_status='pending')",
+            (job_id, job_id))
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
     def count_unopened_links(self, job_id: int) -> int:
         r = self.conn.execute(
             "SELECT COUNT(*) FROM job_links WHERE job_id=? AND opened=0", (job_id,)).fetchone()

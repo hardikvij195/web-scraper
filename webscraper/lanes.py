@@ -256,7 +256,14 @@ class DiscoveryLane(Lane):
     key = "discovery"
 
     def enabled(self) -> bool:
-        return not self.job.get("wa_verify_only") and not self.job.get("reenrich_only")
+        # W62: `discovery_pending` overrides `reenrich_only`. "Finish everything pending"
+        # asks for all three lanes at once — retry the failed crawls, check the unverified
+        # numbers, and re-open the places saved without their details — and reenrich_only
+        # is what normally switches this lane off. Without this the stub re-open was
+        # silently dropped from that plan.
+        if self.job.get("wa_verify_only"):
+            return False
+        return not self.job.get("reenrich_only") or bool(self.job.get("discovery_pending"))
 
     def work(self) -> str | None:
         return self.ctl.run_discovery(self)
