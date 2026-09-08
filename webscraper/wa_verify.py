@@ -171,9 +171,11 @@ def login(name: str) -> bool:
                     'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
                     timeout=_LOGIN_TIMEOUT_MS)
                 log.info("[%s] logged in - session saved to %s", name, profile_dir(name))
+                Store().set_wa_status(name, "logged_in")           # W64
                 ok = True
             except PWTimeout:
                 log.warning("[%s] timed out waiting for QR scan", name)
+                Store().set_wa_status(name, "logged_out")          # W64
                 ok = False
             time.sleep(1.5)   # let WA flush the session to disk before we close
         finally:
@@ -194,6 +196,7 @@ def account_status(name: str) -> str:
         try:
             page.goto("https://web.whatsapp.com/", timeout=60_000)
             state = "logged_in" if _is_logged_in(page) else "logged_out"
+            Store().set_wa_status(name, state)                     # W64
         finally:
             ctx.close()
     return state
@@ -422,7 +425,9 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             if not _is_logged_in(page):
                 # Raised, not returned: a relaunch happens deep inside `_check`, and this is
                 # its only way to report "profile came back unlinked" through Relauncher.open().
+                Store().set_wa_status(name, "logged_out")      # W64
                 raise WaNotLoggedIn(f"[{name}] profile has no live WhatsApp Web session")
+            Store().set_wa_status(name, "logged_in")           # W64
             return ctx, page
         except BaseException:
             # T336: `ctx` is a real Chrome process the moment launch_persistent_context

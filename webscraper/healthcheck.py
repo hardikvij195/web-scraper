@@ -109,9 +109,48 @@ def _wa_session() -> dict:
     accounts = sorted(p.name for p in d.iterdir() if p.is_dir()) if d.exists() else []
     # A profile that completed wa-login has a Default/ dir with WhatsApp Web's storage.
     live = [a for a in accounts if (d / a / "Default").exists()]
-    # discovery + enrichment run without it; only the WhatsApp lane needs it
-    return _check(bool(live), f"WhatsApp accounts: {', '.join(live) or 'none'}",
+    # W64: a directory is not a session. A profile unlinked from the phone keeps every
+    # file it ever had, so this check used to pass while the WhatsApp lane died on
+    # `wa_not_logged_in` in every job. Report what was last actually SEEN.
+    seen: dict[str, tuple[str, str]] = {}
+    try:
+        from webscraper.store import Store
+        for row in Store().list_wa_accounts():
+            if row.get("status"):
+                seen[str(row["name"])] = (str(row["status"]), str(row.get("status_at") or ""))
+    except Exception:                                             # noqa: BLE001 — no store yet
+        pass
+
+    def _label(a: str) -> str:
+        st, at = seen.get(a, ("unknown", ""))
+        when = f" {_ago(at)}" if at else ""
+        return f"{a}: {'linked' if st == 'logged_in' else 'NOT linked' if st == 'logged_out' else 'unchecked'}{when}"
+
+    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in"]
+    detail = "WhatsApp accounts — " + ("; ".join(_label(a) for a in live) if live else "none")
+    # Only a profile we have SEEN logged in counts as ok; unchecked stays a warning
+    # rather than a green tick, because "we never looked" is not "it works".
+    return _check(bool(linked), detail,
                   "python -m webscraper wa-login <label>  (scan the QR once on this machine)", optional=True)
+
+
+def _ago(iso: str) -> str:
+    """`3m ago` for a timestamp this module wrote; empty string if it cannot be read."""
+    from datetime import datetime, timezone
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        secs = max(0, int((datetime.now(timezone.utc) - t).total_seconds()))
+    except Exception:                                             # noqa: BLE001
+        return ""
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
 
 
 def _ai_keys() -> dict:

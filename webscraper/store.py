@@ -822,6 +822,27 @@ class Store:
     def list_wa_accounts(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM wa_accounts ORDER BY name")]
 
+    def set_wa_status(self, name: str, status: str) -> None:
+        """Record what we last SAW of this profile: 'logged_in' | 'logged_out'.
+
+        W64: `wa_session` in the self-check only ever said a profile directory existed,
+        which is true of a profile that was unlinked from the phone months ago — the
+        Systems tab showed a green tick while every job's WhatsApp lane died on
+        `wa_not_logged_in`. This is written at the moments the answer is already known
+        for free (a lane opening its session, a login finishing) and by a cheap probe
+        around each job, so the tab can say linked or not, and when that was last true.
+        """
+        for col, typ in (("status", "TEXT"), ("status_at", "TEXT")):
+            try:
+                self.conn.execute(f"ALTER TABLE wa_accounts ADD COLUMN {col} {typ}")
+            except Exception:                                     # noqa: BLE001 — already there
+                pass
+        self.conn.execute(
+            "INSERT INTO wa_accounts(name, added_at, status, status_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET status=excluded.status, status_at=excluded.status_at",
+            (name, now_iso(), status, now_iso()))
+        self.conn.commit()
+
     def add_wa_account(self, name: str) -> None:
         # Upsert + re-enable: a fresh wa-login clears a prior 'disabled' flag (e.g. one
         # set when a headless verify misread the session as logged-out).

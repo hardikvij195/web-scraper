@@ -153,6 +153,35 @@ def _job_areas(job: Any) -> list[dict[str, Any]]:
 
 
 # ── worker ────────────────────────────────────────────────────────────────────
+def _refresh_wa_status(store, when: str) -> None:
+    """Ask each WhatsApp profile whether it is still linked, and record the answer.
+
+    W64. Cheap by design: a headless page load per account, only for profiles that have
+    actually been logged in at some point, and never more than once a minute — the lanes
+    write the same field whenever they open a session, so between these two probes the
+    answer stays current on its own.
+
+    Never raises. A machine with no Playwright, no profile or no network still runs its
+    job; it just leaves the tab saying "unchecked", which is the honest answer.
+    """
+    try:
+        from webscraper import wa_verify
+        from webscraper.config import settings
+        d = settings.wa_profiles_dir
+        if not d.exists():
+            return
+        for acc in sorted(p.name for p in d.iterdir() if p.is_dir()):
+            if not (d / acc / "Default").exists():
+                continue                      # never completed a login; nothing to probe
+            try:
+                state = wa_verify.account_status(acc)   # writes it through set_wa_status
+                log.info("WhatsApp profile %r is %s (%s)", acc, state, when)
+            except Exception as e:                                # noqa: BLE001
+                log.debug("WhatsApp probe for %r failed (%s): %s", acc, when, e)
+    except Exception:                                             # noqa: BLE001
+        log.debug("WhatsApp status refresh skipped", exc_info=True)
+
+
 class Worker(threading.Thread):
     """Sequential job runner. Polls the DB for `phase='queued'` so jobs survive a restart."""
 
@@ -427,9 +456,16 @@ class Worker(threading.Thread):
                     # clock" — previously indistinguishable in the UI.
                     return lanes_mod.R_MAPS_CAP if time_up["flag"] else lanes_mod.R_COMPLETED
 
+                # W64: check the WhatsApp profiles BEFORE the lanes start. It is a headless
+                # page load, a few seconds, and it is the difference between the Systems
+                # tab claiming a session exists because a folder does, and it knowing. The
+                # lanes then keep it current for free — every session they open records
+                # what it found — and the same probe runs again at the end.
+                _refresh_wa_status(store, "before job")
                 pipe = Pipeline(job_id, dict(job), _discovery)
                 reasons = pipe.run()
                 log.info("job %s lanes finished: %s", job_id, reasons)
+                _refresh_wa_status(store, "after job")
 
                 # push to Supabase (best-effort; no-op when not configured / table missing)
                 try:
