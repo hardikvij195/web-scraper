@@ -188,6 +188,9 @@ def verify_places(
     on_progress: Callable[..., None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     job_id: int | None = None,
+    # W59: this job's own window choice for WhatsApp Web. None = the agent's
+    # WA_VERIFY_HEADLESS setting, which is what every run used before.
+    headless: bool | None = None,
 ) -> dict[str, int]:
     """Verify numbers against WhatsApp, one verdict per NUMBER (W26).
 
@@ -315,7 +318,7 @@ def verify_places(
                         store.log(job_id, "whatsapp", "no enabled WhatsApp account left — run wa-login", "error")
                 break
 
-            page = _ensure_session(pw, open_ctx, relaunchers, name)
+            page = _ensure_session(pw, open_ctx, relaunchers, name, headless)
             if page is None:      # account logged out — disable it and try the next row
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
                 store.conn.commit()
@@ -355,7 +358,8 @@ def verify_places(
 
 
 def _ensure_session(pw, open_ctx: dict[str, Any],
-                    relaunchers: dict[str, Relauncher] | None, name: str) -> Page | None:
+                    relaunchers: dict[str, Relauncher] | None, name: str,
+                    headless: bool | None = None) -> Page | None:
     """Return a live, logged-in page for `name`, launching its profile once. None if logged out.
 
     The launch closure is handed to a Relauncher so a later crash can rebuild *exactly*
@@ -369,8 +373,9 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
     def _open() -> tuple[Any, Page]:
         mark_profile_clean(profile_dir(name))
         ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir(name)), headless=settings.wa_verify_headless, locale="en",
-            viewport={"width": 1100, "height": 820},
+            user_data_dir=str(profile_dir(name)),
+            headless=settings.wa_verify_headless if headless is None else bool(headless),
+            locale="en", viewport={"width": 1100, "height": 820},
             args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()

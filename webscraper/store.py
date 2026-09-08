@@ -367,6 +367,12 @@ class Store:
             # W26: 1 while the discovery OPENER has a place panel in flight (the collector
             # thread's tiling does not count — it produces links, not places).
             ("disc_active", "INTEGER NOT NULL DEFAULT 0"),
+            # W59: the WhatsApp lane's own window choice. NULL = follow the agent's
+            # WA_VERIFY_HEADLESS setting, which is what every run did before. It is
+            # separate from `headless` because the two lanes want opposite things:
+            # enrichment is watched to see a block happen, while WhatsApp Web is
+            # usually left hidden — one switch could never mean both.
+            ("wa_headless", "INTEGER"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")

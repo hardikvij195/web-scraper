@@ -1275,6 +1275,11 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         headless=int(bool(cj.get("headless", True))),
         message="re-run requested from the CRM",
     )
+    # W59: the WhatsApp lane has its own window choice, and it is tri-state — NULL means
+    # "use the agent's WA_VERIFY_HEADLESS". create_job takes a fixed column list, so it
+    # is written here rather than widening that signature for a nullable extra.
+    if cj.get("wa_headless") is not None:
+        store.update_job(local_id, wa_headless=int(bool(cj["wa_headless"])))
     store.log(local_id, "job", f"re-run requested from the CRM (cloud job #{cj['id']})")
     srv.worker.wake.set()                        # do not wait out the poll interval
     log.info("cloud job #%s re-queued -> local job #%s", cj["id"], local_id)
@@ -1397,6 +1402,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             center_lat=cj.get("lat"), center_lng=cj.get("lng"),
             max_minutes=cj.get("max_minutes"),
             unique_new=bool(cj.get("unique_new", False)))
+        if cj.get("wa_headless") is not None:                     # W59 — see above
+            store.update_job(local_id, wa_headless=int(bool(cj["wa_headless"])))
         import json as _json
         locs = cj.get("locations")
         store.update_job(local_id, cloud_id=cj["id"], cloud_kind=kind,

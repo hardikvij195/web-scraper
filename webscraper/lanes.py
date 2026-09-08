@@ -481,8 +481,13 @@ class WhatsAppLane(Lane):
                     pass
 
             try:
+                # W59: this lane's own window choice. NULL on the job (the normal
+                # case, and every job made before this) means "whatever the agent's
+                # WA_VERIFY_HEADLESS says", which is exactly the old behaviour.
+                wa_hl = self.job.get("wa_headless")
                 res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
-                                              job_id=self.job_id)
+                                              job_id=self.job_id,
+                                              headless=None if wa_hl is None else bool(wa_hl))
             except wa_verify.WaNotLoggedIn as e:
                 self.note(f"WhatsApp verification skipped — {e}", "warn")
                 return R_WA_LOGIN
