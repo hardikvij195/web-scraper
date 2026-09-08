@@ -502,6 +502,63 @@ def _ship_ai_usage(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
 START_GRACE_SEC = 5 * 60
 
 
+#: W66 — how long a running job may show no sign of life before it is stopped. The
+#: signal is deliberately broad: any counter moving, or any new log line. Every lane
+#: narrates what it is doing every few seconds, so two minutes of total silence is a
+#: hang, not slow work — a Maps panel that takes a minute, a paced WhatsApp check and a
+#: slow site crawl all still log.
+STALL_SEC = 120.0
+
+#: job id -> (signature, first time we saw it)
+_STALL_SEEN: dict[int, tuple[str, float]] = {}
+
+
+def _fail_stalled(cloud: "Cloud | CrmCloud", store: Store, kind: str) -> None:
+    """Stop a job that has stopped moving, and report why.
+
+    W66 (user request 2026-09-08): "check if there is some progress or not — if not stop
+    that job and show error". Job #5839 spent its afternoon looking alive on the ASUS
+    while every lane had already ended with nothing to do.
+    """
+    rows = store.conn.execute(
+        "SELECT id, cloud_id, scraped_count, enrich_done, wa_verify_done FROM jobs "
+        "WHERE cloud_id IS NOT NULL AND cloud_kind=? AND phase NOT IN "
+        "('done','failed','stopped','queued','error','cancelled')", (kind,)).fetchall()
+    live = {int(r["id"]) for r in rows}
+    for gone in [j for j in _STALL_SEEN if j not in live]:
+        _STALL_SEEN.pop(gone, None)
+
+    now = time.monotonic()
+    for r in rows:
+        jid = int(r["id"])
+        try:
+            last_log = store.conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid),0) FROM job_logs WHERE job_id=?", (jid,)).fetchone()
+        except Exception:                                         # noqa: BLE001 — no job_logs yet
+            last_log = (0, 0)
+        sig = f"{r['scraped_count']}|{r['enrich_done']}|{r['wa_verify_done']}|{last_log[0]}|{last_log[1]}"
+        seen = _STALL_SEEN.get(jid)
+        if seen is None or seen[0] != sig:
+            _STALL_SEEN[jid] = (sig, now)
+            continue
+        if now - seen[1] < STALL_SEC:
+            continue
+        why = (f"no progress for {int(now - seen[1])}s — no counter moved and nothing was "
+               f"logged, so the run is stuck")
+        log.error("job %s stalled: %s", jid, why)
+        try:
+            store.log(jid, "job", f"stopped by the watchdog: {why}", level="error")
+        except Exception:                                         # noqa: BLE001
+            pass
+        store.update_job(jid, phase="failed", status="failed", message=why[:300], stop_requested=1)
+        store.finish_job(jid, "failed", why[:300])
+        try:
+            cloud.done(int(r["cloud_id"]), "error", why[:300])
+        except Exception as e:                                    # noqa: BLE001
+            log.warning("could not report the stall for job %s: %s", jid, e)
+        _STALL_SEEN.pop(jid, None)
+
+
 def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> None:
     """Job #32 on the Dell Vostro (2026-08-27) sat at 'queued' for 11 minutes: the agent
     claimed it, the heartbeat stayed green, and nothing ever ran. Here every mirrored
@@ -762,6 +819,10 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             _fail_unstarted(cloud, store, kind, srv)
         except Exception as e:                                    # noqa: BLE001
             log.warning("start-watchdog: %s", e)
+        try:
+            _fail_stalled(cloud, store, kind)                     # W66
+        except Exception as e:                                    # noqa: BLE001
+            log.warning("stall-watchdog: %s", e)
         try:
             _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:

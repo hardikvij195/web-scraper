@@ -466,7 +466,22 @@ class Worker(threading.Thread):
                 # tab claiming a session exists because a folder does, and it knowing. The
                 # lanes then keep it current for free — every session they open records
                 # what it found — and the same probe runs again at the end.
+                # W66: and say so ON THE JOB, not just on the machine's card. A run whose
+                # WhatsApp lane is going to stop before it starts should say that in its own
+                # first log line, where whoever opens the job will actually read it.
                 _refresh_wa_status(store, "before job")
+                try:
+                    from webscraper.store import Store as _S
+                    for a in _S().list_wa_accounts():
+                        st = str(a.get("status") or "unchecked")
+                        store.log(job_id, "job",
+                                  f"WhatsApp profile {a['name']}: "
+                                  + ("linked" if st == "logged_in" else
+                                     "NOT linked — the WhatsApp lane will stop" if st == "logged_out"
+                                     else "unchecked"),
+                                  level="info" if st == "logged_in" else "warn")
+                except Exception:                                 # noqa: BLE001
+                    log.debug("could not log the WhatsApp state onto the job", exc_info=True)
                 pipe = Pipeline(job_id, dict(job), _discovery)
                 reasons = pipe.run()
                 log.info("job %s lanes finished: %s", job_id, reasons)
