@@ -1344,6 +1344,29 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     log.info("re-verify #%s: %d numbers checked%s", jid, n_checked, " (daily cap hit)" if capped else "")
 
 
+def _seed_missing_places(cloud: "Cloud | CrmCloud", store: Store, cj: dict, local_id: int) -> None:
+    """Create local place rows for scoped leads this machine has never seen (W71)."""
+    from webscraper.models import Place
+    keys = cj.get("place_keys")
+    wanted = {str(k) for k in keys} if isinstance(keys, list) and keys else None
+    have = {r["place_key"] for r in store.places(local_id)}
+    rows = cloud.results(int(cj["id"]))
+    seeded = 0
+    for r in rows:
+        pk = str(r.get("place_key") or "")
+        if not pk or pk in have or (wanted is not None and pk not in wanted):
+            continue
+        store.upsert_place(Place(
+            job_id=local_id, place_key=pk, name=r.get("name"), phone=r.get("phone"),
+            website=r.get("website"), country=r.get("country"), maps_url=r.get("maps_url"),
+            email=r.get("email"), whatsapp_number=r.get("whatsapp_number"),
+            enrich_status="failed" if r.get("website") else "no_website",
+        ))
+        seeded += 1
+    if seeded:
+        store.log(local_id, "job", f"pulled {seeded} lead(s) from the CRM — they were not on this machine")
+
+
 def _place_keys_json(cj: dict) -> str | None:
     """The CRM's `place_keys` array as JSON text, or None for "the whole job"."""
     keys = cj.get("place_keys")
@@ -1389,6 +1412,15 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     if cj.get("wa_headless") is not None:
         store.update_job(local_id, wa_headless=int(bool(cj["wa_headless"])))
     store.log(local_id, "job", f"re-run requested from the CRM (cloud job #{cj['id']})")
+    # W71: "Run on" defaults to Auto now (T457), so a re-enrich can land on a machine that
+    # never ran the job and holds none of its leads. Pull the scoped rows from the CRM and
+    # seed them locally so the enrichment lane has something to crawl — the WhatsApp
+    # re-verify path has always done this; enrichment needed the same.
+    if cj.get("reenrich_only"):
+        try:
+            _seed_missing_places(cloud, store, cj, local_id)
+        except Exception:                                         # noqa: BLE001
+            log.warning("could not seed leads for the re-enrich from the CRM", exc_info=True)
     srv.worker.wake.set()                        # do not wait out the poll interval
     log.info("cloud job #%s re-queued -> local job #%s", cj["id"], local_id)
 

@@ -292,14 +292,33 @@ class Worker(threading.Thread):
                     # `place_keys` when the CRM asked for a subset, so "Re-enrich (24)" is 24
                     # leads and not the whole job.
                     keys = store.job_place_keys(job_id)
-                    retry = [r for r in store.places(job_id)
-                             if r["enrich_status"] in ("failed", "thin")
-                             and (not keys or r["place_key"] in keys)]
+                    rows = [r for r in store.places(job_id) if not keys or r["place_key"] in keys]
+                    # W71: `pending` is in the retry set too — a row left pending by a run
+                    # that never reached it is work, not history. Two crawls is the cutoff
+                    # (T441): "re-enrich queued for 0 lead(s) (scoped to 14)" three times
+                    # in twenty minutes on the PC was 14 leads that had already failed
+                    # twice, once with the window open. Nothing here can improve on that.
+                    retry, settled = [], []
+                    for r in rows:
+                        if r["enrich_status"] not in ("failed", "thin", "pending"):
+                            continue
+                        if int(r["enrich_attempts"] if "enrich_attempts" in r.keys() else 0) >= 2 \
+                                and r["enrich_status"] != "pending":
+                            settled.append(r)
+                        else:
+                            retry.append(r)
                     for r in retry:
-                        store.update_enrichment(job_id, r["place_key"], {"enrich_status": "pending"})
+                        store.update_enrichment(job_id, r["place_key"], {
+                            "enrich_status": "pending",
+                            "enrich_attempts": int(r["enrich_attempts"] if "enrich_attempts" in r.keys() else 0) + 1,
+                        })
+                    missing = len(keys) - len(rows) if keys else 0
                     store.log(job_id, "job",
                               f"re-enrich queued for {len(retry)} lead(s)"
-                              + (f" (scoped to {len(keys)})" if keys else " (whole job)"))
+                              + (f" (scoped to {len(keys)})" if keys else " (whole job)")
+                              + (f" · {len(settled)} gave up after 2 tries" if settled else "")
+                              + (f" · {missing} not on this machine" if missing > 0 else ""),
+                              "warn" if (settled or missing > 0) and not retry else "info")
 
                 store.update_job(job_id, phase="scraping", status="running", message="opening Google Maps…",
                                  started_at=t0, scrape_started_at=t0)
@@ -472,14 +491,22 @@ class Worker(threading.Thread):
                 _refresh_wa_status(store, "before job")
                 try:
                     from webscraper.store import Store as _S
-                    for a in _S().list_wa_accounts():
+                    accts = _S().list_wa_accounts()
+                    # W71: the lane rotates across every linked account and needs only one.
+                    # A spare that is not linked is a note, not a threat — the PC's log
+                    # said "spare1: NOT linked — the WhatsApp lane will stop" under a
+                    # linked `main`, and the lane ran fine.
+                    any_linked = any(str(a.get("status") or "") == "logged_in" for a in accts)
+                    for a in accts:
                         st = str(a.get("status") or "unchecked")
-                        store.log(job_id, "job",
-                                  f"WhatsApp profile {a['name']}: "
-                                  + ("linked" if st == "logged_in" else
-                                     "NOT linked — the WhatsApp lane will stop" if st == "logged_out"
-                                     else "unchecked"),
-                                  level="info" if st == "logged_in" else "warn")
+                        if st == "logged_in":
+                            msg, lvl = "linked", "info"
+                        elif st == "logged_out":
+                            msg = "NOT linked" + ("" if any_linked else " — the WhatsApp lane will stop")
+                            lvl = "info" if any_linked else "warn"
+                        else:
+                            msg, lvl = "unchecked", "info" if any_linked else "warn"
+                        store.log(job_id, "job", f"WhatsApp profile {a['name']}: {msg}", level=lvl)
                 except Exception:                                 # noqa: BLE001
                     log.debug("could not log the WhatsApp state onto the job", exc_info=True)
                 pipe = Pipeline(job_id, dict(job), _discovery)

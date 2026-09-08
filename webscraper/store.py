@@ -376,6 +376,15 @@ class Store:
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+        # W71: how many crawls a lead has had. Two failures is the cutoff (T441): the
+        # lead keeps its status and error for the review page but stops being retried.
+        pcols = {r[1] for r in self.conn.execute("PRAGMA table_info(places)")}
+        if "enrich_attempts" not in pcols:
+            self.conn.execute("ALTER TABLE places ADD COLUMN enrich_attempts INTEGER NOT NULL DEFAULT 0")
+        for col, typ in (
+        ):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
         # 'assumed_mobile' is retired (2026-08-23): a plain mobile number is a CANDIDATE for
         # verification, never a claim that the business is on WhatsApp. Existing rows become
         # 'unverified', which the UI deliberately renders with no tag at all.
