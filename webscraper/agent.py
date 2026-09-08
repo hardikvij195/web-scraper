@@ -413,7 +413,13 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
     # opened, what was skipped and why. Best-effort — an old store has no job_links.
     try:
         offered, opened = store.link_counts(row["id"]) if store is not None else (0, 0)
-        out.update({"links_offered": offered, "links_opened": opened,
+        # W61: how many of the saved places are stubs (no panel to read). Reported in its
+        # own right now that the lane's `done` counts them, so the card can say "145 / 145
+        # · 9 saved as stubs" instead of implying nine went missing.
+        stubs = 0
+        if store is not None:
+            stubs = max(0, int(store.count_places(row["id"])) - int(store.count_places_detailed(row["id"])))
+        out.update({"links_offered": offered, "links_opened": opened, "places_stub": stubs,
                     "skipped_known": int(_col(row, "skipped_known", 0) or 0),
                     "skipped_far": int(_col(row, "skipped_far", 0) or 0)})
     except Exception:                                             # noqa: BLE001
