@@ -1344,29 +1344,6 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     log.info("re-verify #%s: %d numbers checked%s", jid, n_checked, " (daily cap hit)" if capped else "")
 
 
-def _seed_missing_places(cloud: "Cloud | CrmCloud", store: Store, cj: dict, local_id: int) -> None:
-    """Create local place rows for scoped leads this machine has never seen (W71)."""
-    from webscraper.models import Place
-    keys = cj.get("place_keys")
-    wanted = {str(k) for k in keys} if isinstance(keys, list) and keys else None
-    have = {r["place_key"] for r in store.places(local_id)}
-    rows = cloud.results(int(cj["id"]))
-    seeded = 0
-    for r in rows:
-        pk = str(r.get("place_key") or "")
-        if not pk or pk in have or (wanted is not None and pk not in wanted):
-            continue
-        store.upsert_place(Place(
-            job_id=local_id, place_key=pk, name=r.get("name"), phone=r.get("phone"),
-            website=r.get("website"), country=r.get("country"), maps_url=r.get("maps_url"),
-            email=r.get("email"), whatsapp_number=r.get("whatsapp_number"),
-            enrich_status="failed" if r.get("website") else "no_website",
-        ))
-        seeded += 1
-    if seeded:
-        store.log(local_id, "job", f"pulled {seeded} lead(s) from the CRM — they were not on this machine")
-
-
 def _place_keys_json(cj: dict) -> str | None:
     """The CRM's `place_keys` array as JSON text, or None for "the whole job"."""
     keys = cj.get("place_keys")
@@ -1418,9 +1395,11 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     # re-verify path has always done this; enrichment needed the same.
     if cj.get("reenrich_only"):
         try:
-            _seed_missing_places(cloud, store, cj, local_id)
+            n = _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
+            if n:
+                store.log(local_id, "job", f"pulled {n} lead(s) from the CRM to refresh this machine's copy")
         except Exception:                                         # noqa: BLE001
-            log.warning("could not seed leads for the re-enrich from the CRM", exc_info=True)
+            log.warning("could not hydrate the re-enrich from the CRM", exc_info=True)
     srv.worker.wake.set()                        # do not wait out the poll interval
     log.info("cloud job #%s re-queued -> local job #%s", cj["id"], local_id)
 
@@ -1431,12 +1410,11 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
     `EnrichmentLane`'s `pending_enrichment()` (a LOCAL sqlite query) has something to
     find instead of silently seeing zero rows and reporting a false "nothing to do".
 
-    Scoped to re-enrich/both ONLY — discovery re-runs are NOT hydrated here:
-    `discovery_pending` needs `job_links` (which unopened Maps links to open), and that
-    table is never synced to the CRM at all, so there is nothing to reconstruct it from.
-    A `discovery_missed`/`discovery_more` re-run does a fresh Maps search instead and
-    does not need existing local rows either. Only `reenrich_only` jobs hit this path
-    (checked by the caller).
+    Runs for every `reenrich_only` re-run, including one that also carries
+    `discovery_pending` (W72). `job_links` is never synced, so the stub re-open part of
+    such a run offers 0 on a foreign machine — but `places` is rebuilt, and that is what
+    the enrichment and WhatsApp lanes crawl. A `discovery_missed`/`discovery_more` re-run
+    does a fresh Maps search and needs no local rows.
 
     Safety, worked through deliberately rather than assumed:
     - Source is `cloud.results()` — the SAME narrow endpoint (`place_key, name, phone,
@@ -1563,7 +1541,14 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # first pass — its local `places` table is genuinely empty, so a re-enrich right
         # now would just be handed nothing. `discovery_pending` is excluded even though
         # it also carries `reenrich_only` — it needs `job_links`, never synced.
-        if kind == "crm" and cj.get("reenrich_only") and not cj.get("discovery_pending"):
+        # W72: `discovery_pending` no longer disqualifies it. "Finish everything pending"
+        # (T442) sets it beside reenrich_only, and the exclusion left a job that landed
+        # on a fresh machine with an EMPTY places table — "re-enrich queued for 0
+        # lead(s) (whole job)" on jobs #2 and #5 the moment Auto routing spread them.
+        # Hydration rebuilds `places`, which is what enrichment and WhatsApp need; the
+        # stub re-open still needs `job_links`, which only the original machine has, so
+        # on a foreign machine that part offers 0 and the rest of the run is real.
+        if kind == "crm" and cj.get("reenrich_only"):
             try:
                 _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
             except Exception:                                     # noqa: BLE001
