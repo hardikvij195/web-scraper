@@ -607,7 +607,11 @@ def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> 
         if worker is not None and not worker.is_alive():
             why = "the agent's worker thread is dead"
         elif worker is not None and worker.current_job not in (None, int(r["id"])):
-            why = f"the worker is still busy with local job #{worker.current_job}"
+            # W74: busy is not broken. Auto routing (T469) can hand a machine two jobs in
+            # one poll; the second is simply queued behind the first and starts the moment
+            # the worker frees. Failing it after five minutes — "the worker is still busy
+            # with local job #34" on the DELL — turned a queue into an error.
+            continue
         else:
             why = "the worker never picked it up (browser launch or SQLite lock hung)"
         reason = (f"did not start within {START_GRACE_SEC // 60} min — {why}. "
