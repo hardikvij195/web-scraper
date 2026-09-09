@@ -13,6 +13,22 @@
 
 ---
 
+## Session 2026-09-09 — W77: a mid-job wa-login no longer kills the WhatsApp lane (CRM T477)
+
+- [x] **W77** `lanes.py` — linking a second number from the CRM ("WhatsApp login", arg `spare1`)
+  while a job ran ENDED that job's WhatsApp lane: the rotation reached the account being
+  scanned, `_ensure_session` raised `WaNotLoggedIn("a WhatsApp login is open")` (correct), and
+  the lane returned `wa_not_logged_in` for good — seen live on `1 - PC` job 36 at 03:51 UTC,
+  the new number never used until a restart. Now the lane pauses while
+  `wa_verify.login_in_progress()` (up to `WA_LOGIN_WAIT_SEC` 240 s; the QR window itself
+  times out at 2 min) and continues the same batch. Test:
+  `test_whatsapp_lane_waits_out_an_open_login_instead_of_giving_up`. VERSION 1.5.3.
+  Context: the CRM's `wa_parallel__<device>` save had been failing on the
+  `lead_gen_settings_key_check` constraint (CRM migration 20260909T0900); parallel sessions =
+  min(setting, linked accounts) — a machine with one linked number runs one session whatever
+  the setting says.
+
+
 ## Session 2026-09-04 — bug reports (CRM tasks.md T336/T338): orphaned Chrome windows + lane auto-retry
 
 | # | What | State |

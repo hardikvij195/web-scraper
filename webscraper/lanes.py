@@ -49,6 +49,9 @@ log = logging.getLogger("webscraper.lanes")
 #: lane feeding it is still running. Two seconds is invisible next to a ~3.5 s/place scrape
 #: and keeps the polling cost to nothing.
 IDLE_POLL_SEC = 2.0
+# W77: how long the WhatsApp lane waits for an open wa-login window before giving up —
+# the QR window itself times out after 2 min, so this only ever waits out a real scan.
+WA_LOGIN_WAIT_SEC = 240.0
 
 #: Enrichment gets its speed from concurrency inside `enrich_places`, so it takes a batch
 #: rather than one lead at a time. Small enough that a lead reaches WhatsApp quickly.
@@ -604,6 +607,22 @@ class WhatsAppLane(Lane):
                     res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
                                                   job_id=self.job_id, headless=hl)
             except wa_verify.WaNotLoggedIn as e:
+                # W77: a login window is open on this machine (the user is linking a
+                # number from the CRM's "WhatsApp login" mid-job). The rotation reached
+                # that account and _ensure_session refused to open its profile — which is
+                # right — but giving the lane up for it is not: the job's WhatsApp lane
+                # ended for good and the new number never got used. Wait the login out
+                # (its QR window times out after 2 min) and carry on with the same batch.
+                if wa_verify.login_in_progress():
+                    self.note("WhatsApp lane paused — a WhatsApp login is open on this "
+                              "machine; resuming when it closes", "info")
+                    deadline = time.monotonic() + WA_LOGIN_WAIT_SEC
+                    while wa_verify.login_in_progress() and time.monotonic() < deadline:
+                        if self.stopped():
+                            return R_STOPPED
+                        time.sleep(1.0)
+                    if not wa_verify.login_in_progress():
+                        continue
                 self.note(f"WhatsApp verification skipped — {e}", "warn")
                 # W67: and take the window with it. The lane gives up in seconds, but the
                 # headed WhatsApp browser it opened was left sitting on the splash — the

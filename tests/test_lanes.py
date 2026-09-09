@@ -239,3 +239,54 @@ def test_enrichment_bails_instead_of_looping_on_a_stuck_queue(db, monkeypatch):
     s = db()
     assert s.lanes(job_id)["enrichment"]["ok"] is False
     s.close()
+
+
+def test_whatsapp_lane_waits_out_an_open_login_instead_of_giving_up(db, monkeypatch):
+    """W77: linking a second number from the CRM while a job runs used to END the job's
+    WhatsApp lane — the rotation reached the account being scanned, _ensure_session raised
+    WaNotLoggedIn("a WhatsApp login is open"), and the lane returned wa_not_logged_in for
+    good. The lane must pause while the login window is open and pick up where it was."""
+    from webscraper import wa_verify
+    from webscraper.store import Store
+
+    job_id, job = _mk_job(db, do_enrich=0, do_wa_verify=1)
+    _add_place(db, job_id, "p1", "+919999999999")
+    state = {"login_open": True, "calls": 0, "pending": True}
+    row = {"place_key": "p1", "name": "biz p1", "number": "919999999999", "source": "maps"}
+
+    monkeypatch.setattr(Store, "pending_wa_verify",
+                        lambda self, jid, limit=25: [row] if state["pending"] else [])
+    monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
+    def login_open(name=None):
+        # Open while the lane raises and for its first wait poll; the scan finishes after.
+        state["polls"] = state.get("polls", 0) + 1
+        if state["polls"] > 2:
+            state["login_open"] = False
+        return state["login_open"]
+    monkeypatch.setattr(wa_verify, "login_in_progress", login_open)
+
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+        state["calls"] += 1
+        if state["login_open"]:
+            raise wa_verify.WaNotLoggedIn("[spare1] a WhatsApp login is open on this machine — waiting for it")
+        on_progress("p1", "yes", "919999999999", "maps")
+        state["pending"] = False
+        return {"yes": 1, "no": 0, "unknown": 0}
+    monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
+    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
+
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
+    pipe.discovery.done.set()
+    lane = pipe.whatsapp
+    lane.store = db()
+    try:
+        reason = lane._work()
+    finally:
+        lane.store.close()
+
+    assert reason == L.R_COMPLETED, reason
+    assert state["calls"] == 2
+    s = db()
+    msgs = [r["message"] for r in s.logs(job_id)]
+    s.close()
+    assert any("paused" in m and "login" in m for m in msgs), msgs
