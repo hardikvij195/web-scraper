@@ -297,6 +297,29 @@ class EnrichmentLane(Lane):
         seen = store.count_enriched(self.job_id)
         stuck = 0
 
+        # W81 (CRM T500): the re-run's "skip — mark done" choice is answered BEFORE the
+        # WhatsApp wait below. It used to sit in that loop for the whole WhatsApp run,
+        # reporting "running 575 / 575" on a lane that had nothing to do (job #1631).
+        # W76: the re-run's choice about websites (see enrich_scope on the job).
+        scope_mode = str(self.job.get("enrich_scope") or "all")
+        if scope_mode == "skip":
+            # "Mark it done without web scraping": every lead this run would have crawled
+            # is settled instead — two attempts is the cutoff the CRM stops counting at —
+            # so the job can finish without a crawl that was never wanted.
+            keys = store.job_place_keys(self.job_id)
+            n = 0
+            for r in store.places(self.job_id):
+                if keys and r["place_key"] not in keys:
+                    continue
+                if r["enrich_status"] in ("pending", "failed", "thin"):
+                    store.update_enrichment(self.job_id, r["place_key"],
+                                            {"enrich_status": "failed" if r["enrich_status"] != "thin" else "thin",
+                                             "enrich_attempts": 2,
+                                             "enrich_error": r["enrich_error"] or "skipped by request"})
+                    n += 1
+            self.note(f"websites skipped by request — {n} lead(s) marked settled without a crawl")
+            return R_NO_TARGETS
+
         # W76 (user directive 2026-09-08): websites are the LAST priority. After Maps
         # discovery, WhatsApp verification of the Maps numbers comes first; the site
         # crawl waits until discovery has ended and WhatsApp has nothing left from it.
@@ -318,25 +341,6 @@ class EnrichmentLane(Lane):
         if waited:
             self.note("WhatsApp has cleared the Maps numbers — crawling websites now")
 
-        # W76: the re-run's choice about websites (see enrich_scope on the job).
-        scope_mode = str(self.job.get("enrich_scope") or "all")
-        if scope_mode == "skip":
-            # "Mark it done without web scraping": every lead this run would have crawled
-            # is settled instead — two attempts is the cutoff the CRM stops counting at —
-            # so the job can finish without a crawl that was never wanted.
-            keys = store.job_place_keys(self.job_id)
-            n = 0
-            for r in store.places(self.job_id):
-                if keys and r["place_key"] not in keys:
-                    continue
-                if r["enrich_status"] in ("pending", "failed", "thin"):
-                    store.update_enrichment(self.job_id, r["place_key"],
-                                            {"enrich_status": "failed" if r["enrich_status"] != "thin" else "thin",
-                                             "enrich_attempts": 2,
-                                             "enrich_error": r["enrich_error"] or "skipped by request"})
-                    n += 1
-            self.note(f"websites skipped by request — {n} lead(s) marked settled without a crawl")
-            return R_NO_TARGETS
         # Set the total BEFORE the first lead is touched, not just after the first batch
         # finishes. Otherwise `enrich_total` keeps the previous run's value (e.g. 180) and
         # the bar reads "3 / 180" while the 9 fixable leads process, flipping to "9 / 9"

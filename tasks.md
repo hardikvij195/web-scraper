@@ -26,6 +26,19 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W81** `lanes.py` (CRM T500) — a re-run whose websites choice is "Skip — mark done"
+  settled its leads only AFTER the W76 wait-for-WhatsApp loop, so the enrichment lane sat
+  "running 575 / 575" for the whole WhatsApp run (job #1631). The skip is answered first now.
+- [x] **W82** `server.py` (CRM T499) — the before/after-job WhatsApp probe is a headless page
+  load with a 40 s ceiling per account, and WhatsApp Web rarely renders headless on these
+  profiles (W65): 80–160 s between jobs answering "unknown". A profile the lanes saw in the
+  last 20 minutes is taken as read; only stale ones are probed.
+- [x] **W83** `server.py` + `agent.py` (CRM T501) — finished jobs reached the CRM as **Error**
+  ("discovery: completed · enrichment: completed · whatsapp: completed"): the final status was
+  written only after the probe + Supabase push, the stall watchdog (no counter / log for
+  120 s) stopped the already-finished job, and `stopped` mapped to cloud `error`. Now: status
+  is written before the housekeeping; the watchdog ignores a job whose lanes have all ended;
+  `stopped` with every lane ok reports `done`. VERSION 1.5.7.
 - [x] **W80** `wa_rename` agent command (CRM T489) — `arg` = `<old>><new>`: renames a WhatsApp
   account's profile dir (`data/wa-profiles/<name>`) and its `wa_accounts` row (+ `wa_checks`
   history) so a number can be called what it is instead of main/spare1. `wa_verify.rename_account()`

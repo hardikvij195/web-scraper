@@ -170,9 +170,27 @@ def _refresh_wa_status(store, when: str) -> None:
         d = settings.wa_profiles_dir
         if not d.exists():
             return
+        # W82 (CRM T499): the probe is a headless page load with a 40 s ceiling per
+        # account, and WhatsApp Web rarely renders headless on these profiles (W65) — so
+        # it burned 80–160 s between jobs answering "unknown". The lanes record the real
+        # answer whenever they open a session; anything seen in the last 20 minutes is
+        # taken as read and only stale profiles are probed.
+        fresh_before = datetime.now(timezone.utc) - timedelta(minutes=20)
+        seen_at: dict[str, datetime] = {}
+        try:
+            for row in store.list_wa_accounts():
+                if row.get("status") and row.get("status_at"):
+                    seen_at[str(row["name"])] = datetime.fromisoformat(str(row["status_at"]))
+        except Exception:                                         # noqa: BLE001
+            pass
         for acc in sorted(p.name for p in d.iterdir() if p.is_dir()):
             if not (d / acc / "Default").exists():
                 continue                      # never completed a login; nothing to probe
+            last = seen_at.get(acc)
+            if last is not None and last >= fresh_before:
+                log.info("WhatsApp profile %r: last seen %s (%s) — probe skipped",
+                         acc, last.strftime("%H:%M:%S"), when)
+                continue
             try:
                 state = wa_verify.account_status(acc)   # writes it through set_wa_status
                 log.info("WhatsApp profile %r is %s (%s)", acc, state, when)
@@ -512,6 +530,22 @@ class Worker(threading.Thread):
                 pipe = Pipeline(job_id, dict(job), _discovery)
                 reasons = pipe.run()
                 log.info("job %s lanes finished: %s", job_id, reasons)
+
+                # The job is 'stopped' only if the USER stopped it. A lane that hit the Maps
+                # cap, the WhatsApp daily cap or its own error still leaves a finished job —
+                # the per-lane reason says which, so "2 / 30 · done" can no longer happen.
+                #
+                # W83 (CRM T501): written FIRST. The after-job WhatsApp probe and the
+                # Supabase push used to run before this line — up to two minutes with no
+                # counter moving and nothing logged — so the stall watchdog stopped jobs
+                # whose every lane had just completed, and the CRM showed them as Error
+                # (#1619, #1634). Housekeeping now happens on a job that already reads done.
+                user_stopped = store.stop_requested(job_id)
+                final = "stopped" if user_stopped else "done"
+                note = pipe.summary()
+                store.update_job(job_id, phase=final, status=final, message=note)
+                store.log(job_id, "job", f"job {final} — {note}")
+
                 _refresh_wa_status(store, "after job")
 
                 # push to Supabase (best-effort; no-op when not configured / table missing)
@@ -523,15 +557,6 @@ class Worker(threading.Thread):
                             log.info("pushed %d leads to Supabase for job %s", n, job_id)
                 except Exception as e:  # noqa: BLE001
                     log.warning("supabase push error: %s", e)
-
-                # The job is 'stopped' only if the USER stopped it. A lane that hit the Maps
-                # cap, the WhatsApp daily cap or its own error still leaves a finished job —
-                # the per-lane reason says which, so "2 / 30 · done" can no longer happen.
-                user_stopped = store.stop_requested(job_id)
-                final = "stopped" if user_stopped else "done"
-                note = pipe.summary()
-                store.update_job(job_id, phase=final, status=final, message=note)
-                store.log(job_id, "job", f"job {final} — {note}")
                 store.finish_job(job_id, final, note)
             except Exception as e:  # noqa: BLE001 — keep the worker alive for the next job
                 log.exception("job %s failed", job_id)

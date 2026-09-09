@@ -534,6 +534,31 @@ STALL_SEC = 120.0
 _STALL_SEEN: dict[int, tuple[str, float]] = {}
 
 
+def _lanes_all_ended(store, jid: int) -> bool:
+    """Every lane the job ran has an end stamp (a lane the job never asked for has none
+    and an `ok` of None — it counts as ended)."""
+    try:
+        lanes = store.lanes(jid)
+    except Exception:                                             # noqa: BLE001
+        return False
+    if not lanes:
+        return False
+    return all(l.get("ended_at") or l.get("ok") is None for l in lanes.values())
+
+
+def _lanes_all_ok(store, jid: int) -> bool:
+    """W83: a job the watchdog or a race marked 'stopped' AFTER every lane finished
+    cleanly is a finished job, not a failed one."""
+    try:
+        lanes = store.lanes(jid)
+    except Exception:                                             # noqa: BLE001
+        return False
+    if not lanes:
+        return False
+    ran = [l for l in lanes.values() if l.get("ok") is not None]
+    return bool(ran) and all(l.get("ok") for l in ran)
+
+
 def _fail_stalled(cloud: "Cloud | CrmCloud", store: Store, kind: str) -> None:
     """Stop a job that has stopped moving, and report why.
 
@@ -552,6 +577,13 @@ def _fail_stalled(cloud: "Cloud | CrmCloud", store: Store, kind: str) -> None:
     now = time.monotonic()
     for r in rows:
         jid = int(r["id"])
+        # W83: lanes that have all ended are not "stuck" — the worker is doing its
+        # after-job housekeeping (WhatsApp probe, Supabase push) and will stamp the
+        # final status in a moment. Stopping the job here turned finished runs into
+        # Error rows on the CRM (#1619, #1634, 2026-09-09).
+        if _lanes_all_ended(store, jid):
+            _STALL_SEEN.pop(jid, None)
+            continue
         try:
             last_log = store.conn.execute(
                 "SELECT COUNT(*), COALESCE(MAX(rowid),0) FROM job_logs WHERE job_id=?", (jid,)).fetchone()
@@ -1652,6 +1684,10 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                     cloud.progress(cid, row["phase"], _local_progress(row, store))
                 except httpx.HTTPError as e:
                     log.warning("final progress for #%s failed (done still sent): %s", cid, e)
-                cloud.done(cid, "done" if row["phase"] == "done" else "error",
-                           None if row["phase"] == "done" else failure[:300])
+                # W83: 'stopped' after every lane completed (a watchdog that fired during
+                # the after-job housekeeping, or Stop pressed as the last lane ended) is a
+                # finished job — the CRM row read "Error: discovery: completed · …" before.
+                finished = row["phase"] == "done" or (row["phase"] == "stopped" and _lanes_all_ok(store, int(row["id"])))
+                cloud.done(cid, "done" if finished else "error",
+                           None if finished else failure[:300])
                 store.update_job(row["id"], note="synced")
