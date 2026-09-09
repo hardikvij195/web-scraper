@@ -81,8 +81,10 @@ class Settings:
     # still seconds apart on purpose: what gets an account challenged is a
     # fixed, machine-looking cadence more than the raw rate. If challenges do
     # start, raise both — that signal costs a logged-in session to ignore.
-    wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 3.0)
-    wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 8.0)
+    # W89 (2026-09-09, user: "decrease the deliberate random pause"): 1.5-4 s (avg ~2.75 s),
+    # per machine from the CRM Systems card via WA_DELAY__<DEVICE> (see wa_verify.wa_delay_range).
+    wa_delay_min: float = _float(os.getenv("WA_VERIFY_DELAY_MIN"), 1.5)
+    wa_delay_max: float = _float(os.getenv("WA_VERIFY_DELAY_MAX"), 4.0)
     # Headed by default: WhatsApp Web treats a headless Chromium as a NEW device and
     # shows the QR again (session doesn't carry over), so headless verify sees every
     # account as logged-out. On a headless VPS set WA_VERIFY_HEADLESS=true + run under

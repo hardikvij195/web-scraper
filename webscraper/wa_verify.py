@@ -490,7 +490,8 @@ def verify_places(
                 # re-derived from every verdict so far (any yes → yes, all no → no).
                 store.record_wa_check(job_id, pk, e164, source, status, name)
             on_progress(pk, status, e164, source)
-            time.sleep(random.uniform(settings.wa_delay_min, settings.wa_delay_max))
+            lo, hi = wa_delay_range()
+            time.sleep(random.uniform(lo, hi))
     finally:
         for pw_ctx, _ in open_ctx.values():
             try:
@@ -499,6 +500,37 @@ def verify_places(
                 pass
         pw.stop()
     return counts
+
+
+def wa_delay_range() -> tuple[float, float]:
+    """W89 (CRM T521): the random pause between two numbers on one session, in seconds.
+
+    Per machine from the CRM Systems card (lead_gen_settings `wa_delay__<device>`, pushed
+    as env WA_DELAY__<DEVICE>, value "<min>-<max>" e.g. "1.5-4"), or WA_DELAY in .env;
+    else the WA_VERIFY_DELAY_MIN/MAX settings (default 1.5-4 since 1.6.4, was 3-8).
+    Read at call time on purpose: the agent pushes cloud config into os.environ AFTER
+    `settings` was built, so a dataclass default would never see it. Floor 0.5 s and
+    a non-inverted range, whatever the value says.
+    """
+    import os
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    raw = (os.getenv(f"WA_DELAY__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) or os.getenv("WA_DELAY")
+    lo, hi = settings.wa_delay_min, settings.wa_delay_max
+    if raw:
+        parts = [x.strip() for x in str(raw).replace("–", "-").split("-") if x.strip()]
+        try:
+            if len(parts) == 2:
+                lo, hi = float(parts[0]), float(parts[1])
+            elif len(parts) == 1:
+                lo = hi = float(parts[0])
+        except ValueError:
+            pass
+    lo = max(0.5, lo)
+    hi = max(lo, hi)
+    return lo, hi
 
 
 def wa_window_mode() -> str:

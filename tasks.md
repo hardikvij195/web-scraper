@@ -26,6 +26,11 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W89** `wa_verify.py` + `config.py` (CRM T521) — the random pause between two numbers on a
+  session drops from 3–8 s to **1.5–4 s** by default and becomes per machine: `WA_DELAY__<DEVICE>`
+  = "<min>-<max>" from the CRM Systems card (or `WA_DELAY` in .env), read at call time (cloud
+  config lands in os.environ after `settings` is built). Floor 0.5 s. `tests/test_wa_delay.py`.
+  VERSION 1.6.4.
 - [x] **W88** `wa_verify.py` + `server.py` — the before/after-job probe (`account_status`) now launches
   the installed Chrome `--headless=new` (the W86 headless kwargs) instead of headless Chromium, so
   it answers in ~5 s instead of "unknown" after 40 s. And W82's 20-minute skip never worked:
