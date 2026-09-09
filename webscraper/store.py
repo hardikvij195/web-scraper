@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS ai_usage (
   ok INTEGER NOT NULL DEFAULT 1,
   status_code INTEGER,
   error TEXT,
-  ts TEXT NOT NULL
+  ts TEXT NOT NULL,
+  key_index INTEGER                -- W79: which of the provider's keys made the call (1-based)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_usage_job ON ai_usage(job_id, id);
 
@@ -385,6 +386,10 @@ class Store:
         pcols = {r[1] for r in self.conn.execute("PRAGMA table_info(places)")}
         if "enrich_attempts" not in pcols:
             self.conn.execute("ALTER TABLE places ADD COLUMN enrich_attempts INTEGER NOT NULL DEFAULT 0")
+        # W79: which key of the provider answered (multi-key registry, CRM T478).
+        ucols = {r[1] for r in self.conn.execute("PRAGMA table_info(ai_usage)")}
+        if "key_index" not in ucols:
+            self.conn.execute("ALTER TABLE ai_usage ADD COLUMN key_index INTEGER")
         for col, typ in (
         ):
             if col not in have:
@@ -468,22 +473,23 @@ class Store:
     def record_ai_usage(self, *, job_id: int | None, place_key: str | None, kind: str,
                          provider: str, model: str | None,
                          prompt_tokens: int | None, completion_tokens: int | None,
-                         ok: bool, status_code: int | None = None, error: str | None = None) -> None:
+                         ok: bool, status_code: int | None = None, error: str | None = None,
+                         key_index: int | None = None) -> None:
         """One row per LLM call. Never raises — a usage-tracking failure must not take
         down the research call it is describing (same contract as log())."""
         try:
             self.conn.execute(
                 "INSERT INTO ai_usage(job_id, place_key, kind, provider, model, prompt_tokens, "
-                "completion_tokens, ok, status_code, error, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "completion_tokens, ok, status_code, error, ts, key_index) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, place_key, kind, provider, model, prompt_tokens, completion_tokens,
-                 1 if ok else 0, status_code, (error or None) and str(error)[:500], now_iso()))
+                 1 if ok else 0, status_code, (error or None) and str(error)[:500], now_iso(), key_index))
             self.conn.commit()
         except sqlite3.Error:                                    # noqa: BLE001
             log.debug("ai_usage write failed for job %s", job_id, exc_info=True)
 
     def ai_usage_since(self, job_id: int, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute(
-            "SELECT id, kind, provider, model, prompt_tokens, completion_tokens, ok, status_code, error, ts "
+            "SELECT id, kind, provider, model, prompt_tokens, completion_tokens, ok, status_code, error, ts, key_index "
             "FROM ai_usage WHERE job_id=? AND id>? ORDER BY id LIMIT ?", (job_id, after_id, limit))]
 
     #: lane key -> (started column, ended column, ok column, reason column)

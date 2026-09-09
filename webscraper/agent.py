@@ -510,7 +510,7 @@ def _ship_ai_usage(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
         cloud.ai_usage(int(cid), [{"kind": r["kind"], "provider": r["provider"], "model": r["model"],
                                    "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"],
                                    "ok": bool(r["ok"]), "status_code": r["status_code"], "error": r["error"],
-                                   "ts": r["ts"]} for r in rows])
+                                   "ts": r["ts"], "key_index": r["key_index"]} for r in rows])
     except Exception as e:                                       # noqa: BLE001
         log.warning("ai_usage ship to #%s failed (%d row(s) held for the next tick): %s",
                     cid, len(rows), e)

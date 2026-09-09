@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Callable
 
 import httpx
@@ -49,6 +50,65 @@ Do not invent people or numbers. Use null when unknown."""
 
 def _gemini_key() -> str | None:
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_AI_STUDIO_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+
+# ---------------------------------------------------------------------------- keys ---
+# W79 (CRM T478): several keys per provider. The CRM's registry mirrors them into
+# lead_gen_settings as <provider>_api_key, <provider>_api_key_2, _3 … and the agent's config
+# push turns those into GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3 … (local .env wins).
+# The chain tries every key of a provider, in that order, before it moves on to the next
+# provider. Sticky, not round-robin: a run always starts at key 1, so quota keys drain in
+# order. A 429'd key cools down inside this process; a 401/403'd key is not retried at all.
+KEY_COOLDOWN_SEC = 600
+
+_cooling: dict[tuple[str, int], float] = {}     # (provider, key_index) -> monotonic expiry
+_rejected: set[tuple[str, int]] = set()          # (provider, key_index) that 401/403'd
+
+
+def reset_key_state() -> None:
+    _cooling.clear()
+    _rejected.clear()
+
+
+def _keys_for(name: str) -> list[str]:
+    """Every key the env holds for a provider, position order. Stops at the first gap, so
+    X_API_KEY_3 without X_API_KEY_2 is ignored (the CRM never writes gaps; a hand-edited
+    .env with one is a mistake worth noticing, not silently reordering)."""
+    if name == "gemini":
+        first, env = _gemini_key(), "GEMINI_API_KEY"
+    else:
+        spec = next((p for p in _PROVIDERS if p[0] == name), None)
+        if spec is None:
+            return []
+        env = spec[1]
+        first = os.getenv(env)
+    if not first:
+        return []
+    keys = [first]
+    n = 2
+    while os.getenv(f"{env}_{n}"):
+        keys.append(os.environ[f"{env}_{n}"])
+        n += 1
+    return keys
+
+
+def _key_usable(name: str, idx: int) -> bool:
+    if (name, idx) in _rejected:
+        return False
+    until = _cooling.get((name, idx))
+    if until is None:
+        return True
+    if time.monotonic() < until:
+        return False
+    del _cooling[(name, idx)]
+    return True
+
+
+def _note_key_result(name: str, idx: int, status_code: int | None) -> None:
+    if status_code == 429:
+        _cooling[(name, idx)] = time.monotonic() + KEY_COOLDOWN_SEC
+    elif status_code in (401, 403):
+        _rejected.add((name, idx))
 
 
 def _text_of(html: str) -> str:
@@ -143,28 +203,24 @@ def _provider_order() -> list[str]:
 
 def available_providers() -> list[str]:
     """Names with a key set, in the order they will be tried."""
-    out = []
-    for name in _provider_order():
-        if name == "gemini" and _gemini_key():
-            out.append("gemini")
-        for p in _PROVIDERS:
-            if p[0] == name and os.getenv(p[1]):
-                out.append(name)
-    return out
+    return [name for name in _provider_order() if _keys_for(name)]
 
 
 #: One LLM call's outcome, whether it succeeded or not — CRM-side token/cost tracking
 #: (2026-09-04) needs every ATTEMPT, not just the winning one, so a run that fell
 #: through 3 rate-limited free providers before Gemini finally answered shows all 4.
+#: `key_index` (W79) says which of the provider's keys made the call (1-based).
 def _usage_row(provider: str, model: str | None, ok: bool, status_code: int | None = None,
                error: str | None = None, prompt_tokens: int | None = None,
-               completion_tokens: int | None = None) -> dict[str, Any]:
+               completion_tokens: int | None = None, key_index: int | None = None) -> dict[str, Any]:
     return {"provider": provider, "model": model, "ok": ok, "status_code": status_code,
-            "error": error, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+            "error": error, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "key_index": key_index}
 
 
 async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, base: str, model: str,
-                             prompt: str, errors: dict[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+                             prompt: str, errors: dict[str, Any] | None,
+                             key_index: int = 1) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     try:
         r = await client.post(
             f"{base}/chat/completions",
@@ -179,9 +235,10 @@ async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, bas
         txt = body["choices"][0]["message"]["content"] or ""
         data = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
         return data, _usage_row(name, model, True, r.status_code,
-                                 prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"))
+                                 prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
+                                 key_index=key_index)
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
-        log.warning("%s research failed: %s", name, e)
+        log.warning("%s research failed (key %d): %s", name, key_index, e)
         code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
         # Body snippet only for 400s — that's the one code where the provider's own
         # message (bad param name, unsupported field) is worth surfacing verbatim;
@@ -195,7 +252,7 @@ async def _ask_openai_compat(client: httpx.AsyncClient, name: str, key: str, bas
         msg = _openai_compat_error_text(name, model, code, snippet)
         if errors is not None:
             errors["error"] = msg
-        return None, _usage_row(name, model, False, code, msg)
+        return None, _usage_row(name, model, False, code, msg, key_index=key_index)
 
 
 async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -203,36 +260,45 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
     failure and `errors['provider']` the provider that answered. The second return value
     is every attempt made (2026-09-04, CRM token/cost tracking) — a run that fell through
     3 rate-limited free providers before one answered ships all 4 attempts, not just the
-    winner, so a 429 shows up even on a lead that ultimately succeeded."""
+    winner, so a 429 shows up even on a lead that ultimately succeeded.
+
+    W79: inside each provider every key is tried in position order (skipping keys that
+    are cooling down after a 429 or were rejected with 401/403 earlier in this process);
+    the next provider is only reached when every key of this one failed."""
     tried = 0
     attempts: list[dict[str, Any]] = []
     for name in _provider_order():
-        if name == "gemini":
-            key = _gemini_key()
-            if not key:
+        keys = _keys_for(name)
+        if not keys:
+            continue
+        spec = None if name == "gemini" else next((p for p in _PROVIDERS if p[0] == name), None)
+        if name != "gemini" and spec is None:
+            continue
+        for idx, key in enumerate(keys, start=1):
+            if not _key_usable(name, idx):
                 continue
             tried += 1
-            data, usage = await _ask_gemini(client, key, prompt, errors)
-        else:
-            spec = next((p for p in _PROVIDERS if p[0] == name), None)
-            if not spec or not os.getenv(spec[1]):
-                continue
-            tried += 1
-            model = os.getenv(f"AI_RESEARCH_MODEL_{name.upper()}") or spec[3]
-            data, usage = await _ask_openai_compat(client, name, os.environ[spec[1]], spec[2], model, prompt, errors)
-        attempts.append(usage)
-        if data:
-            errors["provider"] = name
-            return data, attempts
+            if name == "gemini":
+                data, usage = await _ask_gemini(client, key, prompt, errors, key_index=idx)
+            else:
+                model = os.getenv(f"AI_RESEARCH_MODEL_{name.upper()}") or spec[3]
+                data, usage = await _ask_openai_compat(client, name, key, spec[2], model, prompt, errors, key_index=idx)
+            attempts.append(usage)
+            if data:
+                errors["provider"] = name
+                return data, attempts
+            _note_key_result(name, idx, usage.get("status_code"))
     if tried == 0:
-        errors["error"] = "no AI key configured"
+        errors["error"] = ("no AI key configured" if not available_providers()
+                           else "every AI key is cooling down (429) or was rejected (401/403)")
     else:
         errors["gemini_failed"] = errors.get("gemini_failed", 0) + 1   # counts "all providers failed"
     return None, attempts
 
 
 async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
-                      errors: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+                      errors: dict[str, Any] | None = None,
+                      key_index: int = 1) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     # The other 6 providers already honour AI_RESEARCH_MODEL_<NAME> (set by the
     # CRM's AI APIs tab); Gemini was hardcoded to _MODEL and could not be changed
     # from there. Same override, same fallback.
@@ -252,14 +318,15 @@ async def _ask_gemini(client: httpx.AsyncClient, key: str, prompt: str,
         data = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
         return data, _usage_row("gemini", model, True, r.status_code,
                                  prompt_tokens=usage.get("promptTokenCount"),
-                                 completion_tokens=usage.get("candidatesTokenCount"))
+                                 completion_tokens=usage.get("candidatesTokenCount"),
+                                 key_index=key_index)
     except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
-        log.warning("gemini research failed: %s", e)
+        log.warning("gemini research failed (key %d): %s", key_index, e)
         msg = _gemini_error_text(e)
         code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
         if errors is not None:
             errors["error"] = msg
-        return None, _usage_row("gemini", model, False, code, msg)
+        return None, _usage_row("gemini", model, False, code, msg, key_index=key_index)
 
 
 async def research_places(store: Store, rows: list[dict[str, Any]], concurrency: int = 3,

@@ -15,6 +15,17 @@
 
 ## Session 2026-09-09 — W77: a mid-job wa-login no longer kills the WhatsApp lane (CRM T477)
 
+- [x] **W79** `research.py` — **several keys per AI provider (CRM T478).** The CRM's new
+  `ai_api_keys` registry mirrors into `lead_gen_settings` as `<p>_api_key`, `<p>_api_key_2`,
+  `_3` …, and the agent's config push (unchanged) turns those into `GROQ_API_KEY`,
+  `GROQ_API_KEY_2`, … env. `_keys_for(provider)` reads that list (stops at the first gap:
+  `X_API_KEY_3` without `_2` is ignored); `_ask_llm` now tries EVERY key of a provider in
+  position order before it moves to the next provider — sticky, not round-robin, so quota
+  keys drain in order. A 429'd key cools down for `KEY_COOLDOWN_SEC` (600 s) in-process, a
+  401/403'd key is not presented again; 5xx / timeout / parse failure → next key. Usage rows
+  (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
+  happens once at agent start, so every agent needs a restart to see a newly added key.
+  Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
 - [x] **W78** `lanes.py` — **2-session mode had never verified a number.** W76's slice
   threads were handed the LANE's `should_stop` and `on_wa`, both bound to the lane thread's
   sqlite connection → `ProgrammingError: SQLite objects created in a thread can only be used

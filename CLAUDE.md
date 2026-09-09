@@ -115,6 +115,7 @@ data/            gitignored: leads.db, browser-profile/, browser-profile-open/, 
 
 | Var | Default | Effect |
 |---|---|---|
+| `GROQ_API_KEY_2`, `GROQ_API_KEY_3`, … (same for `GEMINI_` / `CEREBRAS_` / `OPENROUTER_` / `NVIDIA_` / `OPENAI_` / `XAI_`) | — | W79: extra keys of the SAME provider for AI research, tried in that order after `X_API_KEY` before the next provider; the list stops at the first gap. Written by the CRM's config push from its `ai_api_keys` registry (CRM T478) — a local `.env` value still wins on that machine |
 | `ENRICH_TLS_IMPERSONATE` | `true` | W12: curl_cffi Chrome-fingerprint retry between httpx and the browser |
 | `ENRICH_TLS_ROTATION` | `chrome` | W56: comma list of curl_cffi identities tried in turn on a 403 / interstitial (e.g. `chrome,safari18_0,firefox147`). Off by default: measured +0 on 20 real 403 sites from the home IP (the walls left are JS challenges); a VPS IP may see different rules |
 | `ENRICH_BROWSER_FALLBACK` / `_HEADLESS` / `_REAL_CHROME` | `true` / `true` / `true` | W13: browser tier on/off, window, use installed Chrome |
