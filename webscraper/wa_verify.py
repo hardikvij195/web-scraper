@@ -214,6 +214,34 @@ def rename_account(old: str, new: str, *, busy: bool = False, store: "Store | No
     return True, f"renamed {old} → {new}"
 
 
+def reset_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
+    """W91 (CRM T528): forget a WhatsApp account on this machine — evict any Chrome holding
+    its profile, delete the profile directory and the store row — so the next wa-login
+    starts from a clean QR. Refused while a job or a login could be using the profile."""
+    name = (name or "").strip()
+    if not name or not _ACCOUNT_RE.match(name):
+        return False, f"bad name {name!r}"
+    if busy:
+        return False, "a job is running on this machine — stop it, then reset"
+    if login_in_progress(name):
+        return False, "a login window is open for this account — close it first"
+    import shutil
+    d = settings.wa_profiles_dir / name
+    if d.exists():
+        try:
+            from webscraper.browser_recovery import kill_profile_holder
+            kill_profile_holder(d, "wa reset")
+        except Exception:                                         # noqa: BLE001
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        Store().remove_wa_account(name)
+    except Exception:                                             # noqa: BLE001
+        pass
+    log.info("[%s] WhatsApp profile reset — next wa-login starts from a fresh QR", name)
+    return True, f"reset {name} — start a new session to link it again"
+
+
 def login(name: str) -> bool:
     """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success.
 
@@ -230,6 +258,13 @@ def login(name: str) -> bool:
     try:
         with sync_playwright() as pw:
             booted = _login_attempt(pw, name)
+            if booted is None and _chrome_channel():
+                # W91: "never rendered" can be the BROWSER, not the profile — the Mac's
+                # `main` was wiped three times in an hour (2026-09-09) by this rule while
+                # the installed Chrome simply would not paint WhatsApp Web. Try the
+                # bundled Chromium once before destroying a possibly-linked session.
+                log.warning("[%s] WhatsApp Web never rendered with the installed Chrome — retrying with bundled Chromium", name)
+                booted = _login_attempt(pw, name, browser={})
             if booted is None:
                 import shutil
                 log.warning("[%s] WhatsApp Web never rendered on this profile — wiping it and "
@@ -242,12 +277,14 @@ def login(name: str) -> bool:
     return ok
 
 
-def _login_attempt(pw, name: str) -> bool | None:
+def _login_attempt(pw, name: str, browser: dict[str, Any] | None = None) -> bool | None:
     """One headed login window. True = linked, False = QR shown but not scanned in time,
-    None = the client never rendered anything at all (the profile is the problem)."""
+    None = the client never rendered anything at all (the profile is the problem).
+    `browser` overrides the launch channel (W91: {} = bundled Chromium)."""
     mark_profile_clean(profile_dir(name))
     ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir(name)), headless=False, locale="en", **_chrome_channel(),
+        user_data_dir=str(profile_dir(name)), headless=False, locale="en",
+        **(_chrome_channel() if browser is None else browser),
         viewport={"width": 1100, "height": 820},
         args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
     try:

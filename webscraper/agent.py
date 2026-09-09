@@ -987,6 +987,12 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
                 ok = wa_verify.login(label)
                 result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
+            elif cmd["command"] == "wa_reset":
+                # W91: wipe one account's profile + row so the next login is a clean QR.
+                from webscraper import wa_verify
+                ok, result = wa_verify.reset_account(
+                    (cmd.get("arg") or "").strip(),
+                    busy=getattr(srv.worker, "current_job", None) is not None)
             elif cmd["command"] == "wa_rename":
                 # W80: "<old>><new>" — rename a WhatsApp account (profile dir + store row).
                 # The wa_login branch imports wa_verify locally, which makes the name

@@ -26,6 +26,11 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W91** `wa_verify.py` + `agent.py` (CRM T528) — `wa_reset <label>` command: evict any Chrome on
+  the profile, delete the profile dir and the store row, so the next wa-login is a clean QR. And the
+  W70 wipe-on-never-rendered rule now retries once with the bundled Chromium before wiping — the
+  Mac's `main` was wiped three times in an hour by that rule while the installed Chrome would not
+  paint WhatsApp Web. `tests/test_wa_reset.py`. VERSION 1.6.8.
 - [x] **W90** `wa_verify.py` (CRM T522) — Re-link died with `launch_persistent_context: Target page,
   context or browser has been closed`: verify/probe opened profiles with the installed Chrome 152,
   login with bundled Chromium 145, and Chrome upgrades a profile's databases on open so the older
