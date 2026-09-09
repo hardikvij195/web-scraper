@@ -497,6 +497,43 @@ def verify_places(
     return counts
 
 
+def wa_window_mode() -> str:
+    """W86 (CRM T521): how the verify session's Chrome runs on THIS machine.
+
+    visible  — a normal window (W65 default: a quietly unlinked session is at least seen)
+    hidden   — a real headed Chrome parked far off-screen: invisible to the user, identical
+               to Meta. Probed 2026-09-09 on the PC's spare1 profile: chat list in 6 s.
+    headless — real Chrome `--headless=new` (NOT headless Chromium, which WhatsApp Web
+               refuses to render on these profiles — the W65 lesson): chat list in 5 s.
+    Set per machine on the CRM Systems card (lead_gen_settings `wa_window__<device>`,
+    pushed as env WA_WINDOW__<DEVICE>), or WA_WINDOW in .env as a local override.
+    """
+    import os
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    raw = (os.getenv(f"WA_WINDOW__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
+        or os.getenv("WA_WINDOW") or "visible"
+    raw = str(raw).strip().lower()
+    return raw if raw in ("visible", "hidden", "headless") else "visible"
+
+
+_WINDOW_FELL_BACK: set[str] = set()
+
+
+def _launch_kwargs(mode: str) -> dict[str, Any]:
+    """Playwright launch options for a mode. Hidden/headless use the installed Chrome —
+    that is what made both render where headless Chromium never did."""
+    base = ["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS]
+    if mode == "hidden":
+        return {"headless": False, "channel": "chrome",
+                "args": base + ["--window-position=-32000,-32000", "--window-size=1100,820"]}
+    if mode == "headless":
+        return {"headless": False, "channel": "chrome", "args": base + ["--headless=new"]}
+    return {"headless": False, "args": base}
+
+
 def _ensure_session(pw, open_ctx: dict[str, Any],
                     relaunchers: dict[str, Relauncher] | None, name: str,
                     headless: bool | None = None) -> Page | None:
@@ -517,15 +554,16 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
 
     def _open() -> tuple[Any, Page]:
         mark_profile_clean(profile_dir(name))
+        # W65 (user directive 2026-09-08) made the window always visible; W86 (T521) makes
+        # that the per-machine DEFAULT and adds hidden / headless (real Chrome) — a mode
+        # that failed to render once on this account falls back to visible for the run.
+        mode = "visible" if name in _WINDOW_FELL_BACK else wa_window_mode()
+        if mode != "visible":
+            log.info("[%s] WhatsApp window mode: %s", name, mode)
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)),
-            # W65 (user directive 2026-09-08): WhatsApp always runs with its window shown.
-            # A session that has quietly unlinked looks like nothing at all from the
-            # outside — the DELL and the Mac both went days like that — and hiding the one
-            # browser whose state has to be seen was never worth the memory it saved.
-            headless=False,
             locale="en", viewport={"width": 1100, "height": 820},
-            args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
+            **_launch_kwargs(mode))
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             # W60: retry the first navigation instead of letting one slow load end the lane.
@@ -549,6 +587,16 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             if last is not None:
                 raise last
             if not _is_logged_in(page):
+                # W86: a hidden / headless launch that shows NEITHER the chat list nor the
+                # QR never rendered — that is the mode failing, not the account. Fall back
+                # to a visible window for this account for the rest of the run instead of
+                # calling a linked number "logged out" (the W65 misread).
+                if mode != "visible" and not page.locator(
+                        'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]').count():
+                    _WINDOW_FELL_BACK.add(name)
+                    log.warning("[%s] WhatsApp Web did not render in %s mode — retrying with a visible window", name, mode)
+                    ctx.close()
+                    return _open()
                 # Raised, not returned: a relaunch happens deep inside `_check`, and this is
                 # its only way to report "profile came back unlinked" through Relauncher.open().
                 Store().set_wa_status(name, "logged_out")      # W64
