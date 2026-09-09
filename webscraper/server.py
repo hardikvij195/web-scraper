@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from webscraper import __version__
 from webscraper import eta as eta_mod
