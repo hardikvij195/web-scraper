@@ -566,6 +566,16 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             **_launch_kwargs(mode))
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            if mode == "hidden":
+                # Off-screen is honoured (probe: bounds stay at -32000), but the window
+                # still has a taskbar entry; minimising it too keeps it out of Alt-Tab.
+                # Best effort — a failure here must never cost the session.
+                try:
+                    cdp = ctx.new_cdp_session(page)
+                    wid = cdp.send("Browser.getWindowForTarget")["windowId"]
+                    cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "minimized"}})
+                except Exception:                                 # noqa: BLE001
+                    log.debug("[%s] could not minimise the hidden window", name, exc_info=True)
             # W60: retry the first navigation instead of letting one slow load end the lane.
             # `Page.goto: Timeout 60000ms exceeded` was the recorded end reason on six jobs
             # (#5797 stopped at 109 of 497 numbers, #5798 at 54 of 272), and the run reported

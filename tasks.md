@@ -26,6 +26,10 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W87** `wa_verify.py` — hidden mode also minimises the window through CDP (`Browser.setWindowBounds`
+  windowState=minimized): off-screen was honoured (OS rect stayed at -32000) but the window kept a
+  taskbar / Alt-Tab entry, which read as "hidden is not working". Headless mode has no window at
+  all. VERSION 1.6.1.
 - [x] **W86** `wa_verify.py` (CRM T520) — per-machine WhatsApp window mode `visible | hidden | headless`
   (`WA_WINDOW__<DEVICE>` from the CRM Systems card, `WA_WINDOW` in .env). Hidden = installed
   Chrome at `--window-position=-32000,-32000`; headless = installed Chrome `--headless=new`.
