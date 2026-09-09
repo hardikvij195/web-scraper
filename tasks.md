@@ -26,6 +26,15 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W94** `wa_verify.py` (CRM T533) — the PC's Start session died the same way as the Mac's: WhatsApp
+  Web sat on its OWN sync splash ("Don't close this window. Your messages are downloading.") for
+  minutes after a headless run / browser switch, and the boot waits (90 s login, 40 s check) only
+  looked for the chat list or a QR — so a linked, syncing session read as "never rendered" (W70
+  wipe, W65 unlink). `wait_boot` now tells chat / QR / syncing / blank apart: a sync splash keeps the
+  wait alive up to `WA_SYNC_MAX_SEC` (360 s), login treats it as linked and keeps the profile, a job
+  skips the account for the run (`WaUnavailable`), the probe answers unknown (90 s cap). The
+  bundled-Chromium retry crashing at launch on a Chrome-upgraded profile is caught (was a failed
+  command). VERSION 1.7.2.
 - [x] **W93** `wa_verify.py` + `store.py` (CRM T531) — the Mac's three accounts were marked "logged out" inside
   job #30: W91 had linked them with the bundled Chromium, W90 opened the same profiles with the
   installed Chrome for the job's checks, and that Chrome never renders WhatsApp Web there. The

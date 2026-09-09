@@ -82,29 +82,80 @@ def _e164_digits(phone: str | None, wa_number: str | None, country: str | None) 
 
 
 # -- logged-in-state + per-number decision on WhatsApp Web ----------------------
-def _is_logged_in(page: Page) -> bool:
-    """Chat list present (logged in) vs the QR / link-device landing (not).
+_CHAT_SEL = 'div[aria-label="Chat list"], [data-testid="chat-list"], header [data-testid="menu-bar-menu"], #pane-side'
+_QR_SEL = 'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]'
+# WhatsApp Web's own boot / sync splash. "Your messages are downloading" only ever shows for a
+# LINKED session that is (re)syncing from the phone — after a browser or window-mode switch it
+# can take minutes. It is the client working, never a dead profile (W94).
+_SPLASH_WORDS = ("messages are downloading", "loading your chats", "end-to-end encrypted",
+                 "don't close this window", "loading")
+WA_SYNC_MAX_SEC = 360.0
 
-    W67: a page that renders NEITHER within the window is a third thing — WhatsApp Web
-    stuck on its own splash, which is what an unlinked-and-half-broken profile looks
-    like. It is logged the moment it happens, because from the outside it is
-    indistinguishable from "slow", and the Mac spent an afternoon that way with a window
-    open on screen and nobody able to say why.
-    """
+
+def wa_sync_max_sec() -> float:
+    """How long a sync splash may run before we give up on it for THIS open (env WA_SYNC_MAX_SEC)."""
+    import os
     try:
-        page.wait_for_selector(
-            'div[aria-label="Chat list"], [data-testid="chat-list"], '
-            'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]',
-            timeout=40_000)
-    except PWTimeout:
-        log.warning("WhatsApp Web never got past its loading screen in 40s — the profile's "
-                    "local store is likely unusable; delete it and link again")
-        return False
-    for sel in ('div[aria-label="Chat list"]', '[data-testid="chat-list"]',
-                'header [data-testid="menu-bar-menu"]', '#pane-side'):
-        if page.locator(sel).count():
-            return True
-    return False
+        return max(30.0, float(os.environ.get("WA_SYNC_MAX_SEC") or WA_SYNC_MAX_SEC))
+    except ValueError:
+        return WA_SYNC_MAX_SEC
+
+
+def _boot_state(page: Page) -> str:
+    """'chat' (linked, ready) | 'qr' (link-device screen) | 'syncing' (WhatsApp's splash) | 'blank'."""
+    try:
+        if page.locator(_CHAT_SEL).count():
+            return "chat"
+        if page.locator(_QR_SEL).count():
+            return "qr"
+        txt = (page.locator("body").inner_text(timeout=2_000) or "").lower()
+    except Exception:                                             # noqa: BLE001
+        return "blank"
+    return "syncing" if any(w in txt for w in _SPLASH_WORDS) else "blank"
+
+
+def wait_boot(page: Page, name: str, *, blank_ms: int, sync_max_sec: float | None = None) -> str:
+    """Wait for WhatsApp Web to show something decisive; returns the final `_boot_state`.
+
+    A page that shows nothing gets `blank_ms`. A page on WhatsApp's own sync splash keeps the
+    wait alive up to `sync_max_sec` (default WA_SYNC_MAX_SEC): the PC's `spare1` sat on
+    "Don't close this window. Your messages are downloading." for minutes after a headless run,
+    the Mac's `main` did the same after a browser switch, and both were read as "never rendered"
+    — which wiped profiles (W70) and unlinked accounts (the W65 misread) that were fine (W94).
+    """
+    start = time.monotonic()
+    sync_max = sync_max_sec if sync_max_sec is not None else wa_sync_max_sec()
+    seen_sync = False
+    last_log = -30.0
+    while True:
+        st = _boot_state(page)
+        if st in ("chat", "qr"):
+            return st
+        el = time.monotonic() - start
+        if st == "syncing":
+            seen_sync = True
+            if el - last_log >= 30:
+                log.info("[%s] WhatsApp Web is syncing (\"messages are downloading\") — %ds, waiting up to %ds",
+                         name, int(el), int(sync_max))
+                last_log = el
+        if seen_sync:
+            if el >= sync_max:
+                return "syncing"
+        elif el >= blank_ms / 1000:
+            return "blank"
+        time.sleep(1.0)
+
+
+def _is_logged_in(page: Page, name: str = "?", sync_max_sec: float | None = None) -> bool:
+    """Chat list present (logged in) vs anything else. Callers that must tell a QR from a
+    sync splash use `wait_boot` / `_boot_state` directly (W94)."""
+    st = wait_boot(page, name, blank_ms=40_000, sync_max_sec=sync_max_sec)
+    if st == "blank":
+        log.warning("[%s] WhatsApp Web showed nothing in 40s — neither the chat list, a QR nor its own loading screen", name)
+    elif st == "syncing":
+        log.warning("[%s] WhatsApp Web is still downloading messages after %ds — the session is linked; it finishes on a later open",
+                    name, int(sync_max_sec if sync_max_sec is not None else wa_sync_max_sec()))
+    return st == "chat"
 
 
 def _decide(page: Page) -> str:
@@ -274,7 +325,14 @@ def login(name: str) -> bool:
                 # binary once before destroying a possibly-linked session.
                 log.warning("[%s] WhatsApp Web never rendered with %s — retrying with %s",
                             name, _browser_label(used), _browser_label(alt))
-                booted = _login_attempt(pw, name, browser=alt)
+                try:
+                    booted = _login_attempt(pw, name, browser=alt)
+                except PWError as e:
+                    # W94: bundled Chromium refuses a profile the installed Chrome upgraded
+                    # ("Target page, context or browser has been closed" at launch). Not a
+                    # failed command — the other browser simply cannot open this profile.
+                    log.warning("[%s] %s could not open this profile: %s", name, _browser_label(alt), str(e).splitlines()[0][:120])
+                    booted = None
                 if booted is not None:
                     used, fell_back = alt, True
             if booted is None:
@@ -316,15 +374,21 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
         # W63: the scan window starts once the page has actually rendered — QR or chat
         # list — not the moment the tab opened; WhatsApp Web's own boot took the whole
         # window on the ASUS before, and no QR was ever shown.
-        try:
-            page.wait_for_selector(
-                'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref], '
-                'div[aria-label="Chat list"], [data-testid="chat-list"], #pane-side',
-                timeout=_BOOT_TIMEOUT_MS)
-        except PWTimeout:
-            log.warning("[%s] WhatsApp Web is still on its loading screen after %ds",
-                        name, _BOOT_TIMEOUT_MS // 1000)
+        state = wait_boot(page, name, blank_ms=_BOOT_TIMEOUT_MS)
+        if state == "blank":
+            log.warning("[%s] WhatsApp Web showed nothing after %ds", name, _BOOT_TIMEOUT_MS // 1000)
             return None
+        if state == "syncing":
+            # W94: a session that is downloading messages IS linked (a QR would show otherwise).
+            # Say so and keep the profile — the sync resumes on the next open.
+            log.info("[%s] linked — WhatsApp is still downloading messages (%ds); the session is saved and the sync finishes on the next run",
+                     name, int(wa_sync_max_sec()))
+            Store().set_wa_status(name, "logged_in")
+            return True
+        if state == "chat":
+            log.info("[%s] already linked - session in %s", name, profile_dir(name))
+            Store().set_wa_status(name, "logged_in")
+            return True
         log.info("[%s] scan the QR in the window (2 min)...", name)
         try:
             page.wait_for_selector(
@@ -365,13 +429,14 @@ def account_status(name: str) -> str:
             **_launch_kwargs("headless", name))
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
-            page.goto("https://web.whatsapp.com/", timeout=60_000)
-            if _is_logged_in(page):
+            page.goto("https://web.whatsapp.com/", timeout=60_000, wait_until="domcontentloaded")
+            st = wait_boot(page, name, blank_ms=40_000, sync_max_sec=90)
+            if st == "chat":
                 state = "logged_in"
-            elif page.locator('canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]').count():
+            elif st == "qr":
                 state = "logged_out"        # the link-device screen: it really is unlinked
             else:
-                state = "unknown"           # never rendered — say nothing rather than lie
+                state = "unknown"           # blank or still syncing — say nothing rather than lie
             if state != "unknown":
                 Store().set_wa_status(name, state)                 # W64
         finally:
@@ -788,9 +853,14 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
                     time.sleep(3 * (attempt + 1))
             if last is not None:
                 raise last
-            if not _is_logged_in(page):
-                qr_shown = bool(page.locator(
-                    'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]').count())
+            state = wait_boot(page, name, blank_ms=40_000)
+            if state == "syncing":
+                # W94: linked, still downloading messages. Not this run's problem — skip the
+                # account without touching its flag; the sync finishes in a later open.
+                ctx.close()
+                raise WaUnavailable(f"[{name}] WhatsApp Web is still downloading messages after {int(wa_sync_max_sec())}s — skipped this run (still linked)")
+            if state != "chat":
+                qr_shown = state == "qr"
                 if not qr_shown:
                     # Nothing rendered — the client, never the link.
                     # W86: a hidden / headless launch that shows NEITHER the chat list nor
