@@ -390,3 +390,11 @@ def test_stop_ends_opener_and_collector_promptly(db, monkeypatch, tmp_path):
     assert took < 5, f"stop did not end the collector promptly ({took:.1f}s, {n['tiles']} tiles)"
     assert n["tiles"] < 30, "collector kept tiling after the stop"
     s.close()
+
+
+def test_wa_candidates_drops_or_repairs_bogus_wa_link():
+    # W95: a wa.me link with a leading 0 is not international; re-read as national or dropped
+    row = {"whatsapp_number": "+090968645850", "whatsapp_source": "wa_link", "phone": "+91 90968 64585", "country": "IN"}
+    assert wa_candidates(row) == [("+919096864585", "maps")]            # junk link gone, maps phone stays
+    row = {"whatsapp_number": "09876543210", "whatsapp_source": "wa_link", "phone": None, "country": "IN"}
+    assert wa_candidates(row) == [("+919876543210", "wa_link")]          # national number with the trunk 0 -> repaired

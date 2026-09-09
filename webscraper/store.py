@@ -171,7 +171,21 @@ def wa_candidates(row: dict[str, Any], region: str | None = None) -> list[tuple[
 
     src = row.get("whatsapp_source")
     if row.get("whatsapp_number") and src in ("maps_link", "wa_link", "verified"):
-        add(row["whatsapp_number"], "wa_link")
+        # W95 (CRM T534): a wa.me link is supposed to carry a full international number, but
+        # sites publish junk — job #30's "+090968645850" (a leading 0, one digit too many).
+        # No country code starts with 0, so such a link is re-read as a NATIONAL number for
+        # the lead's region and dropped when that does not parse either. WhatsApp answered
+        # "unknown" to the junk one forever, which kept the job Incomplete.
+        raw = row["whatsapp_number"]
+        if _digits_only(raw).startswith("0"):
+            import phonenumbers
+            try:
+                n = phonenumbers.parse(_digits_only(raw), region)
+                raw = (phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)
+                       if phonenumbers.is_valid_number(n) else None)
+            except phonenumbers.NumberParseException:
+                raw = None
+        add(raw, "wa_link")
     if row.get("phone"):
         e164, digits = normalise_phone(row["phone"], region)
         add(e164 or digits, "maps")

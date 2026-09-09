@@ -26,6 +26,11 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W95** `store.py` (CRM T534) — `wa_candidates` no longer offers a wa.me number with a leading 0
+  as-is (no country code starts with 0): it is re-read as a national number for the lead's region
+  or dropped. Job #30's "+090968645850" link answered "unknown" on every check and kept the job
+  Incomplete; the CRM side (`lead_gen_job_outstanding`) now also treats a recorded 'unknown'
+  verdict as checked. VERSION 1.7.3.
 - [x] **W94** `wa_verify.py` (CRM T533) — the PC's Start session died the same way as the Mac's: WhatsApp
   Web sat on its OWN sync splash ("Don't close this window. Your messages are downloading.") for
   minutes after a headless run / browser switch, and the boot waits (90 s login, 40 s check) only
