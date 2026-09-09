@@ -933,6 +933,17 @@ _STANDBY = [False]
 
 #: The one command thread allowed at a time (a second QR window would only confuse).
 _cmd_thread = None
+_cmd_started = 0.0
+_cmd_id = None
+#: W85: a command thread that has not finished in this long is abandoned — the poller
+#: stops waiting on it so later commands (update, restart, start) still run. A wa_login
+#: whose Chrome never came up on the Mac held the slot for an hour and starved every
+#: command after it (2 - MAC, 2026-09-09).
+CMD_MAX_SEC = 900.0
+
+
+def _cmd_stuck(started: float, now: float, alive: bool) -> bool:
+    return alive and started > 0 and (now - started) > CMD_MAX_SEC
 #: The CRM log handler, so an `update` can flush its last lines before exiting.
 _CRM_LOG: list = []
 
@@ -946,10 +957,19 @@ def _poll_command(cloud: "CrmCloud") -> None:
     self-check is re-sent on the next `jobs` call so the CRM health panel flips green
     without waiting the usual 5 minutes."""
     import threading
-    global _cmd_thread
+    global _cmd_thread, _cmd_started, _cmd_id
     if _cmd_thread is not None and _cmd_thread.is_alive():
-        return
+        if not _cmd_stuck(_cmd_started, time.monotonic(), True):
+            return
+        log.error("command thread stuck for %ds — abandoning it so later commands can run",
+                  int(time.monotonic() - _cmd_started))
+        if _cmd_id is not None:
+            try:
+                cloud.command_done(int(_cmd_id), False, f"abandoned after {int(CMD_MAX_SEC)}s — restart the agent on this machine")
+            except Exception:                                     # noqa: BLE001
+                pass
     _cmd_thread = None
+    _cmd_id = None
     try:
         cmd = cloud.command()
     except (httpx.HTTPError, ValueError):
@@ -1237,6 +1257,8 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 log.warning("command_done failed: %s", e)
 
     _cmd_thread = threading.Thread(target=_run, name="agent-command", daemon=True)
+    _cmd_started = time.monotonic()
+    _cmd_id = cmd.get("id")
     _cmd_thread.start()
 
 

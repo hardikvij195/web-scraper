@@ -26,6 +26,11 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W85** `agent.py` — `_poll_command` returned while the previous command thread was alive,
+  with no age limit: a `wa_login` whose Chrome never came up on the Mac held the slot for an
+  hour and every later command (update, restart, wa_rename, even Start) sat 'requested'
+  forever. A thread older than `CMD_MAX_SEC` (15 min) is abandoned, reported to the CRM as
+  failed, and the poller moves on. `tests/test_cmd_stuck.py`. VERSION 1.5.9.
 - [x] **W84** `agent.py` — `wa_rename` died with `cannot access local variable 'wa_verify'`: the
   `wa_login` branch imports `wa_verify` inside the handler, which makes the name local to the
   whole function, so the rename branch needed its own import. VERSION 1.5.8.
