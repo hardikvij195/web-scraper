@@ -26,6 +26,11 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W92** `agent.py` + `wa_verify.py` (CRM T530) — Re-link felt slow: the idle loop slept the whole
+  `poll_sec` (5–15 s) between command polls, and the login `goto` waited for WhatsApp Web's full
+  `load` (assets keep streaming long after the QR is up). Commands are now polled every second
+  inside every idle sleep (`_idle_sleep`), and the login navigation waits for `domcontentloaded`
+  only — the QR / chat-list selector wait is the real gate. VERSION 1.6.9.
 - [x] **W91** `wa_verify.py` + `agent.py` (CRM T528) — `wa_reset <label>` command: evict any Chrome on
   the profile, delete the profile dir and the store row, so the next wa-login is a clean QR. And the
   W70 wipe-on-never-rendered rule now retries once with the bundled Chromium before wiping — the

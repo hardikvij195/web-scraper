@@ -289,7 +289,9 @@ def _login_attempt(pw, name: str, browser: dict[str, Any] | None = None) -> bool
         args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto("https://web.whatsapp.com/", timeout=60_000)
+        # W92: domcontentloaded, not the full load — WhatsApp Web keeps loading assets
+        # long after the QR / chat list is on screen; the selector wait below is the gate.
+        page.goto("https://web.whatsapp.com/", timeout=60_000, wait_until="domcontentloaded")
         # W63: the scan window starts once the page has actually rendered — QR or chat
         # list — not the moment the tab opened; WhatsApp Web's own boot took the whole
         # window on the ASUS before, and no QR was ever shown.

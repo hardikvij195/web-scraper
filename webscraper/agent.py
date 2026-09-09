@@ -890,7 +890,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
                 cloud.jobs()
             except httpx.HTTPError as e:
                 log.debug("standby heartbeat failed: %s", e)
-            time.sleep(poll_sec)
+            _idle_sleep(cloud, kind, poll_sec)
             continue
         try:
             _fail_unstarted(cloud, store, kind, srv)
@@ -946,6 +946,23 @@ def _cmd_stuck(started: float, now: float, alive: bool) -> bool:
     return alive and started > 0 and (now - started) > CMD_MAX_SEC
 #: The CRM log handler, so an `update` can flush its last lines before exiting.
 _CRM_LOG: list = []
+
+
+def _idle_sleep(cloud, kind: str, seconds: float) -> None:
+    """W92 (CRM T530): sleep `seconds` but look for a CRM command every second. The idle
+    loop slept the whole `poll_sec` (5–15 s) between polls, so a Re-link / Reset / Start
+    pressed on the Systems card waited that long before the machine even noticed."""
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(1.0, left))
+        if kind == "crm":
+            try:
+                _poll_command(cloud)
+            except Exception:                                     # noqa: BLE001
+                log.debug("command poll failed", exc_info=True)
 
 
 def _poll_command(cloud: "CrmCloud") -> None:
