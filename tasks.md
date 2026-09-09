@@ -26,6 +26,11 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W88** `wa_verify.py` + `server.py` — the before/after-job probe (`account_status`) now launches
+  the installed Chrome `--headless=new` (the W86 headless kwargs) instead of headless Chromium, so
+  it answers in ~5 s instead of "unknown" after 40 s. And W82's 20-minute skip never worked:
+  `timedelta` was not imported in server.py, so the skip raised before it could skip (caught by
+  the outer try) and every job boundary still paid 40 s per account. VERSION 1.6.2.
 - [x] **W87** `wa_verify.py` — hidden mode also minimises the window through CDP (`Browser.setWindowBounds`
   windowState=minimized): off-screen was honoured (OS rect stayed at -32000) but the window kept a
   taskbar / Alt-Tab entry, which read as "hidden is not working". Headless mode has no window at

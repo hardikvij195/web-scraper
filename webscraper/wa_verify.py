@@ -296,9 +296,13 @@ def account_status(name: str) -> str:
     """
     mark_profile_clean(profile_dir(name))
     with sync_playwright() as pw:
+        # W88: the installed Chrome in new-headless mode — headless CHROMIUM never rendered
+        # WhatsApp Web on these profiles, so this probe answered "unknown" after a 40 s
+        # wait on every job boundary (the T499 gap). Same launch the headless verify mode
+        # uses, which answered in ~5 s.
         ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir(name)), headless=True, locale="en",
-            args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
+            user_data_dir=str(profile_dir(name)), locale="en",
+            **_launch_kwargs("headless"))
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.goto("https://web.whatsapp.com/", timeout=60_000)
