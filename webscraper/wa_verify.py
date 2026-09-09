@@ -22,6 +22,8 @@ Ban risk is never zero - use a spare number, not your main business WhatsApp.
 """
 from __future__ import annotations
 
+import re
+
 import logging
 import random
 import time
@@ -163,6 +165,53 @@ _LOGIN_ACTIVE: set[str] = set()
 def login_in_progress(name: str | None = None) -> bool:
     """True while a wa-login window is open — for `name`, or for any account."""
     return bool(_LOGIN_ACTIVE) if name is None else name in _LOGIN_ACTIVE
+
+
+_ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,29}$")
+
+
+def rename_account(old: str, new: str, *, busy: bool = False, store: "Store | None" = None) -> tuple[bool, str]:
+    """W80: rename a WhatsApp account on this machine — its profile directory and its
+    store row — so the CRM can call a number what it is ("sales", "hardik-personal")
+    instead of main/spare1. Refused while anything could be holding the profile: a login
+    window on either name, or a job in flight (`busy`), since a Chrome with the old
+    directory open would keep writing into a folder that no longer exists."""
+    old, new = (old or "").strip(), (new or "").strip()
+    if not old or not new:
+        return False, "usage: <old>><new>"
+    if not _ACCOUNT_RE.match(new):
+        return False, f"bad name {new!r} — lowercase letters, digits, - and _ only (max 30)"
+    if old == new:
+        return False, "same name"
+    if busy:
+        return False, "a job is running on this machine — stop it, then rename"
+    if login_in_progress(old) or login_in_progress(new):
+        return False, "a WhatsApp login window is open — finish or close it first"
+    # Raw paths: profile_dir() creates the folder it names, which would make every
+    # target look taken.
+    src, dst = settings.wa_profiles_dir / old, settings.wa_profiles_dir / new
+    if dst.exists():
+        return False, f"{new} already exists on this machine"
+    from webscraper.store import Store as _Store
+    st = store or _Store()
+    known = {a["name"] for a in st.list_wa_accounts()}
+    if old not in known and not src.exists():
+        return False, f"{old} is not an account on this machine"
+    if new in known:
+        return False, f"{new} already exists on this machine"
+    if src.exists():
+        try:
+            from webscraper.browser_recovery import kill_profile_holder
+            kill_profile_holder(src, "wa rename")
+        except Exception:                                         # noqa: BLE001
+            pass
+        src.rename(dst)
+    if old in known:
+        st.rename_wa_account(old, new)
+    else:
+        st.add_wa_account(new)
+    log.info("[%s] renamed to %s", old, new)
+    return True, f"renamed {old} → {new}"
 
 
 def login(name: str) -> bool:

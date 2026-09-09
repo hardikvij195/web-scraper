@@ -26,6 +26,12 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W80** `wa_rename` agent command (CRM T489) — `arg` = `<old>><new>`: renames a WhatsApp
+  account's profile dir (`data/wa-profiles/<name>`) and its `wa_accounts` row (+ `wa_checks`
+  history) so a number can be called what it is instead of main/spare1. `wa_verify.rename_account()`
+  refuses: bad name (lowercase/digits/-/_ ≤30), same name, target taken, unknown source, a job in
+  flight on this machine, or a login window open on either name; evicts a Chrome holding the old
+  profile first. Tests `tests/test_wa_rename.py` (2). VERSION 1.5.6.
 - [x] **W78** `lanes.py` — **2-session mode had never verified a number.** W76's slice
   threads were handed the LANE's `should_stop` and `on_wa`, both bound to the lane thread's
   sqlite connection → `ProgrammingError: SQLite objects created in a thread can only be used

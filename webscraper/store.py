@@ -870,6 +870,21 @@ class Store:
             "ON CONFLICT(name) DO UPDATE SET disabled=0", (name, now_iso()))
         self.conn.commit()
 
+    def rename_wa_account(self, old: str, new: str) -> bool:
+        """W80: rename an account row (and its per-number history) — False if `old` is unknown
+        or `new` is already taken. The profile directory is the caller's business."""
+        if self.conn.execute("SELECT 1 FROM wa_accounts WHERE name=?", (new,)).fetchone():
+            return False
+        cur = self.conn.execute("UPDATE wa_accounts SET name=? WHERE name=?", (new, old))
+        if cur.rowcount == 0:
+            return False
+        try:
+            self.conn.execute("UPDATE wa_checks SET account=? WHERE account=?", (new, old))
+        except sqlite3.Error:                                     # noqa: BLE001 — older schema
+            pass
+        self.conn.commit()
+        return True
+
     def remove_wa_account(self, name: str) -> None:
         self.conn.execute("DELETE FROM wa_accounts WHERE name=?", (name,))
         self.conn.commit()

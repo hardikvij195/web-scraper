@@ -935,6 +935,13 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
                 ok = wa_verify.login(label)
                 result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
+            elif cmd["command"] == "wa_rename":
+                # W80: "<old>><new>" — rename a WhatsApp account (profile dir + store row).
+                arg = (cmd.get("arg") or "").strip()
+                old_name, _, new_name = arg.partition(">")
+                ok, result = wa_verify.rename_account(
+                    old_name, new_name,
+                    busy=getattr(srv.worker, "current_job", None) is not None)
             elif cmd["command"] == "rename":
                 # The CRM already renamed its row + repointed jobs; from the next call on
                 # this machine must heartbeat under the new label, and keep it after reboot.
