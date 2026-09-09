@@ -52,6 +52,12 @@ class WaNotLoggedIn(RuntimeError):
     """The account's profile has no live WhatsApp Web session (needs `wa-login`)."""
 
 
+class WaUnavailable(RuntimeError):
+    """W93: WhatsApp Web rendered NEITHER the chat list nor the QR with any browser on this
+    machine. That is the client, not the link — the account is skipped for this run and
+    stays linked; it is never marked logged out or disabled for it."""
+
+
 def profile_dir(name: str):
     d = settings.wa_profiles_dir / name
     d.mkdir(parents=True, exist_ok=True)
@@ -257,34 +263,49 @@ def login(name: str) -> bool:
     ok = False
     try:
         with sync_playwright() as pw:
-            booted = _login_attempt(pw, name)
-            if booted is None and _chrome_channel():
+            used = browser_for(name)
+            fell_back = False
+            booted = _login_attempt(pw, name, browser=used)
+            alt = other_browser(used)
+            if booted is None and alt:
                 # W91: "never rendered" can be the BROWSER, not the profile — the Mac's
                 # `main` was wiped three times in an hour (2026-09-09) by this rule while
-                # the installed Chrome simply would not paint WhatsApp Web. Try the
-                # bundled Chromium once before destroying a possibly-linked session.
-                log.warning("[%s] WhatsApp Web never rendered with the installed Chrome — retrying with bundled Chromium", name)
-                booted = _login_attempt(pw, name, browser={})
+                # the installed Chrome simply would not paint WhatsApp Web. Try the other
+                # binary once before destroying a possibly-linked session.
+                log.warning("[%s] WhatsApp Web never rendered with %s — retrying with %s",
+                            name, _browser_label(used), _browser_label(alt))
+                booted = _login_attempt(pw, name, browser=alt)
+                if booted is not None:
+                    used, fell_back = alt, True
             if booted is None:
                 import shutil
                 log.warning("[%s] WhatsApp Web never rendered on this profile — wiping it and "
                             "starting fresh", name)
                 shutil.rmtree(profile_dir(name), ignore_errors=True)
-                booted = _login_attempt(pw, name)
+                booted = _login_attempt(pw, name, browser=used)
+            if booted is not None:
+                # W93: the binary that painted this profile (QR or chat list) is the one every
+                # later open — job checks, probes, the next Start session — must use.
+                remember_browser(name, used, machine=fell_back)
+                _BROWSER_FELL_BACK.pop(name, None)
             ok = bool(booted)
     finally:
         _LOGIN_ACTIVE.discard(name)                                # W68
     return ok
 
 
-def _login_attempt(pw, name: str, browser: dict[str, Any] | None = None) -> bool | None:
+def _browser_label(browser: str) -> str:
+    return "the installed Chrome" if browser == "chrome" else "the bundled Chromium"
+
+
+def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
     """One headed login window. True = linked, False = QR shown but not scanned in time,
     None = the client never rendered anything at all (the profile is the problem).
-    `browser` overrides the launch channel (W91: {} = bundled Chromium)."""
+    `browser` = "chrome" | "chromium" (W91/W93); default = the profile's own (`browser_for`)."""
     mark_profile_clean(profile_dir(name))
     ctx = pw.chromium.launch_persistent_context(
         user_data_dir=str(profile_dir(name)), headless=False, locale="en",
-        **(_chrome_channel() if browser is None else browser),
+        **_channel_of(browser or browser_for(name)),
         viewport={"width": 1100, "height": 820},
         args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
     try:
@@ -341,7 +362,7 @@ def account_status(name: str) -> str:
         # uses, which answered in ~5 s.
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)), locale="en",
-            **_launch_kwargs("headless"))
+            **_launch_kwargs("headless", name))
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.goto("https://web.whatsapp.com/", timeout=60_000)
@@ -483,14 +504,17 @@ def verify_places(
         for e164, src in cands:
             targets.append((r, e164.lstrip("+"), src))
 
+    unavailable: set[str] = set()          # W93: accounts whose client never rendered this run
     try:
         for r, num, source in targets:
             if should_stop():
                 break
             pk = r["place_key"]
 
-            name = account if account else store.pick_wa_account(cap, today)
-            if name is None:
+            name = account if account else store.pick_wa_account(cap, today, exclude=unavailable)
+            if name is None or name in unavailable:
+                if name in unavailable:
+                    break                       # this slice's own account cannot render — done here
                 if cap > 0:
                     counts["capped"] += 1
                     log.info("all accounts hit the daily cap (%d) - stopping; re-run tomorrow", cap)
@@ -501,7 +525,16 @@ def verify_places(
                         store.log(job_id, "whatsapp", "no enabled WhatsApp account left — run wa-login", "error")
                 break
 
-            page = _ensure_session(pw, open_ctx, relaunchers, name, headless)
+            try:
+                page = _ensure_session(pw, open_ctx, relaunchers, name, headless)
+            except WaUnavailable as e:
+                # W93: the client never painted with any browser — skip the account for this
+                # run only. It is NOT logged out: `disabled` and the W64 status stay as they are.
+                unavailable.add(name)
+                log.warning("%s", e)
+                if job_id is not None:
+                    store.log(job_id, "whatsapp", f"{name}: WhatsApp Web did not render on this machine — skipped this run, still linked", "warn")
+                continue
             if page is None:      # account logged out — disable it and try the next row
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
                 store.conn.commit()
@@ -541,19 +574,81 @@ def verify_places(
     return counts
 
 
-def _chrome_channel() -> dict[str, Any]:
-    """W90: every WhatsApp launch uses the SAME browser. The verify modes and the probe used
-    the installed Chrome (152); login used bundled Chromium (145). Chrome upgrades a
-    profile's databases on open and an older build then refuses it — Re-link died with
-    "Target page, context or browser has been closed" once a profile had been through a
-    headless run (1 - PC, 2026-09-09). Installed Chrome when present, bundled Chromium
-    only on a machine that has none."""
+_BROWSER_MARK = ".wa-browser"            # inside a profile dir: "chrome" | "chromium"
+_BROWSER_PREF = ".wa-browser-default"    # inside wa_profiles_dir: the machine-wide preference
+_BROWSER_FELL_BACK: dict[str, str] = {}  # W93: account -> browser that rendered when the marked one did not
+
+
+def _chrome_installed() -> bool:
     try:
         from webscraper.healthcheck import chrome_path
-        path = chrome_path()
+        return bool(chrome_path())
     except Exception:                                             # noqa: BLE001
-        path = None
-    return {"channel": "chrome"} if path else {}
+        return False
+
+
+def _read_mark(path) -> str | None:
+    try:
+        v = path.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return None
+    return v if v in ("chrome", "chromium") else None
+
+
+def browser_for(name: str | None = None) -> str:
+    """W93: which binary opens a WhatsApp profile — "chrome" (installed) or "chromium" (bundled).
+
+    W90 made every launch use the installed Chrome; W91 let a LOGIN fall back to the bundled
+    Chromium when Chrome never rendered. Together they linked the Mac's three accounts with
+    Chromium and then opened the same profiles with Chrome for the job's checks — which never
+    rendered there, so all three were marked "logged out" inside one job (#30, 2026-09-09).
+    The browser that linked a profile is now written into it and wins for every later open;
+    a machine whose Chrome failed once prefers Chromium for new logins too. Order: an
+    in-run fallback, the profile's marker, the machine preference, installed Chrome, Chromium.
+    """
+    if name and name in _BROWSER_FELL_BACK:
+        return _BROWSER_FELL_BACK[name]
+    chrome = _chrome_installed()
+    if name:
+        m = _read_mark(settings.wa_profiles_dir / name / _BROWSER_MARK)
+        if m:
+            return m if (m == "chromium" or chrome) else "chromium"
+    m = _read_mark(settings.wa_profiles_dir / _BROWSER_PREF)
+    if m:
+        return m if (m == "chromium" or chrome) else "chromium"
+    return "chrome" if chrome else "chromium"
+
+
+def other_browser(browser: str) -> str | None:
+    """The alternative binary to try, or None when there is none on this machine."""
+    if browser == "chrome":
+        return "chromium"
+    return "chrome" if _chrome_installed() else None
+
+
+def remember_browser(name: str, browser: str, *, machine: bool = False) -> None:
+    """Write the marker that `browser_for` reads. `machine=True` also sets the preference
+    for new profiles (a fallback proved the other binary does not render here)."""
+    try:
+        (profile_dir(name) / _BROWSER_MARK).write_text(browser, encoding="utf-8")
+    except OSError:
+        log.debug("[%s] could not write the browser marker", name, exc_info=True)
+    if machine:
+        try:
+            settings.wa_profiles_dir.mkdir(parents=True, exist_ok=True)
+            (settings.wa_profiles_dir / _BROWSER_PREF).write_text(browser, encoding="utf-8")
+        except OSError:
+            log.debug("could not write the machine browser preference", exc_info=True)
+
+
+def _channel_of(browser: str) -> dict[str, Any]:
+    return {"channel": "chrome"} if browser == "chrome" else {}
+
+
+def _chrome_channel(name: str | None = None) -> dict[str, Any]:
+    """Playwright channel kwargs for `browser_for(name)` (W90 kept every launch on one binary;
+    W93 makes that binary the one that linked the profile)."""
+    return _channel_of(browser_for(name))
 
 
 def wa_delay_range() -> tuple[float, float]:
@@ -612,11 +707,12 @@ def wa_window_mode() -> str:
 _WINDOW_FELL_BACK: set[str] = set()
 
 
-def _launch_kwargs(mode: str) -> dict[str, Any]:
+def _launch_kwargs(mode: str, name: str | None = None) -> dict[str, Any]:
     """Playwright launch options for a mode. Hidden/headless use the installed Chrome —
-    that is what made both render where headless Chromium never did."""
+    that is what made both render where headless Chromium never did. `name` picks the
+    profile's own browser (W93)."""
     base = ["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS]
-    ch = _chrome_channel()
+    ch = _chrome_channel(name)
     if mode == "headless" and not ch:
         # Bundled Chromium never renders WhatsApp Web headless (W65): without an installed
         # Chrome, "headless" degrades to hidden, which at least keeps working.
@@ -659,7 +755,7 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)),
             locale="en", viewport={"width": 1100, "height": 820},
-            **_launch_kwargs(mode))
+            **_launch_kwargs(mode, name))
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             if mode == "hidden":
@@ -693,20 +789,40 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             if last is not None:
                 raise last
             if not _is_logged_in(page):
-                # W86: a hidden / headless launch that shows NEITHER the chat list nor the
-                # QR never rendered — that is the mode failing, not the account. Fall back
-                # to a visible window for this account for the rest of the run instead of
-                # calling a linked number "logged out" (the W65 misread).
-                if mode != "visible" and not page.locator(
-                        'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]').count():
-                    _WINDOW_FELL_BACK.add(name)
-                    log.warning("[%s] WhatsApp Web did not render in %s mode — retrying with a visible window", name, mode)
+                qr_shown = bool(page.locator(
+                    'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]').count())
+                if not qr_shown:
+                    # Nothing rendered — the client, never the link.
+                    # W86: a hidden / headless launch that shows NEITHER the chat list nor
+                    # the QR is the mode failing: fall back to a visible window for this
+                    # account for the rest of the run.
+                    if mode != "visible":
+                        _WINDOW_FELL_BACK.add(name)
+                        log.warning("[%s] WhatsApp Web did not render in %s mode — retrying with a visible window", name, mode)
+                        ctx.close()
+                        return _open()
+                    # W93: a visible window that still shows nothing is the BROWSER failing
+                    # (the Mac's installed Chrome sits on the splash forever). Try the
+                    # other binary once for this account, then skip it for the run — it
+                    # stays linked and is never disabled for this.
+                    cur = browser_for(name)
+                    alt = other_browser(cur)
+                    if alt and name not in _BROWSER_FELL_BACK:
+                        _BROWSER_FELL_BACK[name] = alt
+                        log.warning("[%s] WhatsApp Web did not render with %s — retrying with %s",
+                                    name, _browser_label(cur), _browser_label(alt))
+                        ctx.close()
+                        return _open()
                     ctx.close()
-                    return _open()
+                    raise WaUnavailable(f"[{name}] WhatsApp Web did not render with any browser on this machine — skipped this run (still linked)")
                 # Raised, not returned: a relaunch happens deep inside `_check`, and this is
                 # its only way to report "profile came back unlinked" through Relauncher.open().
                 Store().set_wa_status(name, "logged_out")      # W64
                 raise WaNotLoggedIn(f"[{name}] profile has no live WhatsApp Web session")
+            if name in _BROWSER_FELL_BACK:
+                # The other binary painted it: make that the profile's browser from now on,
+                # and the machine's default for new links.
+                remember_browser(name, _BROWSER_FELL_BACK[name], machine=True)
             Store().set_wa_status(name, "logged_in")           # W64
             return ctx, page
         except BaseException:

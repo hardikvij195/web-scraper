@@ -26,6 +26,15 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W93** `wa_verify.py` + `store.py` (CRM T531) — the Mac's three accounts were marked "logged out" inside
+  job #30: W91 had linked them with the bundled Chromium, W90 opened the same profiles with the
+  installed Chrome for the job's checks, and that Chrome never renders WhatsApp Web there. The
+  browser that painted a profile (QR or chat list) is now written into it (`.wa-browser`) and
+  wins for every later open; a machine whose Chrome failed once prefers Chromium for new links
+  (`.wa-browser-default`). Inside a job a visible window that shows neither the chat list nor
+  the QR retries with the other binary, then raises `WaUnavailable` — the account is skipped for
+  the run (`pick_wa_account(exclude=)`) and is never disabled or marked logged out for it; only
+  a rendered QR means logged out. VERSION 1.6.10.
 - [x] **W92** `agent.py` + `wa_verify.py` (CRM T530) — Re-link felt slow: the idle loop slept the whole
   `poll_sec` (5–15 s) between command polls, and the login `goto` waited for WhatsApp Web's full
   `load` (assets keep streaming long after the QR is up). Commands are now polled every second

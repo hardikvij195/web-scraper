@@ -904,12 +904,16 @@ class Store:
     def enabled_wa_accounts(self) -> list[str]:
         return [r[0] for r in self.conn.execute("SELECT name FROM wa_accounts WHERE disabled=0 ORDER BY name")]
 
-    def pick_wa_account(self, cap: int, today: str) -> str | None:
-        """Enabled account with remaining cap today, least-recently-used first (rotation)."""
+    def pick_wa_account(self, cap: int, today: str, exclude: set[str] | None = None) -> str | None:
+        """Enabled account with remaining cap today, least-recently-used first (rotation).
+        `exclude` (W93): names skipped for this run without touching their `disabled` flag."""
         self._roll_day(today)
         # cap <= 0 = unlimited: rotate over every enabled account regardless of today's count.
         where = "disabled=0" + (" AND sent_today<?" if cap > 0 else "")
-        args = (cap,) if cap > 0 else ()
+        args: tuple = (cap,) if cap > 0 else ()
+        if exclude:
+            where += " AND name NOT IN (" + ",".join("?" for _ in exclude) + ")"
+            args = args + tuple(sorted(exclude))
         row = self.conn.execute(
             f"SELECT name FROM wa_accounts WHERE {where} "
             "ORDER BY last_used_at IS NULL DESC, last_used_at ASC LIMIT 1", args).fetchone()

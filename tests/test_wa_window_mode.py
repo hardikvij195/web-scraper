@@ -26,7 +26,7 @@ def test_launch_kwargs():
 
 def test_all_modes_share_one_browser(monkeypatch):
     # W90: login, probe and every verify mode must open a profile with the same binary.
-    monkeypatch.setattr(wa_verify, "_chrome_channel", lambda: {"channel": "chrome"})
+    monkeypatch.setattr(wa_verify, "_chrome_channel", lambda name=None: {"channel": "chrome"})
     assert {wa_verify._launch_kwargs(m).get("channel") for m in ("visible", "hidden", "headless")} == {"chrome"}
-    monkeypatch.setattr(wa_verify, "_chrome_channel", lambda: {})
+    monkeypatch.setattr(wa_verify, "_chrome_channel", lambda name=None: {})
     assert all("channel" not in wa_verify._launch_kwargs(m) for m in ("visible", "hidden", "headless"))
