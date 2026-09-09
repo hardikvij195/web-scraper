@@ -31,7 +31,7 @@
   Chrome at `--window-position=-32000,-32000`; headless = installed Chrome `--headless=new`.
   Probe 2026-09-09 on the PC's spare1: chat list in 6 s / 5 s — headless CHROMIUM is what never
   rendered (W65). Non-visible launch that shows neither chat list nor QR falls back to visible
-  for that account. `tests/test_wa_window_mode.py`. VERSION 1.5.10.
+  for that account. `tests/test_wa_window_mode.py`. VERSION 1.6.0 (bump script rolled 1.5.9 → 1.6.0).
 - [x] **W85** `agent.py` — `_poll_command` returned while the previous command thread was alive,
   with no age limit: a `wa_login` whose Chrome never came up on the Mac held the slot for an
   hour and every later command (update, restart, wa_rename, even Start) sat 'requested'
