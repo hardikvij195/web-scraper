@@ -247,7 +247,7 @@ def _login_attempt(pw, name: str) -> bool | None:
     None = the client never rendered anything at all (the profile is the problem)."""
     mark_profile_clean(profile_dir(name))
     ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir(name)), headless=False, locale="en",
+        user_data_dir=str(profile_dir(name)), headless=False, locale="en", **_chrome_channel(),
         viewport={"width": 1100, "height": 820},
         args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
     try:
@@ -502,6 +502,21 @@ def verify_places(
     return counts
 
 
+def _chrome_channel() -> dict[str, Any]:
+    """W90: every WhatsApp launch uses the SAME browser. The verify modes and the probe used
+    the installed Chrome (152); login used bundled Chromium (145). Chrome upgrades a
+    profile's databases on open and an older build then refuses it — Re-link died with
+    "Target page, context or browser has been closed" once a profile had been through a
+    headless run (1 - PC, 2026-09-09). Installed Chrome when present, bundled Chromium
+    only on a machine that has none."""
+    try:
+        from webscraper.healthcheck import chrome_path
+        path = chrome_path()
+    except Exception:                                             # noqa: BLE001
+        path = None
+    return {"channel": "chrome"} if path else {}
+
+
 def wa_delay_range() -> tuple[float, float]:
     """W89 (CRM T521): the random pause between two numbers on one session, in seconds.
 
@@ -562,12 +577,18 @@ def _launch_kwargs(mode: str) -> dict[str, Any]:
     """Playwright launch options for a mode. Hidden/headless use the installed Chrome —
     that is what made both render where headless Chromium never did."""
     base = ["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS]
+    ch = _chrome_channel()
+    if mode == "headless" and not ch:
+        # Bundled Chromium never renders WhatsApp Web headless (W65): without an installed
+        # Chrome, "headless" degrades to hidden, which at least keeps working.
+        log.warning("no installed Chrome — WhatsApp 'headless' runs as 'hidden' on this machine")
+        mode = "hidden"
     if mode == "hidden":
-        return {"headless": False, "channel": "chrome",
+        return {"headless": False, **ch,
                 "args": base + ["--window-position=-32000,-32000", "--window-size=1100,820"]}
     if mode == "headless":
-        return {"headless": False, "channel": "chrome", "args": base + ["--headless=new"]}
-    return {"headless": False, "args": base}
+        return {"headless": False, **ch, "args": base + ["--headless=new"]}
+    return {"headless": False, **ch, "args": base}
 
 
 def _ensure_session(pw, open_ctx: dict[str, Any],

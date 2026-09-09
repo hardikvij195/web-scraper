@@ -26,6 +26,12 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W90** `wa_verify.py` (CRM T522) — Re-link died with `launch_persistent_context: Target page,
+  context or browser has been closed`: verify/probe opened profiles with the installed Chrome 152,
+  login with bundled Chromium 145, and Chrome upgrades a profile's databases on open so the older
+  build refuses it afterwards. Every WhatsApp launch now uses ONE browser — installed Chrome when
+  present (`_chrome_channel()`), bundled Chromium otherwise; without Chrome, `headless` degrades to
+  `hidden`. (1.6.5 shipped without this code — a patch assert failed silently.) VERSION 1.6.6.
 - [x] **W89** `wa_verify.py` + `config.py` (CRM T521) — the random pause between two numbers on a
   session drops from 3–8 s to **1.5–4 s** by default and becomes per machine: `WA_DELAY__<DEVICE>`
   = "<min>-<max>" from the CRM Systems card (or `WA_DELAY` in .env), read at call time (cloud
