@@ -17,7 +17,7 @@ def test_launch_kwargs():
     v = wa_verify._launch_kwargs("visible")
     h = wa_verify._launch_kwargs("hidden")
     n = wa_verify._launch_kwargs("headless")
-    assert v["headless"] is False and "channel" not in v
+    assert v["headless"] is False and "--headless=new" not in v["args"]   # W90: channel may be chrome
     assert h["channel"] == "chrome" and any(a.startswith("--window-position=-32000") for a in h["args"])
     assert n["channel"] == "chrome" and ("--headless=new" in n["args"] or "--window-position=-32000,-32000" in n["args"])
     for k in (v, h, n):
