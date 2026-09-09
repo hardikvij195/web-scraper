@@ -26,6 +26,9 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W84** `agent.py` — `wa_rename` died with `cannot access local variable 'wa_verify'`: the
+  `wa_login` branch imports `wa_verify` inside the handler, which makes the name local to the
+  whole function, so the rename branch needed its own import. VERSION 1.5.8.
 - [x] **W81** `lanes.py` (CRM T500) — a re-run whose websites choice is "Skip — mark done"
   settled its leads only AFTER the W76 wait-for-WhatsApp loop, so the enrichment lane sat
   "running 575 / 575" for the whole WhatsApp run (job #1631). The skip is answered first now.

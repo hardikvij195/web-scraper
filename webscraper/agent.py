@@ -969,6 +969,10 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
             elif cmd["command"] == "wa_rename":
                 # W80: "<old>><new>" — rename a WhatsApp account (profile dir + store row).
+                # The wa_login branch imports wa_verify locally, which makes the name
+                # function-local for EVERY branch — so this one must import it too, or it
+                # dies with "cannot access local variable 'wa_verify'" (2 - MAC, 2026-09-09).
+                from webscraper import wa_verify
                 arg = (cmd.get("arg") or "").strip()
                 old_name, _, new_name = arg.partition(">")
                 ok, result = wa_verify.rename_account(
