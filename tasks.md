@@ -34,7 +34,7 @@
   (`.wa-browser-default`). Inside a job a visible window that shows neither the chat list nor
   the QR retries with the other binary, then raises `WaUnavailable` — the account is skipped for
   the run (`pick_wa_account(exclude=)`) and is never disabled or marked logged out for it; only
-  a rendered QR means logged out. VERSION 1.6.10.
+  a rendered QR means logged out. VERSION 1.7.0 (1.7.1 = this note).
 - [x] **W92** `agent.py` + `wa_verify.py` (CRM T530) — Re-link felt slow: the idle loop slept the whole
   `poll_sec` (5–15 s) between command polls, and the login `goto` waited for WhatsApp Web's full
   `load` (assets keep streaming long after the QR is up). Commands are now polled every second
