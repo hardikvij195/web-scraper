@@ -548,16 +548,31 @@ class WhatsAppLane(Lane):
                            f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
                            + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
 
-            def on_wa(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
-                nonlocal checked
-                checked += 1
-                store.update_job(self.job_id, wa_verify_done=checked)
-                try:
-                    r = by_pk.get(pk, {})
-                    self.store.log(self.job_id, "whatsapp",
-                                   _wa_line(r, status, num or r.get("number"), source or r.get("source")))
-                except Exception:                                 # noqa: BLE001
-                    pass
+            # W78: the progress callback takes the Store of the THREAD that calls it. The
+            # single-session path passes the lane's own; each W76 slice passes the Store
+            # it opened for itself. sqlite3 connections are bound to the thread that
+            # created them — handing a slice the lane's `on_wa`/`stopped` raised
+            # `ProgrammingError: SQLite objects created in a thread can only be used in
+            # that same thread` on the first `should_stop()`, so 2-session mode died
+            # before it had checked one number (1 - PC, job 36, 2026-09-09).
+            counter_lock = threading.Lock()
+
+            def make_on_wa(st: Store):
+                def on_wa(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
+                    nonlocal checked
+                    with counter_lock:
+                        checked += 1
+                        done_now = checked
+                    st.update_job(self.job_id, wa_verify_done=done_now)
+                    try:
+                        r = by_pk.get(pk, {})
+                        st.log(self.job_id, "whatsapp",
+                               _wa_line(r, status, num or r.get("number"), source or r.get("source")))
+                    except Exception:                             # noqa: BLE001
+                        pass
+                return on_wa
+
+            on_wa = make_on_wa(store)
 
             try:
                 # W59: this lane's own window choice. NULL on the job (the normal
@@ -576,21 +591,21 @@ class WhatsAppLane(Lane):
                 if n > 1:
                     self.store.log(self.job_id, "whatsapp",
                                    f"{n} WhatsApp sessions in parallel — {', '.join(accounts[:n])}")
-                    lock = threading.Lock()
-                    def locked_on_wa(*a, **k):
-                        with lock:
-                            on_wa(*a, **k)
                     slices = [batch[i::n] for i in range(n)]
                     results: list[dict] = []
                     errors: list[BaseException] = []
                     def run_slice(rows, name):
+                        # Everything this thread touches in sqlite goes through `st`:
+                        # the verify itself, its progress lines, and the stop poll.
                         st = self.ctl.new_store()
                         try:
                             results.append(wa_verify.verify_places(
-                                st, rows, locked_on_wa, self.stopped, job_id=self.job_id,
-                                headless=hl, account=name))
+                                st, rows, make_on_wa(st),
+                                lambda: bool(st.stop_requested(self.job_id)),
+                                job_id=self.job_id, headless=hl, account=name))
                         except BaseException as e:                # noqa: BLE001
                             errors.append(e)
+                            log.warning("[whatsapp#%s] slice %s failed: %s", self.job_id, name, e)
                         finally:
                             st.close()
                     ts = [threading.Thread(target=run_slice, args=(sl, accounts[i]),
@@ -602,7 +617,11 @@ class WhatsAppLane(Lane):
                         t.join()
                     if errors and not results:
                         raise errors[0]
-                    res = {"capped": any(bool(r.get("capped")) for r in results)}
+                    # W78: the summary line below reads yes/no/unknown — a `capped`-only
+                    # dict was a KeyError waiting behind the thread bug.
+                    res = {k: sum(int(r.get(k, 0) or 0) for r in results)
+                           for k in ("yes", "no", "unknown", "no_number")}
+                    res["capped"] = any(bool(r.get("capped")) for r in results)
                 else:
                     res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
                                                   job_id=self.job_id, headless=hl)

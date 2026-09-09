@@ -15,6 +15,15 @@
 
 ## Session 2026-09-09 — W77: a mid-job wa-login no longer kills the WhatsApp lane (CRM T477)
 
+- [x] **W78** `lanes.py` — **2-session mode had never verified a number.** W76's slice
+  threads were handed the LANE's `should_stop` and `on_wa`, both bound to the lane thread's
+  sqlite connection → `ProgrammingError: SQLite objects created in a thread can only be used
+  in that same thread` on the first `should_stop()`; both slices died, `raise errors[0]`,
+  lane reason `error:SQLite…` (1 - PC job 36, right after the "2 WhatsApp sessions in
+  parallel" line). Behind it a second crash: the parallel result was `{capped}` only and the
+  summary note reads `res['yes']` → KeyError. Now every slice gets `make_on_wa(st)` + a stop
+  poll on its own Store, and the results are summed. Test:
+  `test_parallel_whatsapp_slices_never_touch_the_lane_threads_sqlite`. VERSION 1.5.4.
 - [x] **W77** `lanes.py` — linking a second number from the CRM ("WhatsApp login", arg `spare1`)
   while a job ran ENDED that job's WhatsApp lane: the rotation reached the account being
   scanned, `_ensure_session` raised `WaNotLoggedIn("a WhatsApp login is open")` (correct), and

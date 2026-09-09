@@ -290,3 +290,61 @@ def test_whatsapp_lane_waits_out_an_open_login_instead_of_giving_up(db, monkeypa
     msgs = [r["message"] for r in s.logs(job_id)]
     s.close()
     assert any("paused" in m and "login" in m for m in msgs), msgs
+
+
+def test_parallel_whatsapp_slices_never_touch_the_lane_threads_sqlite(db, monkeypatch):
+    """W78: the W76 parallel path handed each slice thread the LANE's `should_stop` and
+    `on_wa`, both bound to the lane thread's sqlite connection — so the first
+    `should_stop()` from a slice raised `ProgrammingError: SQLite objects created in a
+    thread can only be used in that same thread` and 2-session mode died before checking
+    a single number (1 - PC, job 36, 2026-09-09). Every callback a slice calls must use
+    the slice's own Store."""
+    import threading
+    from webscraper import wa_verify
+    from webscraper.store import Store
+
+    job_id, job = _mk_job(db, do_enrich=0, do_wa_verify=1)
+    _add_place(db, job_id, "p1", "+919999999991")
+    _add_place(db, job_id, "p2", "+919999999992")
+    s = db(); s.add_wa_account("main"); s.add_wa_account("spare1"); s.close()
+    rows = [{"place_key": "p1", "name": "biz p1", "number": "919999999991", "source": "maps"},
+            {"place_key": "p2", "name": "biz p2", "number": "919999999992", "source": "maps"}]
+    state = {"pending": True, "threads": set(), "accounts": [], "lock": threading.Lock()}
+
+    monkeypatch.setattr(Store, "pending_wa_verify",
+                        lambda self, jid, limit=25: rows if state["pending"] else [])
+    monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 2 if state["pending"] else 0)
+    monkeypatch.setattr(L, "_wa_parallel", lambda: 2)
+    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
+
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+        with state["lock"]:
+            state["threads"].add(threading.get_ident())
+            state["accounts"].append(account)
+        for r in batch:
+            assert should_stop() is False          # lane-thread sqlite would raise here
+            on_progress(r["place_key"], "no", r["number"], "maps")
+        with state["lock"]:
+            if len(state["accounts"]) == 2:
+                state["pending"] = False
+        return {"yes": 0, "no": len(batch), "unknown": 0}
+    monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
+
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
+    pipe.discovery.done.set()
+    lane = pipe.whatsapp
+    lane.store = db()
+    try:
+        reason = lane._work()
+    finally:
+        lane.store.close()
+
+    assert reason == L.R_COMPLETED, reason
+    assert sorted(state["accounts"]) == ["main", "spare1"]
+    assert len(state["threads"]) == 2
+    s = db()
+    done = s.conn.execute("SELECT wa_verify_done FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+    msgs = [r["message"] for r in s.logs(job_id)]
+    s.close()
+    assert done == 2
+    assert sum("not on WhatsApp" in m for m in msgs) == 2, msgs
