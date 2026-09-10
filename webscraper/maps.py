@@ -401,6 +401,18 @@ def scrape_place(page: Page, href: str, job_id: int, country: str) -> Place:
 
 #: Poll interval for the opener while the collector is still tiling and the queue is empty.
 OPENER_POLL_SEC = 2.0
+# W103 — a place whose `page.goto` fails with a plain navigation error (net::ERR_ABORTED,
+# ERR_CONNECTION_RESET/CLOSED, ERR_NETWORK_CHANGED …) is retried once after this pause,
+# then skipped. Only this many skipped places IN A ROW fail the lane: one flaky request
+# is a place, five back to back is the network.
+NAV_RETRY_SLEEP_SEC = 3.0
+MAX_CONSECUTIVE_NAV_FAILURES = 5
+
+
+def _first_line(e: BaseException) -> str:
+    """A Playwright error's message is the reason plus a multi-line call log; the log and
+    the `skip` event want just the reason (`Page.goto: net::ERR_ABORTED at https://…`)."""
+    return (str(e).strip().splitlines() or [""])[0][:200]
 #: The opener's own persistent Chrome profile, beside the collector's (`settings.profile_dir`).
 OPENER_PROFILE_NAME = "browser-profile-open"
 
@@ -703,6 +715,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                 # Places whose panel this job has ALREADY read (an earlier area / run) — a
                 # second visit is reported as `dup`. Stubs are not "known" in that sense.
                 known = store.detailed_place_keys(job_id)
+                nav_failures = 0          # W103: skipped places in a row; reset by every place that opens
                 while True:
                     drain()
                     if should_stop():
@@ -738,33 +751,64 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                         pass
                     _set_active(1)
                     pacing.sleep_between()
+                    place = None
+                    nav_retried = False
                     try:
-                        place = scrape_place(page, href, job_id, country)
-                    except CaptchaError:
-                        backoff = random.uniform(900, 1800)
-                        emit_direct("captcha", {"backoff_sec": backoff})
-                        log.warning("captcha — backing off %.0fs", backoff)
-                        time.sleep(backoff)
-                        try:
-                            place = scrape_place(page, href, job_id, country)
-                        except CaptchaError:
-                            stop_ev.set()
-                            emit_direct("abort", {"reason": "captcha twice"})
-                            store.finish_job(job_id, "stopped", "captcha twice")
-                            return saved
-                    except PWTimeout:
-                        emit_direct("skip", {"href": href, "reason": "timeout"})
-                        continue
-                    except PWError as e:
-                        # Same recovery as the collector: a dead browser costs this one place,
-                        # not the remaining list and not the places already saved.
-                        if not is_closed(e) or not rl.recover(f"place {opened}"):
-                            raise
-                        ctx, page = rl.current
-                        emit_direct("skip", {"href": href, "reason": "browser restarted"})
-                        continue
+                        while place is None:
+                            try:
+                                place = scrape_place(page, href, job_id, country)
+                            except CaptchaError:
+                                backoff = random.uniform(900, 1800)
+                                emit_direct("captcha", {"backoff_sec": backoff})
+                                log.warning("captcha — backing off %.0fs", backoff)
+                                time.sleep(backoff)
+                                try:
+                                    place = scrape_place(page, href, job_id, country)
+                                except CaptchaError:
+                                    stop_ev.set()
+                                    emit_direct("abort", {"reason": "captcha twice"})
+                                    store.finish_job(job_id, "stopped", "captcha twice")
+                                    return saved
+                            except PWTimeout:
+                                emit_direct("skip", {"href": href, "reason": "timeout"})
+                                break
+                            except PWError as e:
+                                if is_closed(e):
+                                    # Same recovery as the collector: a dead browser costs this
+                                    # one place, not the remaining list and not the places
+                                    # already saved.
+                                    if not rl.recover(f"place {opened}"):
+                                        raise
+                                    ctx, page = rl.current
+                                    emit_direct("skip", {"href": href, "reason": "browser restarted"})
+                                    break
+                                # W103: a plain navigation failure is NOT "the browser died" —
+                                # `is_closed()` correctly says no, but until this fix that meant
+                                # the error was re-raised and ended the whole lane: job #1625
+                                # (local 54) lost 133 unopened places at 1455/1578, 7h18m in, to
+                                # one `net::ERR_ABORTED`. Browser and page are still alive, so
+                                # retry THIS place once, then give it up like a timeout (the link
+                                # is already `opened`, the stub stays `pending`, and W98's stub
+                                # re-open hands it back later). Only a run of skipped places
+                                # ends the lane — that is a dead network, and it must surface.
+                                if not nav_retried:
+                                    nav_retried = True
+                                    time.sleep(NAV_RETRY_SLEEP_SEC)
+                                    continue
+                                nav_failures += 1
+                                log.warning("skipped %s: %s", card.name or href, _first_line(e))
+                                emit_direct("skip", {"href": href, "reason": "navigation failed",
+                                                     "error": _first_line(e)})
+                                if nav_failures >= MAX_CONSECUTIVE_NAV_FAILURES:
+                                    log.error("%d places in a row failed to open — giving up on the lane: %s",
+                                              nav_failures, _first_line(e))
+                                    raise
+                                break
                     finally:
                         _set_active(0)
+                    if place is None:
+                        continue
+                    nav_failures = 0
                     # feed card values fill whatever the panel didn't expose
                     if place.name is None and card.name:
                         place.name = card.name

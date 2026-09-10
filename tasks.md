@@ -26,6 +26,30 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W103** `maps.py` (CRM T546) — one place's `net::ERR_ABORTED` ended the discovery lane.
+  `1 - PC` job #1625 / local 54: discovery at 7h18m, 1455/1578 places opened, 09:15:34 UTC —
+  `page.goto` on `Lifespan Mortgage Services` raised `Page.goto: net::ERR_ABORTED`, then
+  `lane discovery failed for job 54`, job Incomplete with 133 places never opened. Root cause
+  `maps.py:758` (opener loop in `run_scrape`): `except PWError` knew exactly one case — `is_closed(e)`
+  → `rl.recover()` relaunch — and re-raised everything else, so any plain navigation failure
+  (ERR_ABORTED, ERR_CONNECTION_RESET/CLOSED, ERR_NETWORK_CHANGED …) on ONE place propagated through
+  `server._discovery` → `lanes.run_discovery` → `Lane.run`, which records `error:<msg>` for the lane.
+  The WhatsApp lane has retried the same class of error in place since T338 (`wa_verify._check`);
+  the opener never got it. Fix (same pattern): a non-`is_closed` `PWError` retries that place once
+  after `NAV_RETRY_SLEEP_SEC` (3 s); a second failure logs `skipped <name>: <reason>` at warn, emits
+  `skip` (`reason: navigation failed`) and continues — the link is already `opened=1` and the stub
+  row stays `detail_status='pending'`, which is exactly what `reopen_stub_links` (W62/W98) hands
+  back to the opener on the next pending run, the same route a timeout takes. `nav_failures` counts
+  skipped places IN A ROW (reset by every place that opens, untouched by a timeout or a relaunch);
+  `MAX_CONSECUTIVE_NAV_FAILURES` (5) re-raises the last error so a dead network still fails the lane.
+  `is_closed` keeps the relaunch path unchanged. `_first_line()` trims Playwright's multi-line call
+  log out of the warn line and the event. Audited the collector too: a tile that dies is caught
+  in `_collect_links` (`collect_failed` → "link collection stopped: … — opening what was found")
+  and only re-raised when nothing at all was saved — already graceful (#6611 this morning), left
+  alone. Tests: `tests/test_w103_place_nav_failure.py` (5 — four fail on the old code: retry-once
+  opens, twice skips and the lane finishes with the stub re-openable, five in a row raise the last
+  error, a success resets the count; plus the dead-browser relaunch path). 207 pass / 1 skipped.
+  VERSION 1.7.9. Agents pick it up on their next auto-update.
 - [x] **W102** `wa_verify.py` / `browser_fetch.py` / `fdcount.py` (CRM T545) — `[Errno 24] Too many open files`.
   `2 - MAC` (Python 3.14, 4 WhatsApp accounts in parallel), job #6619 / local 29: the WhatsApp lane
   started 05:50 UTC and at 08:09 every slice failed with Errno 24, then `lane whatsapp failed`, then
