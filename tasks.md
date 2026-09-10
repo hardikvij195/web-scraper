@@ -26,6 +26,16 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W101** `agent.py` (CRM T538 follow-up) — the parked Stop (W75) never flagged the running job.
+  Its branch in `_poll_command` wrote `store.update_job(cur, stop_requested=1, …)`, but the command
+  thread has no `store` (the loop's one is a local of `run_agent`, and sqlite connections are
+  thread-bound anyway) — a `NameError` swallowed by the branch's own `except`, so `stop_requested`
+  was never set on Stop and the lanes only halted once the CRM's cancel came back through
+  `cloud.progress()` on a later tick. Now the branch opens its own `Store()` (as `_cloud_job_id` does),
+  writes `stop_requested=1` + the message and the job log line, and closes it. Test:
+  `tests/test_w100_defer_update.py::test_stop_flags_the_running_job_in_its_own_store` — runs the real
+  `_poll_command` stop branch against a temp DB with a fake worker holding `current_job` and asserts
+  the flag, the message and the `done` ack. 191 pass / 1 skipped. VERSION 1.7.7.
 - [x] **W100** `agent.py` (CRM T538) — `update` / `restart` wait for the running job. Both end in
   `os._exit`, so one landing mid-job killed the in-flight Chromes, threw away the WhatsApp batch and
   cost a full boot (job #1618 on `1 - PC`, 2026-09-10 01:22: the restart itself was survivable —

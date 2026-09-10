@@ -1327,9 +1327,19 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     try:
                         cur = getattr(srv.worker, "current_job", None)
                         if cur:
-                            store.update_job(int(cur), stop_requested=1,
-                                             message="stopped — the agent was parked from the CRM")
-                            store.log(int(cur), "job", "stopped: the agent was parked from the CRM", level="warn")
+                            # W101: this thread has no `store` of its own (the loop's one
+                            # lives in run_agent, and sqlite connections are thread-bound
+                            # anyway) — the old `store.update_job` here was a NameError
+                            # swallowed by the except below, so a park never flagged the
+                            # job and the lanes only stopped once the CRM's cancel came
+                            # back through cloud.progress(). Open one like _cloud_job_id.
+                            _st = Store()
+                            try:
+                                _st.update_job(int(cur), stop_requested=1,
+                                               message="stopped — the agent was parked from the CRM")
+                                _st.log(int(cur), "job", "stopped: the agent was parked from the CRM", level="warn")
+                            finally:
+                                _st.close()
                     except Exception:                             # noqa: BLE001
                         log.debug("could not flag the running job on stop", exc_info=True)
                     _close_browsers()

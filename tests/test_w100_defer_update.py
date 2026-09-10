@@ -152,3 +152,34 @@ def test_command_loop_runs_update_now_when_idle(monkeypatch):
     assert agent._DEFERRED_CMD[0] is None
     # the stub returned instead of exiting, so the loop's `finally` reported it
     assert cloud.done == [(9, True, "updated")]
+
+
+def test_stop_flags_the_running_job_in_its_own_store(monkeypatch, tmp_path):
+    """W101: the parked Stop writes stop_requested on the running local job. The branch
+    used to reference a `store` that does not exist in the command thread (NameError,
+    swallowed), so the lanes only stopped once the CRM's cancel came back."""
+    from webscraper.config import settings
+    from webscraper.store import Store
+
+    monkeypatch.setattr(settings, "db_path", tmp_path / "stop.db")
+    monkeypatch.setattr(agent, "_close_browsers", lambda *a, **k: None)
+    s = Store()
+    jid = s.create_job(query="dentist", location="Pune", max_places=10, delay_sec=0)
+    s.close()
+    monkeypatch.setattr(agent.srv.worker, "current_job", jid)
+    agent._STANDBY[0] = False
+    cloud = _FakeCloud({"id": 11, "command": "stop"})
+    try:
+        agent._poll_command(cloud)
+        agent._cmd_thread.join(10)
+    finally:
+        agent._STANDBY[0] = False
+
+    s = Store()
+    try:
+        assert s.stop_requested(jid) is True
+        row = s.get_job(jid)
+        assert "parked from the CRM" in (row["message"] or "")
+    finally:
+        s.close()
+    assert cloud.done == [(11, True, "agent stopped — parked, press Start in the CRM to run it again")]
