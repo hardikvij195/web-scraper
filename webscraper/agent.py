@@ -825,6 +825,18 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         logging.getLogger().addHandler(crm_log)
         _CRM_LOG[:] = [crm_log]
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
+    # W102 (CRM T545): macOS starts a process with 256 open files. Six Chromes' worth of
+    # Playwright drivers, three sqlite lanes, httpx and the log fit — until anything leaks,
+    # and job #6619's WhatsApp lane died of `[Errno 24] Too many open files` after ~2 h.
+    # Ask for more before the first browser; a no-op on Windows (no such limit).
+    from webscraper.fdcount import fd_status, raise_fd_limit
+    lim = raise_fd_limit()
+    if lim is not None:
+        old, new = lim
+        if new != old:
+            log.info("open-files limit raised %d -> %d (%s)", old, new, fd_status())
+        else:
+            log.info("open-files limit %s (%s)", "unlimited" if old < 0 else old, fd_status())
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()

@@ -56,6 +56,17 @@ bash scripts/install-agent-autostart-mac.sh
 #               rm ~/Library/LaunchAgents/app.hvtechnologies.leadfinder-agent.plist
 ```
 
+**Open-files limit (W102, 2026-09-10).** macOS starts every process with `ulimit -n 256`.
+Four parallel WhatsApp sessions + the Maps and enrichment browsers are six Playwright drivers,
+each with pipes and an event loop, and job #6619's WhatsApp lane died of `[Errno 24] Too many
+open files` after ~2 h. Three layers now raise it: the launchd plist grants
+`SoftResourceLimits NumberOfFiles 4096` (re-run `scripts/install-agent-autostart-mac.sh` on an
+existing Mac — the old plist has no such key), `run-agent-loop.sh` runs `ulimit -n 4096`, and the
+agent raises its own soft limit at start and logs `open-files limit raised 256 -> 4096`. The
+self-check (`python -m webscraper doctor`, the CRM device card) has an `fd_limit` row that warns
+under 1024, and the WhatsApp lane logs `fd=<open>/<limit>` at every batch so a leak shows as a
+climbing number long before the cap.
+
 WhatsApp verification lane needs a WA Web session ON THE MACHINE THAT RUNS THE JOB:
 `.venv/bin/python -m webscraper wa-login <label>` once on the Mac (QR scan). Without it the
 WhatsApp lane ends `wa_not_logged_in`; discovery + enrichment still run.

@@ -234,6 +234,14 @@ class BrowserFetcher:
         self._thread = threading.Thread(target=self._run, name="browser-fetch", daemon=True)
         self._thread.start()
         if not self._ready.wait(BOOT_TIMEOUT_SEC):
+            # W102: the caller gives up, but the worker is still launching. Without this
+            # it finished its launch later, parked on `_jobs.get()` for ever inside
+            # `with playwright`, and nobody held a reference to close it — one driver
+            # (two pipes + an event loop) and one Chrome leaked per enrichment batch
+            # that booted slowly. Mark it closed and queue the stop sentinel: the
+            # worker's first `get()` returns it, the context and the driver are released.
+            self._closed = True
+            self._jobs.put(None)
             raise RuntimeError(f"browser fetch did not start within {BOOT_TIMEOUT_SEC:.0f}s")
         if self._boot_error is not None:
             raise RuntimeError(f"browser fetch could not start: {self._boot_error}")

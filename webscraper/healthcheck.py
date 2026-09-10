@@ -178,6 +178,27 @@ def _disk() -> dict:
         return _check(False, f"disk check failed: {e}")
 
 
+def _fd_limit() -> dict:
+    """W102: open-files limit. macOS defaults to 256 per process, which the WhatsApp lane
+    (a Playwright driver per slice, per batch) exhausted in ~2 h on the Mac (job #6619).
+    The agent raises its own soft limit at start; this reports what it actually got."""
+    try:
+        from webscraper.fdcount import WARN_BELOW, fd_count, fd_limit
+        lim = fd_limit()
+        n = fd_count()
+        used = f", {n} in use" if n is not None else ""
+        if lim is None:
+            return _check(True, f"no per-process open-files limit on this OS{used}")
+        soft, hard = lim
+        if soft < 0:
+            return _check(True, f"open-files limit unlimited{used}")
+        return _check(soft >= WARN_BELOW, f"open-files limit {soft} (hard {hard if hard >= 0 else 'unlimited'}){used}",
+                      "Restart the agent (it raises the limit itself); on macOS re-run "
+                      "scripts/install-agent-autostart-mac.sh so launchd grants 4096")
+    except Exception as e:  # noqa: BLE001
+        return _check(False, f"open-files check failed: {e}")
+
+
 def _autostart() -> dict:
     sysname = platform.system()
     try:
@@ -237,6 +258,7 @@ def run_checks() -> dict:
         "wa_session": _wa_session(),
         "ai_keys": _ai_keys(),
         "disk": _disk(),
+        "fd_limit": _fd_limit(),
         "autostart": _autostart(),
     }
     required_ok = all(c["ok"] for c in checks.values() if not c.get("optional"))

@@ -21,6 +21,7 @@ cat > "$PLIST" <<PL
   <key>StandardOutPath</key><string>$ROOT/data/launchd.out.log</string>
   <key>StandardErrorPath</key><string>$ROOT/data/launchd.err.log</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>4096</integer></dict>
 </dict></plist>
 PL
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true

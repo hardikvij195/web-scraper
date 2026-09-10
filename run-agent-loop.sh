@@ -7,6 +7,11 @@ set -u
 cd "$(dirname "$0")"
 PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 mkdir -p data
+# W102: macOS gives a process 256 open files. Four WhatsApp Chromes + Maps + enrichment,
+# each a Playwright driver with pipes and an event loop, ran out after ~2 h (job #6619,
+# "[Errno 24] Too many open files"). Raise it here so the agent and everything it spawns
+# inherit it; the agent raises its own limit too, and the launchd job grants 4096.
+ulimit -n 4096 2>/dev/null || ulimit -n 2048 2>/dev/null || true
 # Friendly machine name shown in the CRM "Run on" picker. `.env` (written by the
 # installer's --device) wins; otherwise the Mac's ComputerName. Never export the bare
 # hostname: under launchd `scutil` can return nothing and the agent then registered as

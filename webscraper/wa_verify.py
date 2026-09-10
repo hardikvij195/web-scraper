@@ -485,7 +485,12 @@ def verify_places(
 
     open_ctx: dict[str, Any] = {}      # name -> (pw_ctx, page); all closed in `finally`
     relaunchers: dict[str, Relauncher] = {}   # name -> its own relaunch budget
-    pw = sync_playwright().start()
+    # W102: the Playwright driver is started INSIDE the try below (after the targets are
+    # expanded), so there is no window where a live driver sits outside the `finally`.
+    # It used to start here, before the expansion loop — and that loop writes to sqlite
+    # (`set_wa_verify`, the progress callback), so a `database is locked` there leaked
+    # the driver process, its two pipes and its event loop for the rest of the agent.
+    pw: Any = None
 
     def _relaunch(name: str, where: str) -> bool:
         """Rebuild `name`'s dead browser and refresh its handle. False once its cap is spent.
@@ -582,6 +587,8 @@ def verify_places(
 
     unavailable: set[str] = set()          # W93: accounts whose client never rendered this run
     try:
+        if targets:
+            pw = sync_playwright().start()
         for r, num, source in targets:
             if should_stop():
                 break
@@ -615,6 +622,8 @@ def verify_places(
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
                 store.conn.commit()
                 log.warning("[%s] logged out - disabled; run wa-login to re-link", name)
+                if account:
+                    break         # W102: a pinned slice has no other account to move to
                 continue
 
             try:
@@ -623,6 +632,11 @@ def verify_places(
                 # Session dropped mid-run, or a relaunch found the profile unlinked.
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
                 store.conn.commit()
+                if account:
+                    # W102: `account=` pins this slice, so `continue` re-opened the same
+                    # unlinked profile for EVERY remaining number (a Chrome launch + a 40 s
+                    # wait each) instead of ending the slice.
+                    break
                 continue
 
             store.bump_wa_account(name, today)
@@ -646,7 +660,16 @@ def verify_places(
                 pw_ctx.close()
             except Exception:  # noqa: BLE001
                 pass
-        pw.stop()
+        if pw is not None:
+            # W102: `stop()` must not be allowed to raise — Playwright marks the session
+            # as exited BEFORE it closes the event loop, so an exception here leaves the
+            # loop's descriptors open for good and hides the error that ended the slice.
+            try:
+                pw.stop()
+            except Exception:  # noqa: BLE001
+                log.warning("[%s] Playwright did not stop cleanly", account or "wa", exc_info=True)
+        from webscraper.fdcount import fd_status
+        log.info("[%s] verify slice done: %d checked, %s", account or "wa", counts["checked"], fd_status())
     return counts
 
 

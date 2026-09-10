@@ -26,6 +26,44 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W102** `wa_verify.py` / `browser_fetch.py` / `fdcount.py` (CRM T545) — `[Errno 24] Too many open files`.
+  `2 - MAC` (Python 3.14, 4 WhatsApp accounts in parallel), job #6619 / local 29: the WhatsApp lane
+  started 05:50 UTC and at 08:09 every slice failed with Errno 24, then `lane whatsapp failed`, then
+  Playwright's `Future exception was never retrieved — OSError(24)` on every later driver start
+  (696/931 numbers done; discovery, whose browser was already up, kept going). macOS caps a process
+  at 256 open files; Windows has no cap, so a slow leak was invisible on the four PCs (0 lines) and
+  fatal on the Mac (8 lines in 2 days). Every Playwright sync session is a driver process with two
+  pipes plus its own asyncio loop (kqueue + self-pipe) ≈ 5 descriptors, and the lane starts one per
+  slice per batch. Traced every launch site for a matching stop and found three paths without one:
+  (1) `wa_verify.py:488` `pw = sync_playwright().start()` ran BEFORE the `try`, and the target
+  expansion between them writes sqlite (`set_wa_verify`, the progress callback) — a `database is
+  locked` there (4 slices + 3 lanes on one WAL file) left the driver, pipes and loop alive for the
+  rest of the agent; (2) `browser_fetch.py:236` `BrowserFetcher.__init__` raised on the 90 s boot
+  timeout but its worker thread kept launching, then parked on `_jobs.get()` for ever inside
+  `with playwright` with nobody holding a reference to close it — one driver + one Chrome per
+  enrichment batch that booted slowly (`enrich_places` builds a fresh fetcher per batch, and a
+  busy-profile evict + retry is two 75 s launches > 90 s on a Mac already running five Chromes);
+  (3) `wa_verify.py:649` `pw.stop()` was unguarded in the `finally` — Playwright 1.58 marks the
+  session exited BEFORE `loop.close()`, so a stop that raised kept the loop's descriptors and hid
+  the slice's real error. Fixes: the driver starts inside the `try` and only when there are
+  targets; contexts and `stop()` each close in their own try/except (a failed stop is logged);
+  a timed-out `BrowserFetcher` marks itself closed and queues the stop sentinel so the late worker
+  releases its context and Playwright; a pinned slice (`account=`) now ENDS when its account is
+  logged out or drops mid-run instead of relaunching the unlinked profile (a launch + 40 s wait)
+  for every remaining number. Instrumentation: `webscraper/fdcount.py` (`fd_count` — psutil if
+  present, else `GetProcessHandleCount` / `/proc/self/fd` / an `fstat` sweep on macOS; `fd_limit`,
+  `fd_status`, `raise_fd_limit`) — `fd=<open>/<limit>` is logged at every WhatsApp batch boundary
+  (`WhatsAppLane._work`, also in the job log line) and when a verify slice ends. Belt: `run_agent`
+  raises the soft `RLIMIT_NOFILE` to min(4096, hard) on POSIX and logs `open-files limit raised
+  256 -> 4096`; `run-agent-loop.sh` runs `ulimit -n 4096`; the launchd plist gains
+  `SoftResourceLimits NumberOfFiles 4096` (re-run `install-agent-autostart-mac.sh` on the Mac);
+  `healthcheck` gains `fd_limit` (warns under 1024; "no limit" on Windows); `MAC-SETUP.md` updated.
+  Tests: `tests/test_w102_fd_leaks.py` (11 — six fail on the old code: unguarded stop, driver
+  before expansion, no-targets driver, both pinned-slice exits, the boot-timeout orphan; plus the
+  launch-failure teardown, a context that will not close, Relauncher close-before-open, fdcount,
+  healthcheck). 202 pass / 1 skipped. VERSION 1.7.8. Not fixed: Playwright's own
+  `sync_playwright().start()` leaks its event loop when the driver cannot be spawned — the
+  post-exhaustion amplifier behind the repeated "never retrieved" lines, harmless once nothing leaks.
 - [x] **W101** `agent.py` (CRM T538 follow-up) — the parked Stop (W75) never flagged the running job.
   Its branch in `_poll_command` wrote `store.update_job(cur, stop_requested=1, …)`, but the command
   thread has no `store` (the loop's one is a local of `run_agent`, and sqlite connections are

@@ -547,10 +547,19 @@ class WhatsAppLane(Lane):
                              wa_verify_done=checked, wa_active=len(batch))
 
             by_pk = {r["place_key"]: r for r in batch}
+            # W102: the descriptor count at every batch boundary. Each batch starts one
+            # Playwright driver per slice and ends it; a number that climbs batch after
+            # batch is a leak, and on macOS (256 by default) it is the `[Errno 24]` that
+            # ended job #6619's lane after ~2 h. Logged here so the trend is visible in
+            # agent.log and the job log long before the cap.
+            from webscraper.fdcount import fd_status
+            fds = fd_status()
+            log.info("[whatsapp#%s] batch of %d — %s", self.job_id, len(batch), fds)
             self.store.log(self.job_id, "whatsapp",
                            f"checking {len(batch)} number(s) on WhatsApp — accounts: "
                            f"{', '.join(store.enabled_wa_accounts()) or 'none'}"
-                           + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day"))
+                           + (" · no daily cap" if settings.wa_daily_cap <= 0 else f" · cap {settings.wa_daily_cap}/day")
+                           + f" · {fds}")
 
             # W78: the progress callback takes the Store of the THREAD that calls it. The
             # single-session path passes the lane's own; each W76 slice passes the Store
