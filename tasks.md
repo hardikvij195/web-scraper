@@ -26,6 +26,15 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W106** `scripts/vwe-scrape.py` (CRM T561) — VALVE WORLD EXPO 2026 exhibitor directory →
+  Excel. The public page is an empty shell; the data is the Messe Düsseldorf **VIS JSON API**
+  (`/vis-api/vis/v1/en/...`) and every call needs the header `x-vis-domain: <host>` — without it
+  the API answers `400 No config set found`. Per letter a–z **plus `other`** (not `oth`, which the
+  page's own links say) `directory/<letter>` lists the exhibitors; per exhibitor
+  `exhibitors/<id>/slices/{profile,contacts,products}` carry company data, contact persons and
+  products. Website emails/socials/phones come from the repo's own `enrich.crawl_site` (httpx
+  tier). 550 exhibitors, 4 sheets. Re-runnable for the next edition: only the host and the
+  `event` key change.
 - [x] **W105** `fdcount.py` + `agent.py` (CRM T553) — the Mac's launchd plist installed before W102
   had no `SoftResourceLimits`, so every login restarted the agent at 256 open files until someone
   re-ran `scripts/install-agent-autostart-mac.sh` by hand. The agent now repairs the plist itself
