@@ -26,6 +26,24 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W100** `agent.py` (CRM T538) — `update` / `restart` wait for the running job. Both end in
+  `os._exit`, so one landing mid-job killed the in-flight Chromes, threw away the WhatsApp batch and
+  cost a full boot (job #1618 on `1 - PC`, 2026-09-10 01:22: the restart itself was survivable —
+  `_requeue_orphans` resumed the job — but the roll script's pause three minutes later cancelled it).
+  Now `_should_defer(cmd, current_job)` parks either command while `worker.current_job` is set: the
+  CRM command is closed as **done** with result `deferred — will update after job #<cloud id> finishes`
+  (`_defer_command`, cloud id from `jobs.cloud_id`; the CRM never re-sends a done command, so nothing
+  waits on a second request) and the name is kept in the one-slot `_DEFERRED_CMD`. The main loop calls
+  `_run_deferred(cloud)` right after `_tick` — the job boundary, once the finished job's final status
+  and leads are pushed — and from the standby branch (a Stop that parked the machine also stopped the
+  job it was waiting for); it waits while the command slot is busy (a wa_login QR must not die either),
+  clears the slot BEFORE running so nothing runs twice, and a failed pull is logged once and dropped
+  (press Update agent again on the now-idle machine). The old inline `update` body became
+  `_do_update(cloud, cmd_id | None)` and `restart` became `_do_restart(cloud, cmd_id | None)` — the
+  command loop passes the id (closes the command before exiting), the deferred run passes None and only
+  logs. `stop` / `start` / `checks` / `wa_*` / `rename` / `relocate` unchanged. Tests:
+  `tests/test_w100_defer_update.py` (8: the decision, the result line, the boundary run, the busy slot,
+  once-only, and `_poll_command` end to end with a fake cloud). 190 pass / 1 skipped. VERSION 1.7.6.
 - [x] **W99** `store.py` (CRM T536) — W97's one-retry cap never fired. `wa_checks` is keyed
   (job_id, place_key, number) and `record_wa_check` UPSERTs — a second look overwrites the first
   row — so W97's `COUNT(*) >= 2` settle rule counted a row that could not exist: an 'unknown' was

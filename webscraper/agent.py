@@ -901,6 +901,12 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
                 cloud.jobs()
             except httpx.HTTPError as e:
                 log.debug("standby heartbeat failed: %s", e)
+            # W100: a Stop that parked us also stopped the job the update was waiting
+            # for — a parked machine takes its update now, like an idle one would.
+            try:
+                _run_deferred(cloud)
+            except Exception as e:                                # noqa: BLE001
+                log.error("deferred command failed: %s", e)
             _idle_sleep(cloud, kind, poll_sec)
             continue
         try:
@@ -915,6 +921,13 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             _tick(cloud, store, kind, synced_upto)
         except httpx.HTTPError as e:
             log.warning("cloud unreachable: %s", e)
+        # W100: the job boundary. `_tick` above has just mirrored a finished job's final
+        # status and leads up, so an update/restart parked behind it can run now.
+        if kind == "crm":
+            try:
+                _run_deferred(cloud)
+            except Exception as e:                                # noqa: BLE001
+                log.error("deferred %s failed: %s", _DEFERRED_CMD[0] or "command", e)
         try:
             if _busy():
                 last_busy = time.monotonic()
@@ -957,6 +970,186 @@ def _cmd_stuck(started: float, now: float, alive: bool) -> bool:
     return alive and started > 0 and (now - started) > CMD_MAX_SEC
 #: The CRM log handler, so an `update` can flush its last lines before exiting.
 _CRM_LOG: list = []
+
+#: W100 (CRM T538): an `update` / `restart` that lands while this machine is running a job
+#: is NOT executed on the spot. Both end in `os._exit`, which kills the in-flight Chromes,
+#: throws away the WhatsApp batch in progress and costs a full boot — and on 2026-09-10
+#: (job #1618, `1 - PC`) the restart itself was survivable (`_requeue_orphans` resumed the
+#: job) but the roll script's pause three minutes later was not. The command is acknowledged
+#: to the CRM as done ("deferred — will update after job #1618 finishes"; the CRM never
+#: re-sends a done command, so nothing may depend on a second request) and remembered here
+#: as the command name; `_run_deferred` executes it from the main loop the moment
+#: `worker.current_job` is None. One slot: a later update/restart simply replaces the name.
+_DEFERRED_CMD: list = [None]
+
+#: Commands that end the process and therefore wait for the running job (W100).
+_EXIT_COMMANDS = ("update", "restart")
+
+
+def _should_defer(cmd: dict, current_job: int | None) -> bool:
+    """W100: decide whether `cmd` waits for the job in flight instead of running now."""
+    return str(cmd.get("command") or "") in _EXIT_COMMANDS and current_job is not None
+
+
+def _cloud_job_id(local_id: int) -> int | None:
+    """The CRM's `lead_gen_jobs.id` behind a local `jobs` row (jobs.cloud_id), or None."""
+    try:
+        s = Store()
+        try:
+            r = s.conn.execute("SELECT cloud_id FROM jobs WHERE id=?", (int(local_id),)).fetchone()
+        finally:
+            s.close()
+        return int(r["cloud_id"]) if r and r["cloud_id"] is not None else None
+    except Exception:                                             # noqa: BLE001
+        log.debug("could not map local job %s to its cloud id", local_id, exc_info=True)
+        return None
+
+
+def _defer_command(cmd: dict, current_job: int) -> tuple[bool, str]:
+    """W100: park an update/restart behind the running job. Returns the (ok, result) the
+    command loop reports to the CRM — `done`, with a result line that says when it runs."""
+    name = str(cmd.get("command"))
+    _DEFERRED_CMD[0] = name
+    cid = _cloud_job_id(int(current_job))
+    label = f"#{cid}" if cid is not None else f"local #{current_job}"
+    result = f"deferred — will {name} after job {label} finishes"
+    log.info("%s requested by the CRM while job %s is running on this machine — %s",
+             name, label, result)
+    return True, result
+
+
+def _do_update(cloud: "CrmCloud", cmd_id: int | None) -> tuple[bool, str | None]:
+    """"Update agent" (T209): pull main, reinstall deps, then exit — the supervisor loop
+    (run-agent-loop.sh/.bat) restarts us on the new code. A job in flight is left to
+    _requeue_orphans on the way back up (W100 defers the command so there is none).
+
+    Shared by the command loop (`cmd_id` = the CRM command to close before exiting) and the
+    deferred run at the job boundary (`cmd_id` None — the command was already closed as
+    "deferred", so only the log says what happened). Returns (ok, result) only when it did
+    NOT restart: every success path ends in `os._exit(0)`."""
+    import subprocess
+    import sys
+    from webscraper.config import ROOT
+    # W49 (Dell Vostro, 2026-08-31): the folder may not be a git checkout at
+    # all — an installer/zip deployment has no .git, so every `git pull` here
+    # died with "fatal: not a git repository: (NULL)" and the agent could
+    # never be updated from the CRM again. Repair it in place rather than
+    # reporting a dead end: init, point at origin, hard-check out main.
+    # Safe because data/ and .env are gitignored, so the SQLite DB, the
+    # WhatsApp profiles and CRM_AGENT_TOKEN all survive.
+    import os
+    tag = "update" if cmd_id is not None else "deferred update"
+    result: str | None = None
+    repair_failed = None
+    is_repo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT,
+                             capture_output=True, text=True).returncode == 0
+    if not is_repo:
+        log.warning("%s: %s is not a git checkout - repairing it in place", tag, ROOT)
+        repo = os.getenv("WEBSCRAPER_REPO") or "https://github.com/hardikvij195/web-scraper.git"
+        for step in (["git", "init", "-q"],
+                     ["git", "remote", "add", "origin", repo],
+                     ["git", "fetch", "-q", "origin", "main"],
+                     ["git", "checkout", "-f", "-B", "main", "origin/main"]):
+            r = subprocess.run(step, cwd=ROOT, capture_output=True, text=True, timeout=300)
+            # `remote add` fails harmlessly when a remote already exists.
+            if r.returncode != 0 and step[1] != "remote":
+                repair_failed = (f"could not repair the checkout ({step[1]}): "
+                                 f"{(r.stderr or r.stdout).strip()[:160]}")
+                break
+        if repair_failed:
+            log.error("%s: %s", tag, repair_failed)
+            result = repair_failed
+        else:
+            log.info("%s: checkout repaired - continuing with the normal update", tag)
+
+    before = "" if repair_failed else subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+        capture_output=True, text=True).stdout.strip()
+    # W47: a detached HEAD (submodule checkout, or a clone that ended up off
+    # its branch — the Dell Vostro, 2026-08-27) makes `git pull` refuse with
+    # "You are not currently on a branch". Same cure as the installer: put the
+    # checkout on main tracking origin/main first.
+    on_branch = repair_failed is not None or subprocess.run(
+        ["git", "symbolic-ref", "-q", "HEAD"], cwd=ROOT,
+        capture_output=True, text=True).returncode == 0
+    log.info("%s: on %s (%s) - pulling origin/main", tag, before,
+             "branch" if on_branch else "detached HEAD, re-attaching to main first")
+    if not on_branch:
+        subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT,
+                       capture_output=True, text=True, timeout=120)
+        subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=ROOT,
+                       capture_output=True, text=True, timeout=60)
+    pull = (subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+            if not repair_failed else None)
+    if repair_failed:
+        return False, result                      # `result` is already the reason
+    if pull.returncode != 0:
+        result = f"git pull failed: {(pull.stderr or pull.stdout).strip()[:200]}"
+        # W48: say it in the CRM log too - the dialog used to spin with nothing to read.
+        log.error("%s: %s", tag, result)
+        return False, result
+    log.info("%s: pulled - %s", tag, (pull.stdout or "").strip().splitlines()[-1][:120]
+             if pull.stdout.strip() else "up to date")
+    log.info("%s: pip install -r requirements.txt ...", tag)
+    pip = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+                         cwd=ROOT, capture_output=True, text=True, timeout=600)
+    if pip.returncode != 0:
+        log.warning("%s: pip install reported %s", tag, (pip.stderr or pip.stdout).strip()[-200:])
+    after = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                           capture_output=True, text=True).stdout.strip()
+    result = f"already on {after}" if after == before else f"updated {before} → {after}, restarting"
+    log.info("%s: %s", tag, result)
+    if cmd_id is not None:
+        cloud.command_done(int(cmd_id), True, result)
+    _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
+    _close_browsers(); os._exit(0)
+    return True, result                           # unreachable; keeps the signature honest
+
+
+def _do_restart(cloud: "CrmCloud", cmd_id: int | None) -> None:
+    """W46: plain restart from the CRM — no pull. Same exit path as update; the supervisor
+    loop brings us back and _requeue_orphans resumes anything left mid-run. `cmd_id` None =
+    the deferred run (W100), whose command was already closed as "deferred"."""
+    import os as _os
+    log.info("restart requested by the CRM" if cmd_id is not None
+             else "deferred restart: this machine's job has finished — restarting now")
+    if cmd_id is not None:
+        cloud.command_done(int(cmd_id), True, "restarting")
+    _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
+    _close_browsers(); _os._exit(0)
+
+
+def _run_deferred(cloud: "CrmCloud") -> bool:
+    """W100: at the job boundary, run the update/restart that was parked behind the job.
+
+    Called from the agent's main loop after `_tick` (so the finished job's final status and
+    leads have been pushed to the CRM first). Waits while a job is still running or while
+    the command slot is busy (a wa_login QR window must not be killed either). The slot is
+    cleared BEFORE running, so a failed pull is reported once and never retried on its
+    own — pressing Update agent again on the now-idle machine runs it immediately.
+    Returns True when it took the deferred command."""
+    name = _DEFERRED_CMD[0]
+    if name is None:
+        return False
+    if getattr(srv.worker, "current_job", None) is not None:
+        return False
+    if _cmd_thread is not None and _cmd_thread.is_alive():
+        return False
+    _DEFERRED_CMD[0] = None                       # taken — never run twice
+    log.info("deferred %s: this machine's job has finished — running it now", name)
+    if name == "restart":
+        _do_restart(cloud, None)
+        return True
+    ok, result = _do_update(cloud, None)
+    if not ok:
+        log.error("deferred update failed: %s — press Update agent again on the CRM", result)
+        if _CRM_LOG:
+            try:
+                _ship_agent_logs(cloud, _CRM_LOG[0])
+            except Exception:                                     # noqa: BLE001
+                pass
+    return True
 
 
 def _idle_sleep(cloud, kind: str, seconds: float) -> None:
@@ -1009,7 +1202,13 @@ def _poll_command(cloud: "CrmCloud") -> None:
         global DEVICE_NAME
         ok, result = False, None
         try:
-            if cmd["command"] == "wa_login":
+            _cur_job = getattr(srv.worker, "current_job", None)
+            if _should_defer(cmd, _cur_job):
+                # W100 (CRM T538): update/restart wait for the running job — see
+                # _DEFERRED_CMD. Reported as done by the `finally` below; the main loop's
+                # _run_deferred executes it once the worker frees.
+                ok, result = _defer_command(cmd, int(_cur_job))
+            elif cmd["command"] == "wa_login":
                 from webscraper import wa_verify
                 label = (cmd.get("arg") or "main").strip() or "main"
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
@@ -1090,83 +1289,9 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 ok = True
                 result = f"self-check: {fine}/{total} fine" + ("" if rep.get("ok") else " (required check failing)")
             elif cmd["command"] == "update":
-                # "Update agent" (T209): pull main, reinstall deps, then exit — the
-                # supervisor loop (run-agent-loop.sh/.bat) restarts us on the new code.
-                # A job in flight is left to _requeue_orphans on the way back up.
-                import subprocess
-                import sys
-                from webscraper.config import ROOT
-                # W49 (Dell Vostro, 2026-08-31): the folder may not be a git checkout at
-                # all — an installer/zip deployment has no .git, so every `git pull` here
-                # died with "fatal: not a git repository: (NULL)" and the agent could
-                # never be updated from the CRM again. Repair it in place rather than
-                # reporting a dead end: init, point at origin, hard-check out main.
-                # Safe because data/ and .env are gitignored, so the SQLite DB, the
-                # WhatsApp profiles and CRM_AGENT_TOKEN all survive.
-                import os
-                repair_failed = None
-                is_repo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT,
-                                         capture_output=True, text=True).returncode == 0
-                if not is_repo:
-                    log.warning("update: %s is not a git checkout - repairing it in place", ROOT)
-                    repo = os.getenv("WEBSCRAPER_REPO") or "https://github.com/hardikvij195/web-scraper.git"
-                    for step in (["git", "init", "-q"],
-                                 ["git", "remote", "add", "origin", repo],
-                                 ["git", "fetch", "-q", "origin", "main"],
-                                 ["git", "checkout", "-f", "-B", "main", "origin/main"]):
-                        r = subprocess.run(step, cwd=ROOT, capture_output=True, text=True, timeout=300)
-                        # `remote add` fails harmlessly when a remote already exists.
-                        if r.returncode != 0 and step[1] != "remote":
-                            repair_failed = (f"could not repair the checkout ({step[1]}): "
-                                             f"{(r.stderr or r.stdout).strip()[:160]}")
-                            break
-                    if repair_failed:
-                        log.error("update: %s", repair_failed)
-                        result = repair_failed
-                    else:
-                        log.info("update: checkout repaired - continuing with the normal update")
-
-                before = "" if repair_failed else subprocess.run(
-                    ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
-                    capture_output=True, text=True).stdout.strip()
-                # W47: a detached HEAD (submodule checkout, or a clone that ended up off
-                # its branch — the Dell Vostro, 2026-08-27) makes `git pull` refuse with
-                # "You are not currently on a branch". Same cure as the installer: put the
-                # checkout on main tracking origin/main first.
-                on_branch = repair_failed is not None or subprocess.run(
-                    ["git", "symbolic-ref", "-q", "HEAD"], cwd=ROOT,
-                    capture_output=True, text=True).returncode == 0
-                log.info("update: on %s (%s) - pulling origin/main", before, "branch" if on_branch else "detached HEAD, re-attaching to main first")
-                if not on_branch:
-                    subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT,
-                                   capture_output=True, text=True, timeout=120)
-                    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=ROOT,
-                                   capture_output=True, text=True, timeout=60)
-                pull = (subprocess.run(["git", "pull", "--ff-only"], cwd=ROOT,
-                                       capture_output=True, text=True, timeout=120)
-                        if not repair_failed else None)
-                if repair_failed:
-                    pass                                  # `result` is already the reason
-                elif pull.returncode != 0:
-                    result = f"git pull failed: {(pull.stderr or pull.stdout).strip()[:200]}"
-                    # W48: say it in the CRM log too - the dialog used to spin with nothing to read.
-                    log.error("update: %s", result)
-                else:
-                    log.info("update: pulled - %s", (pull.stdout or "").strip().splitlines()[-1][:120] if pull.stdout.strip() else "up to date")
-                    log.info("update: pip install -r requirements.txt ...")
-                    pip = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
-                                         cwd=ROOT, capture_output=True, text=True, timeout=600)
-                    if pip.returncode != 0:
-                        log.warning("update: pip install reported %s", (pip.stderr or pip.stdout).strip()[-200:])
-                    after = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
-                                           capture_output=True, text=True).stdout.strip()
-                    ok, result = True, (f"already on {after}" if after == before
-                                        else f"updated {before} → {after}, restarting")
-                    log.info("update: %s", result)
-                    cloud.command_done(int(cmd["id"]), True, result)
-                    _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
-                    import os as _os
-                    _close_browsers(); _os._exit(0)
+                # "Update agent" (T209) — body in _do_update (W100 shares it with the
+                # deferred run). Exits the process on success; returns only on failure.
+                ok, result = _do_update(cloud, int(cmd["id"]))
             elif cmd["command"] == "start":
                 # W58 — leave standby. A no-op when the agent is already working, so
                 # pressing Start on a healthy machine is harmless.
@@ -1264,14 +1389,8 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 time.sleep(1)
                 _os._exit(0)
             elif cmd["command"] == "restart":
-                # W46: plain restart from the CRM — no pull. Same exit path as update; the
-                # supervisor loop brings us back and _requeue_orphans resumes the job.
-                ok, result = True, "restarting"
-                log.info("restart requested by the CRM")
-                cloud.command_done(int(cmd["id"]), True, result)
-                _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
-                import os as _os
-                _close_browsers(); _os._exit(0)
+                # W46: plain restart, no pull — body in _do_restart (W100 shares it).
+                _do_restart(cloud, int(cmd["id"]))
             else:
                 result = f"unknown command {cmd['command']}"
                 log.error("command %s: unknown on agent %s - Update agent first", cmd["command"], AGENT_VERSION if 'AGENT_VERSION' in globals() else '?')
