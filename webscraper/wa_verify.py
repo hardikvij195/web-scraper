@@ -628,6 +628,21 @@ def verify_places(
 
             try:
                 status = _check(name, num)
+            except WaUnavailable as e:
+                # W108 (CRM T566): Chrome died mid-number, `_check` relaunched it, and the fresh
+                # profile sat on WhatsApp's "messages are downloading" splash for the whole sync
+                # wait. That raised out of the run and failed the entire re-verify (#6621 on the
+                # Mac: 129 numbers checked, three healthy accounts) — the same condition at
+                # session start is already a skip-this-account-for-the-run. Treat it the same
+                # way here: the account stays linked, this number stays unchecked for next time.
+                unavailable.add(name)
+                open_ctx.pop(name, None)
+                log.warning("%s", e)
+                if job_id is not None:
+                    store.log(job_id, "whatsapp", f"{name}: WhatsApp Web was still syncing after a browser restart — skipped this run, still linked", "warn")
+                if account:
+                    break         # a pinned slice has no other account to move to
+                continue
             except WaNotLoggedIn:
                 # Session dropped mid-run, or a relaunch found the profile unlinked.
                 store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))

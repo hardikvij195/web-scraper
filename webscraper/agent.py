@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 import time
 from typing import Any
 
@@ -1004,6 +1005,37 @@ _CRM_LOG: list = []
 #: `worker.current_job` is None. One slot: a later update/restart simply replaces the name.
 _DEFERRED_CMD: list = [None]
 
+#: W108 (CRM T566): the WhatsApp-only re-verify runs on its own thread. It used to run inside
+#: `_tick` on the main loop, and the main loop is what heartbeats and polls commands — so a
+#: long re-check (the Mac, 2026-09-10 17:43–17:49: a relaunched profile waiting out WhatsApp's
+#: sync splash) showed the machine as offline and left Restart unanswered for 6 minutes.
+_REVERIFY: dict = {"thread": None, "job": None}
+
+
+def _reverify_busy() -> int | None:
+    """The CRM job id of the re-verify running on this machine, or None."""
+    t = _REVERIFY.get("thread")
+    return _REVERIFY.get("job") if t is not None and t.is_alive() else None
+
+
+def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
+    """Run `_reverify_wa` for `jid` on a background thread with its own Store (sqlite
+    connections are not thread-safe); the main loop keeps heartbeating and polling."""
+    def _run() -> None:
+        st = Store()
+        try:
+            _reverify_wa(cloud, st, jid, leads_verify=leads_verify)
+        except Exception:                                         # noqa: BLE001
+            log.exception("re-verify #%s crashed", jid)
+        finally:
+            try:
+                st.close()
+            except Exception:                                     # noqa: BLE001
+                pass
+    t = threading.Thread(target=_run, name=f"reverify-{jid}", daemon=True)
+    _REVERIFY["thread"], _REVERIFY["job"] = t, jid
+    t.start()
+
 #: Commands that end the process and therefore wait for the running job (W100).
 _EXIT_COMMANDS = ("update", "restart")
 
@@ -1027,12 +1059,13 @@ def _cloud_job_id(local_id: int) -> int | None:
         return None
 
 
-def _defer_command(cmd: dict, current_job: int) -> tuple[bool, str]:
+def _defer_command(cmd: dict, current_job: int, cloud_job: int | None = None) -> tuple[bool, str]:
     """W100: park an update/restart behind the running job. Returns the (ok, result) the
-    command loop reports to the CRM — `done`, with a result line that says when it runs."""
+    command loop reports to the CRM — `done`, with a result line that says when it runs.
+    `cloud_job` (W108) = the CRM id is already known (a re-verify has no local jobs row)."""
     name = str(cmd.get("command"))
     _DEFERRED_CMD[0] = name
-    cid = _cloud_job_id(int(current_job))
+    cid = cloud_job if cloud_job is not None else _cloud_job_id(int(current_job))
     label = f"#{cid}" if cid is not None else f"local #{current_job}"
     result = f"deferred — will {name} after job {label} finishes"
     log.info("%s requested by the CRM while job %s is running on this machine — %s",
@@ -1158,6 +1191,8 @@ def _run_deferred(cloud: "CrmCloud") -> bool:
         return False
     if _cmd_thread is not None and _cmd_thread.is_alive():
         return False
+    if _reverify_busy() is not None:              # W108: a re-verify is a running job too
+        return False
     _DEFERRED_CMD[0] = None                       # taken — never run twice
     log.info("deferred %s: this machine's job has finished — running it now", name)
     if name == "restart":
@@ -1225,11 +1260,15 @@ def _poll_command(cloud: "CrmCloud") -> None:
         ok, result = False, None
         try:
             _cur_job = getattr(srv.worker, "current_job", None)
+            _rv_job = _reverify_busy()
             if _should_defer(cmd, _cur_job):
                 # W100 (CRM T538): update/restart wait for the running job — see
                 # _DEFERRED_CMD. Reported as done by the `finally` below; the main loop's
                 # _run_deferred executes it once the worker frees.
                 ok, result = _defer_command(cmd, int(_cur_job))
+            elif _should_defer(cmd, _rv_job):
+                # W108: a re-verify is a running job too — an exit here would kill it mid-run.
+                ok, result = _defer_command(cmd, int(_rv_job), cloud_job=int(_rv_job))
             elif cmd["command"] == "wa_login":
                 from webscraper import wa_verify
                 label = (cmd.get("arg") or "main").strip() or "main"
@@ -1770,10 +1809,15 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # the `mirrored` guard because a re-verify targets a job that was ALREADY
         # scraped+mirrored earlier — the guard would otherwise skip it forever.
         if kind == "crm" and cj.get("wa_verify_only"):
+            # W108: never a second re-verify while one runs (its progress can go stale during
+            # a long sync wait, and a stale job is claimable again by this same device).
+            if _reverify_busy() is not None:
+                continue
             if cloud.claim(cj["id"]) is None:
                 continue
             # W51: `leads_verify` = the CRM's own leads, not this job's results.
-            _reverify_wa(cloud, store, cj["id"], leads_verify=bool(cj.get("leads_verify")))
+            # W108: on its own thread — the main loop keeps heartbeating and polling commands.
+            _start_reverify(cloud, cj["id"], bool(cj.get("leads_verify")))
             continue
         if cj["id"] in mirrored:
             # ALREADY MIRRORED — but the CRM may have queued it AGAIN. "Re-enrich" and
@@ -1784,6 +1828,9 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             # every other re-run shape needs this one.
             if str(cj.get("status") or "") == "queued":
                 _requeue_rerun(cloud, store, cj, kind)
+            continue
+        # W108: a re-verify holds this machine's WhatsApp profiles — start nothing new beside it.
+        if _reverify_busy() is not None:
             continue
         if cloud.claim(cj["id"]) is None:
             continue

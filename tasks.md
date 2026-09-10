@@ -26,6 +26,18 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W108** `agent.py` + `wa_verify.py` (CRM T566) — the Mac looked offline for 6 minutes
+  (2026-09-10 17:43–17:49) and its Restart went unanswered. The WhatsApp-only re-verify ran
+  inside `_tick` on the main loop, and the main loop is what heartbeats and polls commands.
+  In that window spare2's Chrome died mid-number, the relaunch landed on WhatsApp's "messages
+  are downloading" splash for the whole sync wait, and the resulting `WaUnavailable` escaped
+  `verify_places` and failed the entire re-verify of #6621 (129 numbers done, three healthy
+  accounts). Now: the re-verify runs on its own thread with its own Store (`_start_reverify`,
+  `_reverify_busy`); `_tick` claims nothing beside it; update/restart defer behind it
+  (`_defer_command(cloud_job=)`, `_run_deferred`). A still-syncing account after a relaunch is
+  skipped for the run, like the same condition at session start. `threading` moved to a
+  module-level import (the new code NameErrored without it, the 1.8.1 `sys` trap again,
+  caught this time by `tests/test_w108_reverify_thread.py`).
 - [x] **W107** `scripts/vwe-wa-check.py` (CRM T562) — does each Valve World exhibitor's number
   exist on WhatsApp? One number per company (published wa.me link > expo phone > first website
   phone; only fully-qualified +E.164 — a guessed country code would be a wrong verdict), checked
