@@ -97,3 +97,46 @@ def raise_fd_limit(target: int = TARGET_SOFT_LIMIT) -> tuple[int, int] | None:
         return soft, soft
     except Exception:                                             # noqa: BLE001
         return None
+
+
+#: W105 (CRM T553): the launchd job the Mac installer writes. A plist installed before W102
+#: has no SoftResourceLimits key, so every login started the agent at 256 again until
+#: someone re-ran scripts/install-agent-autostart-mac.sh on the Mac by hand.
+LAUNCHD_LABEL = "app.hvtechnologies.leadfinder-agent"
+LAUNCHD_LIMIT_XML = (
+    "  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>%d</integer></dict>\n"
+)
+
+
+def ensure_launchd_limit(plist_path: "str | os.PathLike[str] | None" = None,
+                         target: int = TARGET_SOFT_LIMIT) -> str:
+    """Self-repair the Mac launchd plist so the NEXT login also starts with `target` files.
+
+    Writes the SoftResourceLimits key into the plist file when it is missing — file only,
+    no launchctl: booting the job out from inside would kill this very process, and the
+    running one already raised its own limit (`raise_fd_limit`). launchd reads the file on
+    the next bootstrap (login / reboot / the installer). Returns 'added' | 'present' |
+    'absent' (no plist — autostart never installed) | 'error'. Never raises.
+    """
+    try:
+        if plist_path is None:
+            if sys.platform != "darwin":
+                return "absent"
+            plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
+        path = os.fspath(plist_path)
+        if not os.path.isfile(path):
+            return "absent"
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        if "SoftResourceLimits" in text:
+            return "present"
+        marker = "</dict></plist>"
+        idx = text.rfind(marker)
+        if idx < 0:
+            return "error"
+        text = text[:idx] + (LAUNCHD_LIMIT_XML % int(target)) + text[idx:]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return "added"
+    except Exception:  # noqa: BLE001
+        return "error"

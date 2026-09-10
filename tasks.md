@@ -26,6 +26,12 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W105** `fdcount.py` + `agent.py` (CRM T553) — the Mac's launchd plist installed before W102
+  had no `SoftResourceLimits`, so every login restarted the agent at 256 open files until someone
+  re-ran `scripts/install-agent-autostart-mac.sh` by hand. The agent now repairs the plist itself
+  at start on macOS (`ensure_launchd_limit`: writes `NumberOfFiles 4096` into the file — no
+  launchctl, which would kill the running process; launchd reads it on the next login; the
+  running process already raised its own limit). `tests/test_w105_launchd_limit.py`.
 - [x] **W104** `agent.py` + `store.py` (CRM T547) — the WhatsApp-only re-run over CRM rows
   (`_reverify_wa` → Edge Fn `set_wa`) sent only `wa_verified` per lead, never the per-number
   history, so the CRM's `wa_numbers[].checks` never moved: a number still undecided after its

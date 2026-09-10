@@ -829,7 +829,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     # Playwright drivers, three sqlite lanes, httpx and the log fit — until anything leaks,
     # and job #6619's WhatsApp lane died of `[Errno 24] Too many open files` after ~2 h.
     # Ask for more before the first browser; a no-op on Windows (no such limit).
-    from webscraper.fdcount import fd_status, raise_fd_limit
+    from webscraper.fdcount import ensure_launchd_limit, fd_status, raise_fd_limit
     lim = raise_fd_limit()
     if lim is not None:
         old, new = lim
@@ -837,6 +837,15 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             log.info("open-files limit raised %d -> %d (%s)", old, new, fd_status())
         else:
             log.info("open-files limit %s (%s)", "unlimited" if old < 0 else old, fd_status())
+    # W105 (CRM T553): the Mac's launchd plist gets the same limit written in, once, so the
+    # next login starts high too — done here, by the agent, instead of asking someone to
+    # re-run the installer on the Mac.
+    if sys.platform == "darwin":
+        fix = ensure_launchd_limit()
+        if fix == "added":
+            log.info("launchd plist updated with NumberOfFiles=%d — applies from the next login; this process already raised its own limit", 4096)
+        elif fix == "error":
+            log.warning("launchd plist could not be updated — re-run scripts/install-agent-autostart-mac.sh once")
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
