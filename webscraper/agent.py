@@ -405,6 +405,17 @@ def _flat(r: dict) -> dict:
             phones = None
     if isinstance(phones, list) and phones:
         out["site_phones"] = phones
+    # T535 (2026-09-10): how many crawls the website has had. `supa._COLS` (the SaaS
+    # table's shape) lacks the column, so it never reached the CRM: every row the agent
+    # had given up on (dns, http_404, …) sat at attempts=0 there and counted as pending
+    # work forever. The CRM's `sync` accepts it since the same-day Edge Function deploy;
+    # 0 is a real value here (a fresh lead), so only a missing key is dropped.
+    att = r.get("enrich_attempts")
+    if att is not None:
+        try:
+            out["enrich_attempts"] = int(att)
+        except (TypeError, ValueError):
+            pass
     return out
 
 

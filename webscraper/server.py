@@ -439,21 +439,18 @@ class Worker(threading.Thread):
                     # at that lane's own Store before touching the DB.
                     disc["store"] = lane.store
                     store = lane.store
-                    # "Extend & scrape the pending N": open only the links the capped run
-                    # never visited — one pass, no new Maps search (T172).
-                    if int(_col(job, "discovery_pending", 0) or 0):
+                    stub_pass = {"done": False}     # W98: the reopen-stubs pass runs at most once per run
+
+                    def _open_pending(message: str) -> None:
+                        """Open only the links never visited (or handed back by
+                        `reopen_stub_links`) — one pass, no new Maps search (T172)."""
                         from webscraper.maps import FeedCard
-                        # W62: places whose panel never opened count as pending too. Their
-                        # link says opened=1, so without this they were invisible to every
-                        # re-run the CRM offers (see Store.reopen_stub_links).
-                        again = store.reopen_stub_links(job_id)
-                        if again:
-                            store.log(job_id, "discovery",
-                                      f"re-opening {again} place(s) saved without their details")
                         pend = [FeedCard(href=r["href"], name=r["name"], rating=r["rating"],
                                          reviews_count=r["reviews"], lat=r["lat"], lng=r["lng"])
                                 for r in store.pending_links(job_id)]
-                        store.update_job(job_id, message=f"opening the {len(pend)} places the last run never reached…")
+                        if not pend:
+                            return
+                        store.update_job(job_id, message=message.format(n=len(pend)))
                         a0 = areas[0]
                         run_scrape(store, job_id, job["query"], a0["location"], 0, pacing,
                                    # W65 (user directive 2026-09-08): Google Maps always runs
@@ -466,6 +463,23 @@ class Worker(threading.Thread):
                                    radius_km=a0["radius_km"], wait_if_paused=wait_if_paused,
                                    center=a0["center"], known_keys=None,
                                    preset_links=pend)
+
+                    def _reopen_stubs() -> int:
+                        # W62: places whose panel never opened count as pending too. Their
+                        # link says opened=1, so without this they were invisible to every
+                        # re-run the CRM offers (see Store.reopen_stub_links).
+                        stub_pass["done"] = True
+                        again = store.reopen_stub_links(job_id)
+                        if again:
+                            store.log(job_id, "discovery",
+                                      f"re-opening {again} place(s) saved without their details")
+                        return again
+
+                    # "Extend & scrape the pending N": open only the links the capped run
+                    # never visited — one pass, no new Maps search (T172).
+                    if int(_col(job, "discovery_pending", 0) or 0):
+                        _reopen_stubs()
+                        _open_pending("opening the {n} places the last run never reached…")
                         store.update_job(job_id, discovery_pending=0)
                         areas_to_run: list = []
                     else:
@@ -485,6 +499,16 @@ class Worker(threading.Thread):
                         cur = store.get_job(job_id)
                         agg["scraped_base"] = int(cur["scraped_count"] or 0)
                         agg["links_total"] = int(cur["links_found"] or 0)
+
+                    # W98: discovery finishes its own leftovers. A run that opened every link
+                    # could still end "completed" with places saved from the feed card whose
+                    # panel never rendered (#6611: 795/795 opened, 103 stubs) — and only a
+                    # CRM re-run with discovery_pending ever reopened them, so the job flipped
+                    # Incomplete instead. One extra pass over the stubs, before the lane
+                    # reports; never when the clock ran out or a stop was asked for.
+                    if (not stub_pass["done"] and not time_up["flag"] and not should_stop()
+                            and _reopen_stubs()):
+                        _open_pending("re-opening {n} place(s) saved without their details…")
 
                     # Record how fast Maps actually went, so the NEXT job's ETA is grounded
                     # in this machine's real pace instead of a constant (W4).

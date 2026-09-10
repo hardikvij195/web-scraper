@@ -600,30 +600,42 @@ class Store:
 
         The Maps phone is offered as soon as the opener has written it — no waiting for
         enrichment — and the website's numbers (wa.me link, listed phones) join once
-        `enrich_status` has resolved. A number with ANY row in `wa_checks` (yes / no /
-        unknown) is not offered again in this run: re-checking an 'unknown' every poll
-        would loop the lane for ever; the CRM's Re-verify is the deliberate retry."""
+        `enrich_status` has resolved. A number is settled once it has a yes / no verdict OR
+        two `wa_checks` rows; a number whose only row says 'unknown' is offered ONE more time
+        (W97), after every fresh number — WhatsApp Web not being ready (W96) was behind most
+        of those, and a second look decides them. The 2-row cap is the bound that keeps the
+        lane from re-checking an unknown every poll for ever; the CRM's Re-verify remains
+        the deliberate retry beyond that."""
         scope, args = self._scope_clause(job_id)
         rows = self.conn.execute(
-            "SELECT p.*, (SELECT group_concat(number, ' ') FROM wa_checks w "
-            "  WHERE w.job_id=p.job_id AND w.place_key=p.place_key) AS _checked "
+            "SELECT p.*, (SELECT group_concat(number || ':' || v, ' ') FROM ("
+            "    SELECT number, CASE WHEN SUM(verdict IN ('yes','no')) > 0 OR COUNT(*) >= 2 "
+            "                       THEN 'done' ELSE 'retry' END AS v "
+            "    FROM wa_checks w WHERE w.job_id=p.job_id AND w.place_key=p.place_key "
+            "    GROUP BY number)) AS _checked "
             "FROM places p WHERE p.job_id=? "
             "AND (COALESCE(p.phone,'') <> '' OR COALESCE(p.whatsapp_number,'') <> '' "
             "     OR COALESCE(p.site_phones,'') NOT IN ('', '[]'))" + scope
             + " ORDER BY p.rowid", (job_id, *args)).fetchall()
-        out: list[dict[str, Any]] = []
+        fresh: list[dict[str, Any]] = []
+        retry: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
-            checked = {_digits_only(x) for x in (d.pop("_checked") or "").split()}
+            checked: dict[str, str] = {}
+            for tok in (d.pop("_checked") or "").split():
+                num, _, state = tok.rpartition(":")
+                checked[_digits_only(num)] = state
             for number, source in wa_candidates(d):
-                if _digits_only(number) in checked:
+                state = checked.get(_digits_only(number))
+                if state == "done":
                     continue
                 item = dict(d)
                 item["number"], item["source"] = number, source
-                out.append(item)
-                if limit is not None and len(out) >= limit:
-                    return self._decode_json_cols(out)
-        return self._decode_json_cols(out)
+                (retry if state == "retry" else fresh).append(item)
+                if limit is not None and len(fresh) >= limit:
+                    return self._decode_json_cols(fresh[:limit])
+        out = fresh + retry
+        return self._decode_json_cols(out if limit is None else out[:limit])
 
     def pending_wa_verify(self, job_id: int, limit: int = 25) -> list[dict[str, Any]]:
         """Numbers to check next: (place row + `number` + `source`) tuples, feed order."""

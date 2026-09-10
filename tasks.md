@@ -26,6 +26,30 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W98** `server.py` (CRM T535) — discovery finishes its own stubs. A run that opened every link could
+  still end "completed" with places saved from the feed card whose panel never rendered (#6611:
+  795/795 opened, 103 stubs, #6610: 4) — only a CRM re-run with `discovery_pending` ever reopened
+  them, so the CRM's outstanding check flipped the job Incomplete. The pending-links pass is now a
+  helper (`_open_pending`) shared with the `discovery_pending` branch; after the areas loop, when the
+  clock has not run out and no stop was asked for, `reopen_stub_links` + one pass over them (at most
+  once per run, Maps headed as always — W65). The CRM side (T535) re-queues a finishing job itself,
+  at most twice, when anything is still outstanding — `discovery_pending` when stubs remain, else
+  re-enrich / re-verify — instead of marking it Incomplete. VERSION 1.7.4.
+- [x] **W97** `store.py` (CRM T535) — one automatic retry for an 'unknown' verdict. `_wa_unchecked`
+  used to treat a number with ANY `wa_checks` row as checked, so an unknown never healed inside a
+  run (only the CRM's Re-verify). A number is now settled once it has a yes/no verdict OR two
+  `wa_checks` rows; a number whose only row is 'unknown' is offered once more, after every fresh
+  number in the batch. The 2-row cap is the bound the old docstring feared was missing.
+- [x] **W96** `wa_verify.py` (CRM T535) — sync-aware decide. MI answered 'unknown' on 412 of 699
+  checks (59 %), DELL on 83/131: the WhatsApp lane relaunches Chrome per 25-number batch, a real
+  account re-syncs on every boot ("messages are downloading" at every batch boundary in the logs),
+  and each send-URL goto is a full reload that can land on the sync splash / a blank page — 25 s
+  later `_decide` gave up. Sessions were linked the whole time; the client was not ready. When
+  `_decide` says unknown and `_boot_state` is syncing/blank, `_check` waits for the client once
+  (`wait_boot`, ≤ 120 s), reloads the number and decides again — one retry, logged at info.
+  `_CHECK_TIMEOUT_MS` unchanged. `agent.py::_flat` also ships `enrich_attempts` to the CRM now
+  (the Edge Function accepts it since T535): rows the agent gave up on (dns, http_404, …) sat at
+  attempts=0 in the CRM and counted as pending work forever (#51/#52).
 - [x] **W95** `store.py` (CRM T534) — `wa_candidates` no longer offers a wa.me number with a leading 0
   as-is (no country code starts with 0): it is re-read as a national number for the lead's region
   or dropped. Job #30's "+090968645850" link answered "unknown" on every check and kept the job

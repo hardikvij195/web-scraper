@@ -519,6 +519,17 @@ def verify_places(
             try:
                 page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
                 st = _decide(page)
+                if st == "unknown" and _boot_state(page) in ("syncing", "blank"):
+                    # W96: "could not decide" was mostly WhatsApp Web not being ready, not the
+                    # number. The lane relaunches Chrome per batch, a real account re-syncs on
+                    # every boot, and each send-URL goto is a full reload that can land on the
+                    # sync splash / a blank page again — 25 s later `_decide` gave up. MI
+                    # answered 'unknown' on 59 % of 699 checks that way, DELL on 63 %. Wait
+                    # for the client once (bounded), reload the number, decide again.
+                    wait_boot(page, name, blank_ms=40_000, sync_max_sec=min(wa_sync_max_sec(), 120))
+                    page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
+                    st = _decide(page)
+                    log.info("[%s] number %s: WhatsApp Web was still syncing — re-checked (%s)", name, num, st)
                 _dismiss_popup(page)
                 return st
             except PWTimeout:                 # subclass of PWError - must stay above it
