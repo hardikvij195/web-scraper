@@ -26,6 +26,17 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W99** `store.py` (CRM T536) — W97's one-retry cap never fired. `wa_checks` is keyed
+  (job_id, place_key, number) and `record_wa_check` UPSERTs — a second look overwrites the first
+  row — so W97's `COUNT(*) >= 2` settle rule counted a row that could not exist: an 'unknown' was
+  re-offered on EVERY poll and a WhatsApp lane could loop on its unknowns instead of finishing
+  (1.7.4 was live on all five agents). Now `wa_checks.checks` (migrated in, default 1) is bumped
+  by the upsert, which keeps the newest verdict / account / time; a number is settled by a yes/no
+  verdict OR `checks >= 2`, and only an 'unknown' with `checks < 2` goes to the retry list (still
+  after every fresh number). The `wa_numbers` summary on `places` becomes
+  `[{number, source, verdict, checks}]` so the CRM (`lead_gen_job_outstanding`, the lane card)
+  applies the same rule: no job is Done while a number is undecided, and undecided means "not
+  yet looked at twice". Tests: `tests/test_w99_wa_unknown_twice.py` (3). 182 pass. VERSION 1.7.5.
 - [x] **W98** `server.py` (CRM T535) — discovery finishes its own stubs. A run that opened every link could
   still end "completed" with places saved from the feed card whose panel never rendered (#6611:
   795/795 opened, 103 stubs, #6610: 4) — only a CRM re-run with `discovery_pending` ever reopened

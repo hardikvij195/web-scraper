@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS wa_checks (
   verdict TEXT NOT NULL,                -- yes | no | unknown
   checked_at TEXT NOT NULL,
   account TEXT,
+  checks INTEGER NOT NULL DEFAULT 1,    -- W99: how many times this number was checked
   PRIMARY KEY (job_id, place_key, number)
 );
 """
@@ -303,7 +304,7 @@ class Store:
                          # website to crawl. Existing rows were all opened → 'done'.
                          ("detail_status", "TEXT"),
                          ("site_phones", "TEXT"),      # JSON list, E.164 '+' (W26)
-                         ("wa_numbers", "TEXT")):      # JSON [{number, source, verdict}] (W26)
+                         ("wa_numbers", "TEXT")):      # JSON [{number, source, verdict, checks}] (W26/W99)
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
         self.conn.execute("UPDATE places SET detail_status='done' WHERE detail_status IS NULL")
@@ -400,6 +401,13 @@ class Store:
         pcols = {r[1] for r in self.conn.execute("PRAGMA table_info(places)")}
         if "enrich_attempts" not in pcols:
             self.conn.execute("ALTER TABLE places ADD COLUMN enrich_attempts INTEGER NOT NULL DEFAULT 0")
+        # W99: how many times a number was checked. `wa_checks` is keyed per number and
+        # `record_wa_check` UPSERTs, so a second look never added a second row — W97's
+        # "COUNT(*) >= 2" settle rule could never fire and an 'unknown' was re-offered
+        # on every poll. The counter is what the cap is measured against now.
+        wcols = {r[1] for r in self.conn.execute("PRAGMA table_info(wa_checks)")}
+        if "checks" not in wcols:
+            self.conn.execute("ALTER TABLE wa_checks ADD COLUMN checks INTEGER NOT NULL DEFAULT 1")
         # W79: which key of the provider answered (multi-key registry, CRM T478).
         ucols = {r[1] for r in self.conn.execute("PRAGMA table_info(ai_usage)")}
         if "key_index" not in ucols:
@@ -601,18 +609,19 @@ class Store:
         The Maps phone is offered as soon as the opener has written it — no waiting for
         enrichment — and the website's numbers (wa.me link, listed phones) join once
         `enrich_status` has resolved. A number is settled once it has a yes / no verdict OR
-        two `wa_checks` rows; a number whose only row says 'unknown' is offered ONE more time
-        (W97), after every fresh number — WhatsApp Web not being ready (W96) was behind most
-        of those, and a second look decides them. The 2-row cap is the bound that keeps the
-        lane from re-checking an unknown every poll for ever; the CRM's Re-verify remains
-        the deliberate retry beyond that."""
+        has been checked twice (`wa_checks.checks >= 2`, W99); an 'unknown' checked only
+        once is offered ONE more time (W97), after every fresh number — WhatsApp Web not
+        being ready (W96) was behind most of those, and a second look decides them. The
+        2-check cap is the bound that keeps the lane from re-checking an unknown every poll
+        for ever (W97 counted ROWS, and the upsert in `record_wa_check` never makes a second
+        row, so that cap never fired); the CRM's Re-verify remains the deliberate retry
+        beyond that."""
         scope, args = self._scope_clause(job_id)
         rows = self.conn.execute(
             "SELECT p.*, (SELECT group_concat(number || ':' || v, ' ') FROM ("
-            "    SELECT number, CASE WHEN SUM(verdict IN ('yes','no')) > 0 OR COUNT(*) >= 2 "
+            "    SELECT number, CASE WHEN verdict IN ('yes','no') OR COALESCE(checks, 1) >= 2 "
             "                       THEN 'done' ELSE 'retry' END AS v "
-            "    FROM wa_checks w WHERE w.job_id=p.job_id AND w.place_key=p.place_key "
-            "    GROUP BY number)) AS _checked "
+            "    FROM wa_checks w WHERE w.job_id=p.job_id AND w.place_key=p.place_key)) AS _checked "
             "FROM places p WHERE p.job_id=? "
             "AND (COALESCE(p.phone,'') <> '' OR COALESCE(p.whatsapp_number,'') <> '' "
             "     OR COALESCE(p.site_phones,'') NOT IN ('', '[]'))" + scope
@@ -643,8 +652,8 @@ class Store:
 
     def wa_checks(self, job_id: int, place_key: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute(
-            "SELECT number, source, verdict, checked_at, account FROM wa_checks "
-            "WHERE job_id=? AND place_key=? ORDER BY rowid", (job_id, place_key))]
+            "SELECT number, source, verdict, checked_at, account, COALESCE(checks, 1) AS checks "
+            "FROM wa_checks WHERE job_id=? AND place_key=? ORDER BY rowid", (job_id, place_key))]
 
     def record_wa_check(self, job_id: int, place_key: str, number: str, source: str,
                         verdict: str, account: str | None = None) -> tuple[str, str | None]:
@@ -655,17 +664,20 @@ class Store:
         order (source 'verified'). When everything checked said 'no', a guessed
         ('unverified') candidate is cleared so it never lingers as if it were a WhatsApp;
         a Maps/site WhatsApp link that failed the check is kept as the link it is.
-        Returns the new (wa_verified, whatsapp_number)."""
+        One row per number: a re-check keeps the newest verdict / account / time and bumps
+        `checks` (W99) — that counter, not a row count, is what settles an 'unknown' after
+        its second look (`_wa_unchecked`). Returns the new (wa_verified, whatsapp_number)."""
         e164 = plus(number)
         self.conn.execute(
-            "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account) "
-            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
+            "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account, checks) "
+            "VALUES (?,?,?,?,?,?,?,1) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
             "source=excluded.source, verdict=excluded.verdict, checked_at=excluded.checked_at, "
-            "account=excluded.account",
+            "account=excluded.account, checks=COALESCE(wa_checks.checks, 1) + 1",
             (job_id, place_key, e164, source, verdict, now_iso(), account))
         checks = self.wa_checks(job_id, place_key)
         agg, wa_num = aggregate_wa(checks)
-        summary = json.dumps([{"number": c["number"], "source": c["source"], "verdict": c["verdict"]}
+        summary = json.dumps([{"number": c["number"], "source": c["source"], "verdict": c["verdict"],
+                               "checks": int(c.get("checks") or 1)}
                               for c in checks], ensure_ascii=False)
         self.conn.execute(
             "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=?, wa_numbers=? "

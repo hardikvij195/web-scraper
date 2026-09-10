@@ -131,9 +131,9 @@ def test_wa_pending_offers_maps_phone_before_enrichment_and_site_numbers_after(d
     row = s.places(jid)[0]
     assert row["whatsapp_number"] == "+919999999999", "wa_link beats site for the promoted number"
     assert json.loads(row["wa_numbers"]) == [
-        {"number": "+919876543210", "source": "maps", "verdict": "no"},
-        {"number": "+912012345678", "source": "site", "verdict": "yes"},
-        {"number": "+919999999999", "source": "wa_link", "verdict": "yes"},
+        {"number": "+919876543210", "source": "maps", "verdict": "no", "checks": 1},
+        {"number": "+912012345678", "source": "site", "verdict": "yes", "checks": 1},
+        {"number": "+919999999999", "source": "wa_link", "verdict": "yes", "checks": 1},
     ]
     assert s.pending_wa_verify(jid, 25) == [] and s.count_wa_done(jid) == 3
     s.close()

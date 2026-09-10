@@ -161,8 +161,11 @@ launch (one pick per launch); httpx/curl_cffi rotate per attempt.
   (`site_phones`, `site`), deduped on digits. The Maps phone is checked as soon as the
   opener writes it; site numbers join once `enrich_status` resolves. `record_wa_check`
   re-derives `wa_verified` (any yes → yes, all no → no, else unknown), `whatsapp_number`
-  (first yes in that priority, source `verified`) and the `wa_numbers` JSON summary. The WA
-  lane's done/total are numbers, not places.
+  (first yes in that priority, source `verified`) and the `wa_numbers` JSON summary
+  (`[{number, source, verdict, checks}]`). One row per number: a re-check overwrites the
+  verdict and bumps `wa_checks.checks` (W99) — an 'unknown' is re-offered once and is settled
+  after its second check; the CRM applies the same `checks >= 2` rule. The WA lane's done/total
+  are numbers, not places.
 - **Lanes (2026-08-23, `lanes.py`): the `places` table is the queue.** Discovery, enrichment
   and WhatsApp run concurrently; each owns its **own `Store`** (sqlite3 connections are not
   thread-safe) and each writes **disjoint columns** (`disc_*` / `enr_*` / `wa_*` plus its own
