@@ -26,6 +26,15 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W104** `agent.py` + `store.py` (CRM T547) — the WhatsApp-only re-run over CRM rows
+  (`_reverify_wa` → Edge Fn `set_wa`) sent only `wa_verified` per lead, never the per-number
+  history, so the CRM's `wa_numbers[].checks` never moved: a number still undecided after its
+  second look stayed "outstanding" for ever (T536 rule) → Incomplete → follow-up 2/2 → Incomplete
+  for good. Now every verdict ships a delta `{number, source, verdict, checks: 1}` the Edge
+  Function merges by number (counts accumulate). Same gap the other way: a re-run hydrated on a
+  fresh machine started every number at zero and its later wholesale `sync` wrote `checks: 1`
+  over the CRM's 2 — `Store.seed_wa_checks` now seeds local `wa_checks` from the CRM's
+  `wa_numbers` (Edge Fn `results` ships it), higher count wins. `tests/test_w104_reverify_checks.py`.
 - [x] **W103** `maps.py` (CRM T546) — one place's `net::ERR_ABORTED` ended the discovery lane.
   `1 - PC` job #1625 / local 54: discovery at 7h18m, 1455/1578 places opened, 09:15:34 UTC —
   `page.goto` on `Lifespan Mortgage Services` raised `Page.goto: net::ERR_ABORTED`, then

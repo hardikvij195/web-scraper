@@ -1453,7 +1453,7 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
         log.warning("re-verify #%s: could not fetch results: %s", jid, e)
         cloud.done(jid, "error", "could not fetch results")
         return
-    from webscraper.store import aggregate_wa, wa_candidates
+    from webscraper.store import aggregate_wa, plus, wa_candidates
     if leads_verify:
         # One number per lead, decided server-side. A lead without a number is not a target.
         targets = [dict(r, source=r.get("source") or "leads") for r in rows if r.get("number")]
@@ -1552,6 +1552,12 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
         r0 = name_by_pk.get(pk, {})
         _jlog(_wa_line(r0, status, num, source))
         upd: dict[str, Any] = {"place_key": pk, "wa_verified": agg}
+        # W104 (CRM T547): this run's verdict for THIS number, as a delta the Edge Function
+        # merges into the lead's wa_numbers by number — `checks: 1` = "one more look
+        # happened now". Without it the CRM never saw a second check from a re-verify, so a
+        # number still undecided after two looks stayed "outstanding" for ever (T536 rule).
+        if num:
+            upd["wa_numbers"] = [{"number": plus(num), "source": source or "maps", "verdict": status, "checks": 1}]
         # Confirmed hit -> promote the verified number + mark source 'verified' (drops an
         # 'unverified' guess). Every number a miss on a guessed number -> clear it.
         # 'assumed_mobile' is the retired spelling of 'unverified' (2026-08-23); still
@@ -1695,11 +1701,9 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
     - `upsert_place()`'s own COALESCE-don't-overwrite behaviour is irrelevant on a
       genuinely fresh local job (nothing to preserve yet) but is left completely
       unmodified — this function is a plain caller of it, not a variant.
-    - Known, accepted gap: local `wa_checks` (per-number WhatsApp history) is NOT
-      synced to the CRM anywhere, so a hydrated `both`-mode re-run's WhatsApp lane will
-      re-check numbers that a prior run already decided — wasted daily-cap budget, not
-      a correctness bug (re-confirming a known "yes"/"no" just reconfirms it). Left as
-      a known limitation rather than guessed at with synthetic `wa_checks` rows.
+    - W104 closed the old gap: the CRM's `wa_numbers` (per-number verdict + `checks`)
+      now seeds local `wa_checks` (`Store.seed_wa_checks`), so a hydrated re-run skips
+      settled numbers and never writes a lower `checks` back over the CRM's count.
     """
     rows = cloud.results(cloud_job_id)
     if not rows:
@@ -1718,6 +1722,12 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
             enrich_status=r.get("enrich_status") or "pending",
         )
         store.upsert_place(p)
+        # W104: the CRM's per-number WhatsApp history (verdict + how many looks) seeds the
+        # local `wa_checks`, so the lane skips what is settled and a later `sync` cannot
+        # write a lower count back. Needs the Edge Function's `results` to ship wa_numbers.
+        wn = r.get("wa_numbers")
+        if isinstance(wn, list) and wn:
+            store.seed_wa_checks(local_id, str(pk), wn)
         err = r.get("enrich_error")
         if err:
             # Not a Place/PLACE_COLS field (see store.py's _migrate) — same column

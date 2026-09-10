@@ -695,6 +695,33 @@ class Store:
         self.conn.commit()
         return agg, wa_num
 
+    def seed_wa_checks(self, job_id: int, place_key: str, entries: list[dict[str, Any]]) -> int:
+        """W104: carry the CRM's per-number WhatsApp history into a fresh local mirror.
+
+        A "finish everything pending" re-run hydrated on another machine used to start every
+        number at zero checks: its lane re-checked decided numbers (wasted daily cap) and the
+        later wholesale `sync` of `wa_numbers` wrote `checks: 1` over the CRM's 2 — undoing
+        the T536 "settled after two looks" rule. Seeds `wa_checks` from the CRM's
+        `wa_numbers` entries; on a number already known here the higher count wins and the
+        CRM's verdict is kept only when this machine has none newer. Returns rows written."""
+        n = 0
+        for e in entries or []:
+            number = e.get("number") if isinstance(e, dict) else None
+            if not number:
+                continue
+            digits = _digits_only(number)
+            if not (8 <= len(digits) <= 15):
+                continue
+            verdict = str(e.get("verdict") or "unknown")
+            checks = max(1, int(e.get("checks") or 1))
+            self.conn.execute(
+                "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account, checks) "
+                "VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
+                "checks=MAX(COALESCE(wa_checks.checks, 1), excluded.checks)",
+                (job_id, place_key, "+" + digits, str(e.get("source") or "maps"), verdict, now_iso(), checks))
+            n += 1
+        return n
+
     def job_place_keys(self, job_id: int) -> list[str] | None:
         """The subset this job is scoped to, or None for "every lead in the job"."""
         r = self.conn.execute("SELECT place_keys FROM jobs WHERE id=?", (job_id,)).fetchone()
