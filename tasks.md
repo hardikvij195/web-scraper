@@ -26,6 +26,16 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W107** `scripts/vwe-wa-check.py` (CRM T562) — does each Valve World exhibitor's number
+  exist on WhatsApp? One number per company (published wa.me link > expo phone > first website
+  phone; only fully-qualified +E.164 — a guessed country code would be a wrong verdict), checked
+  through `wa_verify.verify_places` with the machine's linked accounts, one thread per account,
+  headless. Every verdict is appended to a `.wa.jsonl` checkpoint before the next number, so a
+  stop costs nothing and `--resume` is the default. Writes `whatsapp_exists` /
+  `whatsapp_checked_number` / `whatsapp_checked_at` back into the workbook (green = yes).
+  492 numbers in 33 min on the PC's two accounts (14.9/min): 44 yes, 448 no, 0 unknown.
+  ⚠ It needs the machine's WhatsApp profiles, so the running Lead Finder job has to be paused
+  first (T397: a second launch on a live profile evicts the holder and breaks that job's lane).
 - [x] **W106** `scripts/vwe-scrape.py` (CRM T561) — VALVE WORLD EXPO 2026 exhibitor directory →
   Excel. The public page is an empty shell; the data is the Messe Düsseldorf **VIS JSON API**
   (`/vis-api/vis/v1/en/...`) and every call needs the header `x-vis-domain: <host>` — without it
