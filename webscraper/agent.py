@@ -1486,6 +1486,52 @@ def _poll_command(cloud: "CrmCloud") -> None:
     _cmd_thread.start()
 
 
+#: W109: the Store of the slice thread running right now (unset on the re-verify's own
+#: thread). The shared progress callback logs through it — never another thread's sqlite.
+_SLICE_STORE = threading.local()
+
+
+def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp) -> dict:
+    """W109: verify `targets` split round-robin across `accounts`, one thread per account.
+
+    Each slice pins its account (`account=`, so two threads never share a Chrome profile) and
+    opens its OWN Store on the same file — sqlite connections are not thread-safe. `onp` is
+    shared and must already be locked by the caller. A slice that fails (logged out, never
+    rendered) takes only its own share down; the rest finish. All failing = the first error.
+    """
+    from webscraper import wa_verify
+    slices = [targets[i::len(accounts)] for i in range(len(accounts))]
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run_slice(rows: list[dict], name: str) -> None:
+        st = Store(store.path)
+        _SLICE_STORE.st = st
+        try:
+            results.append(wa_verify.verify_places(st, rows, on_progress=onp, job_id=None, account=name))
+        except BaseException as e:                                # noqa: BLE001
+            errors.append(e)
+            log.warning("re-verify slice %s failed: %s", name, e)
+        finally:
+            try:
+                st.close()
+            except Exception:                                     # noqa: BLE001
+                pass
+
+    ts = [threading.Thread(target=run_slice, args=(sl, accounts[i]), name=f"reverify-wa-{i}", daemon=True)
+          for i, sl in enumerate(slices) if sl]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    if errors and not results:
+        raise errors[0]
+    out = {k: sum(int(r.get(k, 0) or 0) for r in results)
+           for k in ("yes", "no", "unknown", "checked", "no_number")}
+    out["capped"] = any(bool(r.get("capped")) for r in results)
+    return out
+
+
 def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool = False) -> None:
     """Verify an existing CRM job's numbers on WhatsApp and sync wa_verified back.
     No scraping/enriching — operates purely on the job's already-synced results.
@@ -1527,13 +1573,16 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     # passed through untouched — the CRM renders "estimating…" for it.
     started = time.monotonic()
     started_iso = datetime.now(timezone.utc).isoformat()
+    # Read once, here: `wa_progress` also runs on W109 slice threads, which must never touch
+    # this thread's sqlite connection.
+    hist_rate = store.phase_rate("verifying_wa")
 
     def wa_progress(done: int, reason: str | None = None) -> dict:
         """`reason` set = the final picture: the lane ended with that token (completed /
         wa_daily_cap / ...). Without it the CRM saw a lane that never reported an ending
         and printed "Interrupted · the job stopped before this lane reported finishing"
         for a plain daily-cap stop (job #14, 2026-08-25)."""
-        per = ((time.monotonic() - started) / done) if done >= 3 else store.phase_rate("verifying_wa")
+        per = ((time.monotonic() - started) / done) if done >= 3 else hist_rate
         eta_sec = round(max(0, total - done) * per) if per else None
         src = "live" if done >= 3 else "history"
         ended = reason is not None
@@ -1577,7 +1626,7 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     def _jlog(msg: str, level: str = "info") -> None:
         if local_log_id is not None:
             try:
-                store.log(local_log_id, "whatsapp", msg, level)
+                (getattr(_SLICE_STORE, "st", None) or store).log(local_log_id, "whatsapp", msg, level)
             except Exception:                                     # noqa: BLE001
                 pass
 
@@ -1593,7 +1642,11 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     def _n_checked() -> int:
         return sum(len(v) for v in checks.values())
 
-    def onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
+    # W109 (CRM T576): parallel slices all report through this one callback, and it mutates
+    # `checks` / `collected` and talks to the CRM — one verdict at a time.
+    _onp_lock = threading.Lock()
+
+    def _onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
         checks.setdefault(pk, []).append({"number": num, "source": source, "verdict": status})
         agg, wa_num = aggregate_wa(checks[pk])
         collected[pk] = agg
@@ -1626,10 +1679,27 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
         except httpx.HTTPError as e:
             log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
 
+    def onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
+        with _onp_lock:
+            _onp(pk, status, num, source)
+
+    # W109 (CRM T576): one WhatsApp session per linked account, at once — the same ceiling
+    # the live WhatsApp lane uses (W76: min(wa_parallel__<device>, linked accounts)). A
+    # re-verify used to rotate every account on ONE thread: 20,868 leads on the PC's two
+    # accounts read ~77 h; the Mac's four accounts sat idle but for one at a time.
+    from webscraper.lanes import _wa_parallel
+    accounts = store.enabled_wa_accounts()
+    n_par = max(1, min(_wa_parallel(), len(accounts)))
+
     try:
-        # job_id=None → verify_places won't touch the local store's places (they aren't
-        # here); `store` is still used for WA account rotation + daily caps.
-        res = wa_verify.verify_places(store, targets, on_progress=onp, job_id=None)
+        if n_par > 1 and len(targets) > 1:
+            _jlog(f"{n_par} WhatsApp sessions in parallel — {', '.join(accounts[:n_par])}")
+            log.info("re-verify #%s: %d parallel sessions (%s)", jid, n_par, ", ".join(accounts[:n_par]))
+            res = _verify_slices(store, targets, accounts[:n_par], onp)
+        else:
+            # job_id=None → verify_places won't touch the local store's places (they aren't
+            # here); `store` is still used for WA account rotation + daily caps.
+            res = wa_verify.verify_places(store, targets, on_progress=onp, job_id=None)
     except wa_verify.WaNotLoggedIn as e:
         cloud.done(jid, "error", f"WhatsApp verify skipped — {e}")
         return

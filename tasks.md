@@ -26,6 +26,14 @@
   (local `ai_usage`, shipped to `lead_gen_ai_usage`) carry `key_index`. ⚠ Config → env
   happens once at agent start, so every agent needs a restart to see a newly added key.
   Tests: `tests/test_research_keys.py` (7, no network). 147 pass / 1 skipped. VERSION 1.5.5.
+- [x] **W109** `agent.py` (CRM T576, 2026-09-11) — a re-verify / leads-verify now runs one
+  WhatsApp session per linked account AT ONCE (`_verify_slices`, same ceiling as the live lane:
+  `min(wa_parallel__<device>, linked accounts)`). It used to rotate every account on one thread:
+  20,868 CRM leads on the PC's two accounts read ~77 h while the Mac's four accounts idled.
+  Each slice pins its account, opens its own `Store`; the shared `onp` callback is locked and
+  never touches the caller's sqlite (history rate read once up front, `_jlog` logs through the
+  slice's Store via `_SLICE_STORE`). One slice failing (logged out / never rendered) leaves the
+  rest running. Tests: `tests/test_w109_reverify_parallel.py` (3). 223 pass / 1 skipped. VERSION 1.8.6.
 - [x] **W108** `agent.py` + `wa_verify.py` (CRM T566) — the Mac looked offline for 6 minutes
   (2026-09-10 17:43–17:49) and its Restart went unanswered. The WhatsApp-only re-verify ran
   inside `_tick` on the main loop, and the main loop is what heartbeats and polls commands.
