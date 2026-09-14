@@ -426,6 +426,8 @@ class Worker(threading.Thread):
                         store.update_job(job_id, message=(
                             f"{pfx}{why} at tile {data['tile']}/{data['tiles']} — "
                             f"scraping the {data['count']} places found so far"))
+                    elif kind == "plan":                       # W112: coverage for the CRM
+                        store.update_job(job_id, collect_stats=data)
                     elif kind == "tile_retry":                 # W111
                         store.log(job_id, "discovery",
                                   f"tile {data['tile']}/{data['tiles']}: Google Maps timed out — retrying it once ({data['error']})", "warn")

@@ -446,6 +446,29 @@ def _open_context(pw, launch_kwargs: dict):
     return c, pg
 
 
+#: W112 (CRM T608): keywords run in BANDS of this size across EVERY map area before the next
+#: band starts. Category jobs carry 350–950 keywords; the old centre-major order ran all of
+#: them in one area first, so an 8 h job searched ~1 of its ~89 areas (UK Health & Medical:
+#: 950 keywords, 84,550 steps, <1 % covered). Now the top keywords cover the whole circle.
+TOP_KEYWORDS = 25
+
+
+def keyword_bands(queries: list[str], size: int = TOP_KEYWORDS) -> list[list[str]]:
+    qs = [q for q in queries if q] or [""]
+    return [qs[i:i + size] for i in range(0, len(qs), size)]
+
+
+def plan_steps(bands: list[list[str]], centers: list, tile_km: float) -> list[tuple]:
+    """(keyword, centre, tile_km, band) — band-major; within a band each centre sweeps its keywords."""
+    return [(qy, c, tile_km, b) for b, band in enumerate(bands) for c in centers for qy in band]
+
+
+def step_key(qy: str, c, tk: float | None, band: int) -> str:
+    """Stable id of one (band, centre, tile size, keyword) search — what a re-run skips (W112)."""
+    cc = "none" if c is None else f"{c[0]:.5f},{c[1]:.5f}"
+    return f"{band}|{cc}|{float(tk or 0):.3f}|{qy}"
+
+
 def _card_from_link(r: dict) -> FeedCard:
     return FeedCard(href=r["href"], name=r.get("name"), rating=r.get("rating"),
                     reviews_count=r.get("reviews"), lat=r.get("lat"), lng=r.get("lng"))
@@ -518,14 +541,36 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 # Centre-major, NOT query-major: each centre sweeps every keyword, so a
                 # truncated run still leaves every keyword represented. `steps` GROWS while
                 # we walk it (children of a saturated tile are appended), so index by hand.
-                steps: list[tuple[str, tuple[float, float], float]] = [(qy, c, tile_km) for c in centers for qy in queries]
+                # W112 (CRM T608): keyword bands across every area (see TOP_KEYWORDS), and a
+                # re-run of this job on this machine carries on from the steps already searched.
+                bands = keyword_bands(queries)
+                steps: list[tuple] = plan_steps(bands, centers, tile_km)
+                done_steps = cstore.collect_steps_done(job_id)
+                if done_steps and all(step_key(*st) in done_steps for st in steps):
+                    cstore.clear_collect_steps(job_id)            # all searched before: a fresh pass
+                    done_steps = set()
+                top_left = {c0: sum(1 for qy0 in bands[0] if step_key(qy0, c0, tile_km, 0) not in done_steps)
+                            for c0 in centers}
+                run_t0 = time.monotonic()
+                run_steps = 0
+
+                def emit_plan() -> None:
+                    emit("plan", {"steps_total": len(steps), "steps_done": len(done_steps),
+                                  "areas_total": len(centers),
+                                  "areas_top_done": sum(1 for v in top_left.values() if v <= 0),
+                                  "top_keywords": len(bands[0]), "keywords_total": len(queries),
+                                  "pace_sec": round((time.monotonic() - run_t0) / run_steps, 1) if run_steps else None})
+                emit_plan()
                 tile_hits: dict[tuple[float, float], int] = {}
                 tiles_seen: set[tuple[float, float]] = set(centers)
                 s_i = 0
                 fail_streak = 0
                 while s_i < len(steps):
                     s_i += 1
-                    qy, c, tk = steps[s_i - 1]
+                    qy, c, tk, band = steps[s_i - 1]
+                    key = step_key(qy, c, tk, band)
+                    if key in done_steps:
+                        continue                                  # W112: searched in an earlier run
                     tile_zoom = zoom_for_radius_km(tk) if tiling else zoom
                     if stop_ev.is_set() or len(merged) >= limit:
                         break
@@ -609,6 +654,13 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                         cstore.save_links(job_id, fresh)
                     emit("tile", {"tile": s_i, "tiles": len(steps), "added": len(fresh), "total": len(merged)})
                     emit("links", {"count": len(merged), "tile": s_i, "tiles": len(steps)})
+                    # W112: remember this step (a re-run carries on after it) and report coverage.
+                    cstore.mark_collect_step(job_id, key)
+                    done_steps.add(key)
+                    run_steps += 1
+                    if band == 0 and tk == tile_km and top_left.get(c, 0) > 0:
+                        top_left[c] -= 1
+                    emit_plan()
                     # W50 — split a saturated tile once its last keyword has run.
                     if tiling:
                         tile_hits[c] = max(tile_hits.get(c, 0), len(cards))
@@ -628,7 +680,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                 tiles_seen.add(kc)
                                 kids.append(kc)
                             if kids:
-                                steps.extend((q2, kc, half) for kc in kids for q2 in queries)
+                                steps.extend((q2, kc, half, band) for kc in kids for q2 in bands[band])
                                 emit("tiles", {"count": len(tiles_seen)})
                                 emit("tile_split", {"tile": s_i, "hits": tile_hits[c], "from_km": round(tk, 2),
                                                     "to_km": round(half, 2), "children": len(kids), "tiles": len(tiles_seen)})

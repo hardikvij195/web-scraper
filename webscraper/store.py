@@ -122,6 +122,14 @@ CREATE TABLE IF NOT EXISTS job_links (
   PRIMARY KEY (job_id, key)
 );
 
+-- W112 (CRM T608): every (band, centre, tile size, keyword) Maps search a job finished, so a
+-- re-run with more time carries on instead of searching the same corner again.
+CREATE TABLE IF NOT EXISTS collect_steps (
+  job_id INTEGER NOT NULL,
+  step TEXT NOT NULL,
+  PRIMARY KEY (job_id, step)
+);
+
 -- W26: one WhatsApp verdict PER NUMBER. A business has up to three kinds of number —
 -- the Google Maps phone (`maps`), a wa.me link on Maps or its site (`wa_link`) and the
 -- numbers its website lists (`site`) — and the user wants every one of them checked.
@@ -358,6 +366,7 @@ class Store:
             ("do_wa_verify", "INTEGER NOT NULL DEFAULT 0"),    # verify each number against WhatsApp Web
             ("wa_verify_done", "INTEGER NOT NULL DEFAULT 0"), ("wa_verify_total", "INTEGER NOT NULL DEFAULT 0"),
             ("locations", "TEXT"),           # JSON [{location, radius_km, lat, lng}] — multi-area scrape
+            ("collect_stats", "TEXT"),       # W112: JSON Maps coverage (steps, areas, pace) for the CRM
             ("skipped_far", "INTEGER NOT NULL DEFAULT 0"),
             ("started_at", "TEXT"),          # worker picked it up
             ("scrape_started_at", "TEXT"),
@@ -775,6 +784,18 @@ class Store:
         """Feed links this job never opened, in feed order."""
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM job_links WHERE job_id=? AND opened=0 ORDER BY rowid", (job_id,))]
+
+    # ── W112: Maps search steps a job already finished (resume) ─────────────────
+    def collect_steps_done(self, job_id: int) -> set[str]:
+        return {r[0] for r in self.conn.execute("SELECT step FROM collect_steps WHERE job_id=?", (job_id,))}
+
+    def mark_collect_step(self, job_id: int, step: str) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO collect_steps(job_id, step) VALUES (?, ?)", (job_id, step))
+        self.conn.commit()
+
+    def clear_collect_steps(self, job_id: int) -> None:
+        self.conn.execute("DELETE FROM collect_steps WHERE job_id=?", (job_id,))
+        self.conn.commit()
 
     def next_pending_link(self, job_id: int) -> dict[str, Any] | None:
         """The oldest unopened feed link — what the opener thread takes next (W26)."""

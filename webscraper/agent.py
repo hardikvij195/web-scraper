@@ -460,6 +460,14 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
                     "skipped_far": int(_col(row, "skipped_far", 0) or 0)})
     except Exception:                                             # noqa: BLE001
         pass
+    # W112 (CRM T608): Maps coverage — steps searched, areas covered with the top keywords, pace.
+    try:
+        cs = _col(row, "collect_stats", None)
+        if cs:
+            import json as _j
+            out["collect"] = _j.loads(cs) if isinstance(cs, str) else cs
+    except Exception:                                             # noqa: BLE001
+        pass
     s = eta.summarise(row, store)
     out.update({"phases": s["phases"], "lanes": s["lanes"], "eta_sec": s["eta_sec"],
                 "phase_eta_sec": s["phase_eta_sec"], "estimating": s["estimating"],
@@ -1827,6 +1835,8 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
         place_keys=_place_keys_json(cj),
         enrich_scope=str(cj.get("enrich_scope") or "all"),          # W76
+        # W112 (CRM T608): "Re-run with extended time" sets a new Maps time limit.
+        max_minutes=cj.get("max_minutes"),
         # Carry the re-run's window choice too. Without this the CRM's "Show window"
         # toggle was dropped on every re-run — the local job kept its original headless
         # value, so a re-enrich asked to run headed still ran hidden.
