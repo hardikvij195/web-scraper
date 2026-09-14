@@ -927,6 +927,15 @@ class Store:
             (name, now_iso(), status, now_iso()))
         self.conn.commit()
 
+    def wa_relinked_since(self, since_iso: str) -> bool:
+        """W110: has an enabled account been SEEN logged in at or after `since_iso`?"""
+        try:
+            return self.conn.execute(
+                "SELECT 1 FROM wa_accounts WHERE disabled=0 AND status='logged_in' AND status_at>=? LIMIT 1",
+                (since_iso,)).fetchone() is not None
+        except sqlite3.Error:                                     # pre-W64 schema: no status column
+            return False
+
     def add_wa_account(self, name: str) -> None:
         # Upsert + re-enable: a fresh wa-login clears a prior 'disabled' flag (e.g. one
         # set when a headless verify misread the session as logged-out).

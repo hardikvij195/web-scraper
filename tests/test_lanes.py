@@ -292,6 +292,89 @@ def test_whatsapp_lane_waits_out_an_open_login_instead_of_giving_up(db, monkeypa
     assert any("paused" in m and "login" in m for m in msgs), msgs
 
 
+def _relink_setup(db, monkeypatch, state):
+    """W110 harness: one pending number, verify refuses until state['linked']."""
+    from webscraper import wa_verify
+    from webscraper.store import Store
+
+    job_id, job = _mk_job(db, do_enrich=0, do_wa_verify=1)
+    _add_place(db, job_id, "p1", "+919999999999")
+    s = db()
+    s.add_wa_account("acc1")
+    s.set_wa_status("acc1", "logged_out")
+    s.close()
+    row = {"place_key": "p1", "name": "biz p1", "number": "919999999999", "source": "maps"}
+    monkeypatch.setattr(Store, "pending_wa_verify",
+                        lambda self, jid, limit=25: [row] if state["pending"] else [])
+    monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
+    monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
+
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+        state["calls"] += 1
+        if not state["linked"]:
+            raise wa_verify.WaNotLoggedIn("no WhatsApp account is logged in on this machine")
+        on_progress("p1", "yes", "919999999999", "maps")
+        state["pending"] = False
+        return {"yes": 1, "no": 0, "unknown": 0}
+    monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
+    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
+    monkeypatch.setattr(L, "WA_RELINK_POLL_SEC", 0.02)
+    return job_id, job
+
+
+def test_whatsapp_lane_waits_for_a_relink_while_numbers_are_still_coming(db, monkeypatch):
+    """W110 (CRM T601): job #103 on 1 - PC ended its WhatsApp lane with wa_not_logged_in at
+    11:26; hvt_wa_bus_2 was re-linked at 14:24 while discovery still ran, and 1,189 numbers
+    were never checked. With discovery still going the lane must wait, and resume on its own
+    the moment a login stamps an account logged in."""
+    import threading
+    state = {"calls": 0, "pending": True, "linked": False}
+    job_id, job = _relink_setup(db, monkeypatch, state)
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)   # discovery NOT done
+
+    def relink():
+        time.sleep(0.3)
+        s = db()
+        s.set_wa_status("acc1", "logged_in")                  # what a finished wa-login writes
+        s.close()
+        state["linked"] = True
+        pipe.discovery.done.set()                             # nothing more to feed: lane may finish
+    threading.Thread(target=relink, daemon=True).start()
+
+    lane = pipe.whatsapp
+    lane.store = db()
+    try:
+        reason = lane._work()
+    finally:
+        lane.store.close()
+    assert reason == L.R_COMPLETED, reason
+    assert state["calls"] == 2
+    s = db()
+    msgs = [r["message"] for r in s.logs(job_id)]
+    s.close()
+    assert any("waiting" in m for m in msgs) and any("resuming" in m for m in msgs), msgs
+
+
+def test_whatsapp_lane_gives_up_after_the_grace_once_nothing_else_is_coming(db, monkeypatch):
+    """W110: no re-link, discovery finished — the lane still ends (wa_not_logged_in) after
+    the grace, so a job never hangs for ever on a machine nobody is looking at."""
+    state = {"calls": 0, "pending": True, "linked": False}
+    job_id, job = _relink_setup(db, monkeypatch, state)
+    monkeypatch.setattr(L, "WA_RELINK_GRACE_SEC", 0.1)
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
+    pipe.discovery.done.set()
+    lane = pipe.whatsapp
+    lane.store = db()
+    start = time.monotonic()
+    try:
+        reason = lane._work()
+    finally:
+        lane.store.close()
+    assert reason == L.R_WA_LOGIN, reason
+    assert state["calls"] == 1
+    assert time.monotonic() - start < 5
+
+
 def test_parallel_whatsapp_slices_never_touch_the_lane_threads_sqlite(db, monkeypatch):
     """W78: the W76 parallel path handed each slice thread the LANE's `should_stop` and
     `on_wa`, both bound to the lane thread's sqlite connection — so the first

@@ -41,7 +41,7 @@ import time
 from typing import Any, Callable
 
 from webscraper.config import settings
-from webscraper.store import Store
+from webscraper.store import Store, now_iso
 
 log = logging.getLogger("webscraper.lanes")
 
@@ -52,6 +52,35 @@ IDLE_POLL_SEC = 2.0
 # W77: how long the WhatsApp lane waits for an open wa-login window before giving up —
 # the QR window itself times out after 2 min, so this only ever waits out a real scan.
 WA_LOGIN_WAIT_SEC = 240.0
+
+#: W110: with no linked WhatsApp session the lane waits for a re-link instead of ending —
+#: checked every WA_RELINK_POLL_SEC, for as long as discovery / enrichment still feed it
+#: numbers, then WA_RELINK_GRACE_SEC more before it finally gives up.
+WA_RELINK_POLL_SEC = 15.0
+WA_RELINK_GRACE_SEC = 1800.0
+
+def _wait_for_relink(lane, store: Store, err: Exception):
+    """W110: park the WhatsApp lane until an account on this machine is seen logged in again.
+
+    True = a re-link happened, retry the batch · False = gave up (nothing else is coming and the
+    grace ran out) · R_STOPPED = the job was stopped. A finished login stamps
+    `wa_accounts.status_at` (Store.set_wa_status), which is what this polls — never a browser."""
+    since = now_iso()
+    lane.note(f"WhatsApp lane waiting — {err}. Link a WhatsApp account on this machine from the "
+              "CRM and it carries on by itself", "warn")
+    grace_end = None
+    while True:
+        if lane.stopped():
+            return R_STOPPED
+        if store.wa_relinked_since(since):
+            lane.note("WhatsApp account linked — WhatsApp lane resuming", "info")
+            return True
+        if lane.ctl.enrichment_finished():
+            grace_end = grace_end or time.monotonic() + WA_RELINK_GRACE_SEC
+            if time.monotonic() >= grace_end:
+                return False
+        time.sleep(WA_RELINK_POLL_SEC)
+
 
 #: Enrichment gets its speed from concurrency inside `enrich_places`, so it takes a batch
 #: rather than one lead at a time. Small enough that a lead reaches WhatsApp quickly.
@@ -655,6 +684,15 @@ class WhatsAppLane(Lane):
                         time.sleep(1.0)
                     if not wa_verify.login_in_progress():
                         continue
+                # W110 (CRM T601): "no linked session right now" is not "never". Job #103 on
+                # 1 - PC ended this lane at 11:26 IST because hvt_wa_bus_2 had dropped; the
+                # user re-linked it at 14:24 while discovery was still adding numbers, and
+                # 1,189 of them sat unchecked because nothing ever looked again.
+                waited = _wait_for_relink(self, store, e)
+                if waited == R_STOPPED:
+                    return R_STOPPED
+                if waited:
+                    continue
                 self.note(f"WhatsApp verification skipped — {e}", "warn")
                 # W67: and take the window with it. The lane gives up in seconds, but the
                 # headed WhatsApp browser it opened was left sitting on the splash — the
