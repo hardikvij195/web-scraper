@@ -299,6 +299,119 @@ def reset_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     return True, f"reset {name} — start a new session to link it again"
 
 
+# -- unlink / delete (W110, CRM T592) --------------------------------------------------
+#: WhatsApp Web's chat-list menu (⋮) and, in newer builds, the Settings entry of the left
+#: rail. Either leads to "Log out", which asks once more before logging out.
+_MENU_SEL = ('div[role="button"][aria-label="Menu"], [aria-label="Menu"], '
+             'span[data-icon="menu"], span[data-icon="more-refreshed"], [title="Menu"]')
+_SETTINGS_SEL = ('[aria-label="Settings"], span[data-icon="settings-refreshed"], '
+                 'span[data-icon="settings"], [title="Settings"]')
+_LOGOUT_ITEM_SEL = ('div[role="menuitem"]:has-text("Log out"), li:has-text("Log out"), '
+                    'div[role="button"]:has-text("Log out"), [aria-label="Log out"]')
+_LOGOUT_CONFIRM_SEL = ('div[role="dialog"] button:has-text("Log out"), '
+                       'div[data-animate-modal-popup="true"] button:has-text("Log out"), '
+                       '[data-testid="popup-controls-ok"]')
+_PHONE_HINT = "unlink it from the phone: WhatsApp → Settings → Linked devices"
+
+
+def _account_guard(name: str, busy: bool, verb: str) -> tuple[str, str | None]:
+    """The refusals unlink / delete share with reset: bad label, a job in flight, or a
+    login window holding the profile."""
+    name = (name or "").strip()
+    if not name or not _ACCOUNT_RE.match(name):
+        return name, f"bad name {name!r}"
+    if busy:
+        return name, f"a job is running on this machine — stop it, then {verb}"
+    if login_in_progress(name):
+        return name, "a login window is open for this account — close it first"
+    return name, None
+
+
+def _click_first(page: Page, selectors: str, timeout_ms: int) -> bool:
+    try:
+        page.locator(selectors).first.click(timeout=timeout_ms)
+        return True
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
+def _log_out_of_whatsapp(name: str) -> tuple[bool, str]:
+    """Open the account's WhatsApp Web and log it out (Menu → Log out → Log out). Logging
+    out from the web client is what removes it from the phone's Linked devices; deleting the
+    profile folder alone leaves a stale linked device on the phone until WhatsApp expires it."""
+    d = settings.wa_profiles_dir / name
+    if not d.exists():
+        return True, "no saved session on this machine"
+    try:
+        from webscraper.browser_recovery import kill_profile_holder
+        kill_profile_holder(d, "wa unlink")
+    except Exception:                                             # noqa: BLE001
+        pass
+    mark_profile_clean(d)
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(d), locale="en", **_launch_kwargs(wa_window_mode(), name))
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto("https://web.whatsapp.com/", timeout=60_000, wait_until="domcontentloaded")
+            st = wait_boot(page, name, blank_ms=60_000, sync_max_sec=120)
+            if st == "qr":
+                Store().set_wa_status(name, "logged_out")
+                return True, "already unlinked (WhatsApp Web shows the QR)"
+            if st != "chat":
+                return False, f"WhatsApp Web did not load ({st}) — {_PHONE_HINT}"
+            found = _click_first(page, _MENU_SEL, 15_000) and _click_first(page, _LOGOUT_ITEM_SEL, 8_000)
+            if not found:
+                page.keyboard.press("Escape")
+                found = _click_first(page, _SETTINGS_SEL, 10_000) and _click_first(page, _LOGOUT_ITEM_SEL, 10_000)
+            if not found:
+                return False, f"could not find WhatsApp Web's Log out — {_PHONE_HINT}"
+            _click_first(page, _LOGOUT_CONFIRM_SEL, 10_000)      # newer builds confirm; older log out at once
+            try:
+                page.wait_for_selector(_QR_SEL, timeout=45_000)
+            except PWTimeout:
+                return False, f"pressed Log out but WhatsApp Web did not return to the QR — {_PHONE_HINT}"
+            Store().set_wa_status(name, "logged_out")
+            log.info("[%s] logged out of WhatsApp Web — removed from the phone's Linked devices", name)
+            return True, "unlinked — removed from the phone's Linked devices"
+        finally:
+            ctx.close()
+
+
+def unlink_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
+    """W110 (CRM T592): log a WhatsApp account out of WhatsApp Web on this machine. The
+    account and its (now logged-out) profile stay, shown as not linked, so Start session can
+    link it again."""
+    name, err = _account_guard(name, busy, "unlink")
+    if err:
+        return False, err
+    try:
+        ok, msg = _log_out_of_whatsapp(name)
+    except Exception as e:                                        # noqa: BLE001
+        ok, msg = False, f"could not open WhatsApp Web: {str(e).splitlines()[0][:120]} — {_PHONE_HINT}"
+    return ok, (f"{name}: {msg}" if ok else msg)
+
+
+def delete_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
+    """W110 (CRM T592): unlink, then forget the account on this machine (profile folder +
+    store row, as `reset_account`) with no new QR. User choice 2026-09-14: if the log-out
+    cannot happen, delete anyway and say to remove the device from the phone."""
+    name, err = _account_guard(name, busy, "delete")
+    if err:
+        return False, err
+    try:
+        logged_out, msg = _log_out_of_whatsapp(name)
+    except Exception as e:                                        # noqa: BLE001
+        logged_out, msg = False, f"could not open WhatsApp Web: {str(e).splitlines()[0][:120]} — {_PHONE_HINT}"
+    wiped, wmsg = reset_account(name, busy=busy)
+    if not wiped:
+        return False, wmsg
+    log.info("[%s] WhatsApp account deleted (%s)", name, "logged out first" if logged_out else "logout failed")
+    if logged_out:
+        return True, f"deleted {name} — logged out of WhatsApp and removed from this machine"
+    return True, f"deleted {name} from this machine, but WhatsApp was NOT logged out: {msg}"
+
+
 def login(name: str) -> bool:
     """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success.
 

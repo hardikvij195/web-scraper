@@ -1281,6 +1281,14 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 ok, result = wa_verify.reset_account(
                     (cmd.get("arg") or "").strip(),
                     busy=getattr(srv.worker, "current_job", None) is not None)
+            elif cmd["command"] in ("wa_unlink", "wa_delete"):
+                # W110 (CRM T592): unlink = log the account out of WhatsApp Web (the phone's
+                # Linked devices loses it; the profile stays, not linked). delete = unlink,
+                # then wipe profile + row with no new QR (deletes even if the logout fails).
+                from webscraper import wa_verify
+                fn = wa_verify.unlink_account if cmd["command"] == "wa_unlink" else wa_verify.delete_account
+                ok, result = fn((cmd.get("arg") or "").strip(),
+                                busy=getattr(srv.worker, "current_job", None) is not None)
             elif cmd["command"] == "wa_rename":
                 # W80: "<old>><new>" — rename a WhatsApp account (profile dir + store row).
                 # The wa_login branch imports wa_verify locally, which makes the name
