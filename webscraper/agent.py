@@ -1009,7 +1009,7 @@ _DEFERRED_CMD: list = [None]
 #: `_tick` on the main loop, and the main loop is what heartbeats and polls commands — so a
 #: long re-check (the Mac, 2026-09-10 17:43–17:49: a relaunched profile waiting out WhatsApp's
 #: sync splash) showed the machine as offline and left Restart unanswered for 6 minutes.
-_REVERIFY: dict = {"thread": None, "job": None}
+_REVERIFY: dict = {"thread": None, "job": None, "stop": None, "why": None}
 
 
 def _reverify_busy() -> int | None:
@@ -1033,8 +1033,28 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
             except Exception:                                     # noqa: BLE001
                 pass
     t = threading.Thread(target=_run, name=f"reverify-{jid}", daemon=True)
+    # T596: the stop a re-verify never had — park and a CRM cancel both set it.
+    _REVERIFY["stop"], _REVERIFY["why"] = threading.Event(), None
     _REVERIFY["thread"], _REVERIFY["job"] = t, jid
     t.start()
+
+
+def _stop_reverify(why: str) -> bool:
+    """T596: ask the running re-verify to stop after the number in hand. True if one was running."""
+    ev = _REVERIFY.get("stop")
+    if ev is None or _reverify_busy() is None:
+        return False
+    _REVERIFY["why"] = _REVERIFY.get("why") or why
+    ev.set()
+    return True
+
+
+def _stop_parks(arg: str | None, platform: str) -> bool:
+    """T596: does a CRM `stop` park the agent (keeps polling) rather than release it (exit +
+    autostart off)? Always park on macOS: a Mac never locks the folder, so there is nothing to
+    release, and unloading the launchd job stranded the Mac for two days (2026-09-12) — no CRM
+    command can reach an agent that is not running."""
+    return str(arg or "").strip().lower() != "release" or platform == "darwin"
 
 #: Commands that end the process and therefore wait for the running job (W100).
 _EXIT_COMMANDS = ("update", "restart")
@@ -1385,7 +1405,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 import subprocess as _sp
                 import sys as _sys
                 from webscraper.config import ROOT
-                if str(cmd.get("arg") or "").strip().lower() != "release":
+                if _stop_parks(cmd.get("arg"), _sys.platform):
                     # W75: park the LOOP and stop the WORK. Parking alone left the worker
                     # thread running its local job: _close_browsers() killed the Chromes,
                     # the lanes' Relauncher brought them straight back, and the Mac kept
@@ -1411,11 +1431,14 @@ def _poll_command(cloud: "CrmCloud") -> None:
                                 _st.close()
                     except Exception:                             # noqa: BLE001
                         log.debug("could not flag the running job on stop", exc_info=True)
+                    _stop_reverify("parked")                     # T596: a re-verify has no local job
                     _close_browsers()
                     _STANDBY[0] = True
                     cloud._checks_sent_at = 0.0
                     ok = True
                     result = "agent stopped — parked, press Start in the CRM to run it again"
+                    if str(cmd.get("arg") or "").strip().lower() == "release":
+                        result += " (macOS never locks the folder, so autostart was left loaded)"
                     log.info("stop requested by the CRM: %s", result)
                     # `finally` below reports it; the release path cannot use that, which
                     # is why it calls command_done itself before exiting the process.
@@ -1435,18 +1458,11 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     notes.append("autostart disabled" if r.returncode == 0
                                  else "autostart task left enabled (needs admin)")
                     boot_out = None
-                elif _sys.platform != "darwin":
+                else:
+                    # T596: macOS never gets here (_stop_parks) — its old `launchctl bootout`
+                    # left nothing polling, so no CRM command could ever reach the Mac again.
                     boot_out = None
                     notes.append("autostart not managed on this OS")
-                else:
-                    # T424: the sentinel alone cannot stop a Mac. run-agent-loop.sh does
-                    # exit when it sees the file, but the launchd job is KeepAlive=true,
-                    # so launchd relaunches the loop at once — and the loop's own
-                    # preamble then DELETES the sentinel ("started by hand ⇒ clear a
-                    # previous Stop"). The agent was back within seconds and Stop looked
-                    # like it did nothing at all. Booting the job out is the real stop.
-                    boot_out = f"gui/{_os.getuid()}/app.hvtechnologies.leadfinder-agent"
-                    notes.append("launchd job unloaded")
 
                 # Report BEFORE touching launchd: `bootout` tears down the whole job,
                 # this process included, so anything after it may never run. The CRM
@@ -1499,7 +1515,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
 _SLICE_STORE = threading.local()
 
 
-def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp) -> dict:
+def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, should_stop=None) -> dict:
     """W109: verify `targets` split round-robin across `accounts`, one thread per account.
 
     Each slice pins its account (`account=`, so two threads never share a Chrome profile) and
@@ -1516,7 +1532,8 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp) 
         st = Store(store.path)
         _SLICE_STORE.st = st
         try:
-            results.append(wa_verify.verify_places(st, rows, on_progress=onp, job_id=None, account=name))
+            results.append(wa_verify.verify_places(st, rows, on_progress=onp, should_stop=should_stop,
+                                                   job_id=None, account=name))
         except BaseException as e:                                # noqa: BLE001
             errors.append(e)
             log.warning("re-verify slice %s failed: %s", name, e)
@@ -1653,6 +1670,13 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     # W109 (CRM T576): parallel slices all report through this one callback, and it mutates
     # `checks` / `collected` and talks to the CRM — one verdict at a time.
     _onp_lock = threading.Lock()
+    # T596: park ("Stop agent") and a cancel from the CRM stop the run after the number in hand.
+    # Before this nothing could: park only flagged the LOCAL job a re-verify does not have, the
+    # CRM's cancel came back from progress() and was dropped, and the Mac's #6984 kept checking
+    # until the process was killed with `stop release` (2026-09-12).
+    own = _REVERIFY.get("stop") if _REVERIFY.get("job") == jid else None
+    stop_ev = own if own is not None else threading.Event()
+    stop_why: list = [None]
 
     def _onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
         checks.setdefault(pk, []).append({"number": num, "source": source, "verdict": status})
@@ -1682,7 +1706,9 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
             upd["whatsapp_source"] = None
         # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
         try:
-            cloud.progress(jid, "verifying_wa", wa_progress(_n_checked()))
+            if cloud.progress(jid, "verifying_wa", wa_progress(_n_checked())) and not stop_ev.is_set():
+                stop_why[0] = "cancelled"
+                stop_ev.set()
             cloud.set_wa(jid, [upd])
         except httpx.HTTPError as e:
             log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
@@ -1703,11 +1729,11 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
         if n_par > 1 and len(targets) > 1:
             _jlog(f"{n_par} WhatsApp sessions in parallel — {', '.join(accounts[:n_par])}")
             log.info("re-verify #%s: %d parallel sessions (%s)", jid, n_par, ", ".join(accounts[:n_par]))
-            res = _verify_slices(store, targets, accounts[:n_par], onp)
+            res = _verify_slices(store, targets, accounts[:n_par], onp, should_stop=stop_ev.is_set)
         else:
             # job_id=None → verify_places won't touch the local store's places (they aren't
             # here); `store` is still used for WA account rotation + daily caps.
-            res = wa_verify.verify_places(store, targets, on_progress=onp, job_id=None)
+            res = wa_verify.verify_places(store, targets, on_progress=onp, should_stop=stop_ev.is_set, job_id=None)
     except wa_verify.WaNotLoggedIn as e:
         cloud.done(jid, "error", f"WhatsApp verify skipped — {e}")
         return
@@ -1721,12 +1747,24 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     if collected:
         cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()])
     capped = bool(res.get("capped")) if isinstance(res, dict) else False
-    reason = "wa_daily_cap" if capped else "completed"
+    stopped = stop_ev.is_set()
+    why = stop_why[0] or (_REVERIFY.get("why") if own is not None else None) or "parked"
+    reason = "stopped" if stopped else ("wa_daily_cap" if capped else "completed")
     left = max(0, total - n_checked)
     try:
         cloud.progress(jid, "verifying_wa", wa_progress(n_checked, reason))
     except httpx.HTTPError as e:
         log.warning("re-verify #%s: final progress failed: %s", jid, e)
+    if stopped:
+        _jlog(f"{'leads-verify' if leads_verify else 're-verify'} stopped ({why}): {n_checked} numbers checked, "
+              f"{left} left", "warn")
+        log.info("re-verify #%s: stopped (%s) after %d numbers", jid, why, n_checked)
+        # A CRM cancel already closed the job there — a `done` now would overwrite "cancelled".
+        # The Edge Function takes done|error only; a parked run did not finish, so: error.
+        if why != "cancelled":
+            cloud.done(jid, "error", f"stopped — the agent was parked from the CRM after {n_checked} numbers, "
+                                     f"{left} left; re-run to finish")
+        return
     msg = (f"WhatsApp daily cap reached ({settings.wa_daily_cap}/account/day) — {n_checked} numbers checked, "
            f"{left} left; re-run tomorrow or add another WhatsApp account (wa-login)") if capped else None
     _jlog(f"{'leads-verify' if leads_verify else 're-verify'} finished: {n_checked} numbers checked across "
