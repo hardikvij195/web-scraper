@@ -854,6 +854,16 @@ class Store:
             "SELECT COUNT(*), COALESCE(SUM(opened),0) FROM job_links WHERE job_id=?", (job_id,)).fetchone()
         return int(r[0] or 0), int(r[1] or 0)
 
+    def count_places_stub(self, job_id: int) -> int:
+        """W111 (CRM T606): places saved from the feed card whose panel was never read — the only
+        rows a `discovery_pending` re-run can finish (reopen_stub_links takes exactly these).
+        `count_places - count_places_detailed` also counted `far` rows (outside the radius, kept
+        on purpose, never opened), so jobs #81/#125/#147/#213 read "N place(s) without details"
+        for ever and every follow-up finished in seconds having nothing to open."""
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND detail_status='pending'", (job_id,)).fetchone()
+        return int(r[0] or 0)
+
     def count_places(self, job_id: int) -> int:
         r = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()
         return int(r[0] or 0)

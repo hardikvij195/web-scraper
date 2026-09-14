@@ -452,7 +452,9 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
         # · 9 saved as stubs" instead of implying nine went missing.
         stubs = 0
         if store is not None:
-            stubs = max(0, int(store.count_places(row["id"])) - int(store.count_places_detailed(row["id"])))
+            # W111: only real stubs — a `far` row (outside the radius) is never opened, so counting
+            # it kept a finished job "incomplete" and its follow-ups empty.
+            stubs = int(store.count_places_stub(row["id"]))
         out.update({"links_offered": offered, "links_opened": opened, "places_stub": stubs,
                     "skipped_known": int(_col(row, "skipped_known", 0) or 0),
                     "skipped_far": int(_col(row, "skipped_far", 0) or 0)})

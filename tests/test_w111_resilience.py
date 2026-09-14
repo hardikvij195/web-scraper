@@ -115,6 +115,18 @@ def test_requeue_still_resumes_when_the_crm_is_unreachable(st):
     assert st.get_job(jid)["phase"] == "queued"
 
 
+def test_far_places_are_not_counted_as_stubs(st):
+    """#81/#125/#147/#213 read "N place(s) without details" for ever: the stub count was
+    all places minus detailed ones, so `far` rows (outside the radius, never opened) counted."""
+    jid = _job(st)
+    for key, status in (("a", "done"), ("b", "done"), ("c", "pending"), ("d", "far"), ("e", "far")):
+        st.conn.execute("INSERT INTO places(job_id, place_key, name, detail_status) VALUES (?,?,?,?)",
+                        (jid, key, key, status))
+    st.conn.commit()
+    assert st.count_places_stub(jid) == 1
+    assert agent._local_progress(st.get_job(jid), st)["places_stub"] == 1
+
+
 def test_requeue_without_a_cloud_behaves_as_before(st):
     jid = _mid_run(st, 12)
     assert agent._requeue_orphans(st, "crm") == 1
