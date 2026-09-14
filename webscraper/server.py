@@ -426,6 +426,12 @@ class Worker(threading.Thread):
                         store.update_job(job_id, message=(
                             f"{pfx}{why} at tile {data['tile']}/{data['tiles']} — "
                             f"scraping the {data['count']} places found so far"))
+                    elif kind == "tile_retry":                 # W111
+                        store.log(job_id, "discovery",
+                                  f"tile {data['tile']}/{data['tiles']}: Google Maps timed out — retrying it once ({data['error']})", "warn")
+                    elif kind == "tile_failed":                # W111
+                        store.log(job_id, "discovery",
+                                  f"tile {data['tile']}/{data['tiles']}: Google Maps timed out twice — skipped this tile, carrying on ({data['error']})", "warn")
                     elif kind == "abort":
                         store.update_job(job_id, message=f"{pfx}{data['reason']}")
 

@@ -693,7 +693,7 @@ def _close_browsers(reason: str = "agent exiting") -> None:
             pass
 
 
-def _requeue_orphans(store: Store, kind: str) -> int:
+def _requeue_orphans(store: Store, kind: str, cloud: "Cloud | CrmCloud | None" = None) -> int:
     """Put jobs the last agent died mid-run back on the Worker's queue.
 
     The Worker only picks up `phase IN ('queued','waiting')`, so a job killed
@@ -705,16 +705,33 @@ def _requeue_orphans(store: Store, kind: str) -> int:
     Re-running is safe: places upsert on (job_id, place_key) locally and the CRM
     upserts on the same pair, so a resumed job overwrites its own rows instead of
     duplicating them. Jobs already synced or explicitly stopped are left alone.
+
+    W111 (CRM T606): ask the CRM first (one progress ping, the same the loop sends anyway).
+    Jobs #169 / #191 were cancelled in the CRM while their agents restarted for an update;
+    the restart resumed them regardless, they ran until the first ping said "cancelled", and
+    their final report turned the CRM row from "cancelled" into "error". Offline = resume
+    as before; the loop's next ping still catches a cancel.
     """
     rows = store.conn.execute(
-        "SELECT id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
+        "SELECT * FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=? "
         "AND phase IN ('scraping','enriching','researching','verifying_wa') "
         "AND (note IS NULL OR note <> 'synced') "
         "AND COALESCE(stop_requested,0)=0", (kind,)).fetchall()
+    resumed = 0
     for r in rows:
+        if cloud is not None:
+            try:
+                if cloud.progress(int(r["cloud_id"]), r["phase"], _local_progress(r, store)):
+                    store.update_job(int(r["id"]), phase="stopped", status="stopped", stop_requested=1,
+                                     note="synced", message="cancelled in the CRM while the agent was down — not resumed")
+                    store.log(int(r["id"]), "job", "not resumed: the job was cancelled in the CRM while the agent was down", "warn")
+                    continue
+            except Exception:                                     # noqa: BLE001
+                log.debug("could not ask the CRM about job #%s before resuming", r["cloud_id"], exc_info=True)
         store.update_job(int(r["id"]), phase="queued",
                          message="resuming after agent restart")
-    return len(rows)
+        resumed += 1
+    return resumed
 
 
 #: How long the loop waits after a tick that DID something. A user who just pressed
@@ -857,7 +874,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     reaped = reap_orphan_browsers(known_profile_dirs(), "agent start")
     if reaped:
         log.warning("killed %d orphan Chrome(s) left by a previous agent process", reaped)
-    orphans = _requeue_orphans(store, kind)
+    orphans = _requeue_orphans(store, kind, cloud)
     if orphans:
         log.info("requeued %d job(s) left mid-run by a previous agent", orphans)
     # Pull API keys from the cloud/CRM (Setup tab) — local .env always wins.

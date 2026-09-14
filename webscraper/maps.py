@@ -503,6 +503,10 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 # to SPLIT_MIN_KM. Dense cities end up on fine tiles, empty land costs one search.
                 SPLIT_AT = MAPS_PAGE_CAP - 10     # a feed this full was probably truncated
                 SPLIT_MIN_KM = 0.5
+                # W111 (CRM T606): a Maps timeout retries the tile once, then skips only that tile;
+                # MAX_TILE_FAILS skipped tiles in a row (Maps really down) still ends the collection.
+                TILE_TIMEOUT_RETRIES = 1
+                MAX_TILE_FAILS = 3
                 MAX_STEPS = 6000                  # (tile, keyword) pairs — safety, the time budget rules in practice
                 if tiling:
                     tile_km = max(2.0, float(radius_km) / 8.0) if float(radius_km) > 16 else min(float(radius_km), 2.0)
@@ -518,6 +522,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 tile_hits: dict[tuple[float, float], int] = {}
                 tiles_seen: set[tuple[float, float]] = set(centers)
                 s_i = 0
+                fail_streak = 0
                 while s_i < len(steps):
                     s_i += 1
                     qy, c, tk = steps[s_i - 1]
@@ -540,6 +545,11 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                     want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
                     # Retry this tile through the relauncher until it reads or the relaunch
                     # cap is spent. Everything already persisted survives a crash.
+                    # W111 (CRM T606): a slow Google Maps page (goto 60 s, or the results feed not
+                    # showing in 20 s) used to raise out of here and end the WHOLE collection —
+                    # jobs #81/#103/#125/#147/#213 each lost the rest of their tiles on 2026-09-14.
+                    cards = None
+                    timeouts = 0
                     while True:
                         try:
                             page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
@@ -552,9 +562,27 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                                                      "tile": s_i, "tiles": len(steps)}))
                             break
                         except PWError as e:
-                            if not is_closed(e) or not rl.recover(f"tile {s_i}/{len(steps)}"):
+                            if is_closed(e):
+                                if not rl.recover(f"tile {s_i}/{len(steps)}"):
+                                    raise
+                                ctx, page = rl.current
+                                continue
+                            if not isinstance(e, PWTimeout):
                                 raise
-                            ctx, page = rl.current
+                            first_line = str(e).split("\n")[0][:160]
+                            timeouts += 1
+                            if timeouts <= TILE_TIMEOUT_RETRIES:
+                                emit("tile_retry", {"tile": s_i, "tiles": len(steps), "error": first_line})
+                                time.sleep(random.uniform(5, 10))
+                                continue
+                            fail_streak += 1
+                            if fail_streak >= MAX_TILE_FAILS:
+                                raise
+                            emit("tile_failed", {"tile": s_i, "tiles": len(steps), "error": first_line})
+                            break
+                    if cards is None:
+                        continue                          # W111: this tile skipped, the rest carry on
+                    fail_streak = 0
                     fresh: list[FeedCard] = []
                     for card in cards:
                         if card.key in merged:

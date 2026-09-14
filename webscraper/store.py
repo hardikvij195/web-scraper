@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -225,6 +226,12 @@ def aggregate_wa(checks: list[dict[str, Any]]) -> tuple[str, str | None]:
     return "unknown", None
 
 
+#: W111: Store.update_job retries a "database is locked" this many times, waiting
+#: LOCK_RETRY_SEC × attempt in between (on top of sqlite's own 30 s busy timeout).
+LOCK_RETRIES = 3
+LOCK_RETRY_SEC = 2.0
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -437,8 +444,24 @@ class Store:
             if isinstance(v, (list, dict, tuple, set)):
                 fields[k] = json.dumps(list(v) if isinstance(v, (tuple, set)) else v, ensure_ascii=False)
         cols = ",".join(f"{k}=?" for k in fields)
-        self.conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", [*fields.values(), job_id])
-        self.conn.commit()
+        sql, args = f"UPDATE jobs SET {cols} WHERE id=?", [*fields.values(), job_id]
+        # W111 (CRM T606): job #81 on 3 - ASUS lost its discovery lane at 17:21 IST 2026-09-14 on a
+        # progress write — "database is locked" after sqlite's own 30 s busy wait, while another of
+        # this agent's connections held the write lock. A lock is transient: roll back, wait, retry.
+        for attempt in range(LOCK_RETRIES + 1):
+            try:
+                self.conn.execute(sql, args)
+                self.conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == LOCK_RETRIES:
+                    raise
+                try:
+                    self.conn.rollback()
+                except sqlite3.Error:                             # noqa: BLE001
+                    pass
+                log.warning("jobs row %s: database is locked — retry %d/%d", job_id, attempt + 1, LOCK_RETRIES)
+                time.sleep(LOCK_RETRY_SEC * (attempt + 1))
 
     # ── phase timing history (feeds the ETA; see eta.py) ─────────────────────
     def record_phase_rate(self, job_id: int | None, phase: str, units: int, seconds: float) -> None:
