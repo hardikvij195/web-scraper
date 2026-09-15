@@ -487,7 +487,10 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
         user_data_dir=str(profile_dir(name)), headless=False, locale="en",
         **_channel_of(browser or browser_for(name)),
         viewport={"width": 1100, "height": 820},
-        args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS])
+        # W116 (CRM T648): Chrome reopens a profile at the window position it last had. A profile
+        # that ever ran "hidden" was parked at -32000,-32000, so the QR window came up off-screen on
+        # 5 - MI (only a sliver at the left edge, QR unscannable). Pin it on screen explicitly.
+        args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS, *ON_SCREEN_ARGS])
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         # W92: domcontentloaded, not the full load — WhatsApp Web keeps loading assets
@@ -1005,7 +1008,12 @@ def _launch_kwargs(mode: str, name: str | None = None) -> dict[str, Any]:
                 "args": base + ["--window-position=-32000,-32000", "--window-size=1100,820"]}
     if mode == "headless":
         return {"headless": False, **ch, "args": base + ["--headless=new"]}
-    return {"headless": False, **ch, "args": base}
+    # W116: a visible window must not inherit the off-screen spot a hidden run left in the profile.
+    return {"headless": False, **ch, "args": base + ON_SCREEN_ARGS}
+
+
+#: W116 (CRM T648): explicit on-screen bounds for every visible WhatsApp window (login + visible mode).
+ON_SCREEN_ARGS = ["--window-position=60,40", "--window-size=1180,900"]
 
 
 def _ensure_session(pw, open_ctx: dict[str, Any],
