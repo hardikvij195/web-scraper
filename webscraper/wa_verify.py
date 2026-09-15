@@ -1001,7 +1001,11 @@ def _launch_kwargs(mode: str, name: str | None = None) -> dict[str, Any]:
     if mode == "headless" and not ch:
         # Bundled Chromium never renders WhatsApp Web headless (W65): without an installed
         # Chrome, "headless" degrades to hidden, which at least keeps working.
-        log.warning("no installed Chrome — WhatsApp 'headless' runs as 'hidden' on this machine")
+        # W116 (CRM T648): `ch` is empty when the PROFILE is pinned to the bundled Chromium (W93
+        # marker / machine preference), not only when Chrome is missing — 5 - MI has Chrome and
+        # still logged "no installed Chrome". Say which one it is.
+        log.warning("%s — WhatsApp 'headless' runs as 'hidden' here",
+                    "profile %r is pinned to the bundled Chromium" % name if _chrome_installed() else "no installed Chrome")
         mode = "hidden"
     if mode == "hidden":
         return {"headless": False, **ch,
