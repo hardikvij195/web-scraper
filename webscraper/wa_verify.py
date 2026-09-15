@@ -91,6 +91,14 @@ _QR_SEL = 'canvas[aria-label*="Scan"], [data-testid="qrcode"], div[data-ref]'
 _SPLASH_WORDS = ("messages are downloading", "loading your chats", "end-to-end encrypted",
                  "don't close this window", "loading")
 WA_SYNC_MAX_SEC = 360.0
+#: W115 (CRM T646): bound on the whole-batch pause `verify_places` takes when it finds an
+#: account mid-sync BEFORE checking the next number (rather than checking into the sync and
+#: getting a false 'unknown' the old reactive-only retry produced 13/42 of on one account).
+WA_BATCH_PAUSE_MAX_SEC = 300.0
+#: Sentinel `_check` returns for a number caught mid-sync even after its own wait — the
+#: caller re-queues it (bounded by WA_REQUEUE_MAX) instead of recording a false 'unknown'.
+_STILL_SYNCING = "__still_syncing__"
+WA_REQUEUE_MAX = 2
 
 
 def wa_sync_max_sec() -> float:
@@ -645,7 +653,12 @@ def verify_places(
                     # sync splash / a blank page again — 25 s later `_decide` gave up. MI
                     # answered 'unknown' on 59 % of 699 checks that way, DELL on 63 %. Wait
                     # for the client once (bounded), reload the number, decide again.
-                    wait_boot(page, name, blank_ms=40_000, sync_max_sec=min(wa_sync_max_sec(), 120))
+                    boot_after = wait_boot(page, name, blank_ms=40_000, sync_max_sec=min(wa_sync_max_sec(), 120))
+                    if boot_after == "syncing":
+                        # W115 (CRM T646): still mid-sync after waiting — WhatsApp itself was
+                        # never ready to answer for this number, so it was never really
+                        # "checked". Tell the caller to re-queue it rather than record 'unknown'.
+                        return _STILL_SYNCING
                     page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
                     st = _decide(page)
                     log.info("[%s] number %s: WhatsApp Web was still syncing — re-checked (%s)", name, num, st)
@@ -700,6 +713,7 @@ def verify_places(
             targets.append((r, e164.lstrip("+"), src))
 
     unavailable: set[str] = set()          # W93: accounts whose client never rendered this run
+    requeue_tries: dict[tuple[str, str], int] = {}   # W115: (place_key, num) -> re-queues so far
     try:
         if targets:
             pw = sync_playwright().start()
@@ -740,6 +754,17 @@ def verify_places(
                     break         # W102: a pinned slice has no other account to move to
                 continue
 
+            # W115 (CRM T646): pause the WHOLE batch here if this account is mid-sync, instead
+            # of walking into it number by number and reactively catching false 'unknown's —
+            # one account answered 'unknown' on 13 of 42 numbers that way (syncing, not really
+            # unresolvable). Bounded so a session that never finishes syncing does not hang.
+            if _boot_state(page) == "syncing":
+                if job_id is not None:
+                    store.log(job_id, "whatsapp",
+                              f"{name}: WhatsApp Web is syncing (messages downloading) — "
+                              "pausing this batch until it's ready", "warn")
+                wait_boot(page, name, blank_ms=1000, sync_max_sec=WA_BATCH_PAUSE_MAX_SEC)
+
             try:
                 status = _check(name, num)
             except WaUnavailable as e:
@@ -772,6 +797,24 @@ def verify_places(
                     # wait each) instead of ending the slice.
                     break
                 continue
+
+            if status == _STILL_SYNCING:
+                # W115 (CRM T646): checked into a sync that never finished — this was not a
+                # real answer, so put the number back on the queue (bounded) instead of
+                # recording it 'unknown' and never revisiting it this batch. Does not touch
+                # the daily cap: a re-queue is not a check.
+                tries = requeue_tries.get((pk, num), 0) + 1
+                requeue_tries[(pk, num)] = tries
+                if tries <= WA_REQUEUE_MAX:
+                    targets.append((r, num, source))
+                    if job_id is not None:
+                        store.log(job_id, "whatsapp",
+                                  f"{name}: number re-queued ({tries}/{WA_REQUEUE_MAX}) — "
+                                  "WhatsApp Web was still syncing", "warn")
+                    continue
+                log.warning("[%s] number %s: still syncing after %d re-queues — recording unknown",
+                            name, num, WA_REQUEUE_MAX)
+                status = "unknown"
 
             try:
                 store.bump_wa_account(name, today)
