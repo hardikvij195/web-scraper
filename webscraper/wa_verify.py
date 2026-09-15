@@ -26,6 +26,7 @@ import re
 
 import logging
 import random
+import sqlite3
 import time
 from datetime import date
 from typing import Any, Callable
@@ -758,8 +759,13 @@ def verify_places(
                 continue
             except WaNotLoggedIn:
                 # Session dropped mid-run, or a relaunch found the profile unlinked.
-                store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
-                store.conn.commit()
+                try:
+                    store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
+                    store.conn.commit()
+                except sqlite3.Error:
+                    # W113 (CRM T624): a lock here must not stop us ending the slice below —
+                    # worst case the account gets re-tried once more before it is disabled.
+                    log.warning("%s: could not mark disabled (db busy)", name)
                 if account:
                     # W102: `account=` pins this slice, so `continue` re-opened the same
                     # unlinked profile for EVERY remaining number (a Chrome launch + a 40 s
@@ -767,7 +773,13 @@ def verify_places(
                     break
                 continue
 
-            store.bump_wa_account(name, today)
+            try:
+                store.bump_wa_account(name, today)
+            except sqlite3.Error:
+                # W113 (CRM T624): job #279 (agent "4 - DELL", 2026-09-15 00:01:40 UTC) died here
+                # on "database is locked" — `bump_wa_account` is a rotation counter, not the
+                # verdict; losing one bump must not take the WhatsApp lane down with it.
+                log.warning("%s: could not bump daily count (db busy) — continuing", name)
             counts[status] += 1
             counts["checked"] += 1
             # Bare digits were only ever for the send URL; everything persisted or reported

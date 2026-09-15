@@ -11,7 +11,7 @@ import logging
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -23,6 +23,20 @@ from webscraper import server as srv
 from webscraper.store import Store
 
 log = logging.getLogger("webscraper.agent")
+
+
+class ProgressReply(NamedTuple):
+    """Result of a `progress` ping. W114 (CRM T624): `reassigned` means the CRM refused the
+    write because this device is no longer the job's owner (another machine claimed it after
+    the 30-min stale-reclaim) -- `agent_device` names the current owner. `bool()` on this
+    stays True only for `cancelled`, so existing `if cloud.progress(...):` call sites keep
+    their old meaning unchanged."""
+    cancelled: bool
+    reassigned: bool = False
+    agent_device: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.cancelled
 
 
 class Cloud:
@@ -42,11 +56,12 @@ class Cloud:
         r.raise_for_status()
         return r.json()
 
-    def progress(self, jid: int, phase: str | None, progress: dict) -> bool:
-        """Returns True if the job was cancelled cloud-side."""
+    def progress(self, jid: int, phase: str | None, progress: dict) -> ProgressReply:
+        """Cancelled / reassigned (W114, CRM T624) status from the CRM."""
         r = self.c.post(f"/api/agent/jobs/{jid}/progress", json={"phase": phase, "progress": progress})
         r.raise_for_status()
-        return bool(r.json().get("cancelled"))
+        d = r.json()
+        return ProgressReply(bool(d.get("cancelled")), bool(d.get("reassigned")), d.get("agent_device"))
 
     def done(self, jid: int, status: str, error: str | None = None) -> None:
         self.c.post(f"/api/agent/jobs/{jid}/done", json={"status": status, "error": error}).raise_for_status()
@@ -303,10 +318,12 @@ class CrmCloud:
         r.raise_for_status()
         return r.json()
 
-    def progress(self, jid: int, phase: str | None, progress: dict) -> bool:
+    def progress(self, jid: int, phase: str | None, progress: dict) -> ProgressReply:
+        """Cancelled / reassigned (W114, CRM T624) status from the CRM."""
         r = self._post(crm_payload("progress", job_id=jid, phase=phase, progress=progress))
         r.raise_for_status()
-        return bool(r.json().get("cancelled"))
+        d = r.json()
+        return ProgressReply(bool(d.get("cancelled")), bool(d.get("reassigned")), d.get("agent_device"))
 
     def done(self, jid: int, status: str, error: str | None = None) -> None:
         self._post(crm_payload("done", job_id=jid, status=status, error=error)).raise_for_status()
@@ -731,7 +748,15 @@ def _requeue_orphans(store: Store, kind: str, cloud: "Cloud | CrmCloud | None" =
     for r in rows:
         if cloud is not None:
             try:
-                if cloud.progress(int(r["cloud_id"]), r["phase"], _local_progress(r, store)):
+                reply = cloud.progress(int(r["cloud_id"]), r["phase"], _local_progress(r, store))
+                if reply.reassigned:
+                    # W114 (CRM T624): the stale-reclaim already handed this job to another
+                    # device while we were away — resuming here would duplicate its run.
+                    store.update_job(int(r["id"]), phase="stopped", status="stopped", stop_requested=1,
+                                     note="synced", message=f"job now runs on {reply.agent_device} — not resumed")
+                    store.log(int(r["id"]), "job", f"not resumed: job now runs on {reply.agent_device} (W114, CRM T624)", "warn")
+                    continue
+                if reply.cancelled:
                     store.update_job(int(r["id"]), phase="stopped", status="stopped", stop_requested=1,
                                      note="synced", message="cancelled in the CRM while the agent was down — not resumed")
                     store.log(int(r["id"]), "job", "not resumed: the job was cancelled in the CRM while the agent was down", "warn")
@@ -2069,9 +2094,15 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                         log.info("streamed %d new lead(s) to job #%s", len(fresh), cid)
                     except httpx.HTTPError as e:
                         log.warning("stream to #%s failed (will retry next tick): %s", cid, e)
-            cancelled = cloud.progress(cid, row["phase"], _local_progress(row, store))
-            if cancelled:
+            reply = cloud.progress(cid, row["phase"], _local_progress(row, store))
+            if reply.cancelled:
                 store.update_job(row["id"], stop_requested=1, note="synced")
+            elif reply.reassigned:
+                # W114 (CRM T624): another device now owns this job (stale-reclaim while we
+                # were asleep) — stop our duplicate run instead of continuing to stream into
+                # its row alongside the real owner.
+                store.update_job(row["id"], stop_requested=1, note="synced")
+                store.log(row["id"], "job", f"stopping: job now runs on {reply.agent_device} (W114, CRM T624)", "warn")
         elif row["phase"] in ("done", "stopped", "failed"):
             rows = store.places(row["id"])
             quota_hit = False

@@ -83,14 +83,18 @@ def test_other_sqlite_errors_are_not_retried(st):
 
 
 class _Cloud:
-    def __init__(self, cancelled: set[int], offline: bool = False):
+    def __init__(self, cancelled: set[int], offline: bool = False, reassigned: dict[int, str] | None = None):
         self.cancelled, self.offline, self.pings = cancelled, offline, []
+        self.reassigned = reassigned or {}
 
     def progress(self, jid, phase, progress):
         self.pings.append(jid)
         if self.offline:
             raise httpx.ConnectError("offline")
-        return jid in self.cancelled
+        owner = self.reassigned.get(jid)
+        if owner:
+            return agent.ProgressReply(False, True, owner)
+        return agent.ProgressReply(jid in self.cancelled)
 
 
 def _mid_run(s: Store, cloud_id: int) -> int:
@@ -113,6 +117,17 @@ def test_requeue_still_resumes_when_the_crm_is_unreachable(st):
     jid = _mid_run(st, 169)
     assert agent._requeue_orphans(st, "crm", _Cloud(cancelled={169}, offline=True)) == 1
     assert st.get_job(jid)["phase"] == "queued"
+
+
+def test_requeue_skips_a_job_reassigned_to_another_device(st):
+    """W114 (CRM T624): the stale-reclaim already handed this job to another machine
+    while we were asleep — do not resume our own copy alongside it."""
+    jid = _mid_run(st, 235)
+    cloud = _Cloud(cancelled=set(), reassigned={235: "2 - MAC"})
+    assert agent._requeue_orphans(st, "crm", cloud) == 0
+    j = st.get_job(jid)
+    assert j["phase"] == "stopped" and j["note"] == "synced" and j["stop_requested"] == 1
+    assert "2 - MAC" in (j["message"] or "")
 
 
 def test_far_places_are_not_counted_as_stubs(st):

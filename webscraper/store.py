@@ -454,13 +454,27 @@ class Store:
                 fields[k] = json.dumps(list(v) if isinstance(v, (tuple, set)) else v, ensure_ascii=False)
         cols = ",".join(f"{k}=?" for k in fields)
         sql, args = f"UPDATE jobs SET {cols} WHERE id=?", [*fields.values(), job_id]
+
+        def _do() -> None:
+            self.conn.execute(sql, args)
+            self.conn.commit()
         # W111 (CRM T606): job #81 on 3 - ASUS lost its discovery lane at 17:21 IST 2026-09-14 on a
         # progress write — "database is locked" after sqlite's own 30 s busy wait, while another of
         # this agent's connections held the write lock. A lock is transient: roll back, wait, retry.
+        # W113 (CRM T624) pulled the retry loop out into `_write()`, reused by every write method
+        # below instead of each one dying (and taking its lane down) on the same transient lock.
+        self._write(f"jobs row {job_id}", _do)
+
+    def _write(self, what: str, fn) -> None:
+        """W113 (CRM T624): run `fn` (one or more `self.conn.execute` + a final `commit()`),
+        retrying on a "database is locked" `sqlite3.OperationalError` exactly like update_job's
+        own W111 loop did. `fn` must be safe to call again from the top — only DB statements,
+        no side effects outside the connection. Any other error, or the retries run out,
+        re-raises — a genuine schema/bind error must still surface, not vanish into a warning.
+        """
         for attempt in range(LOCK_RETRIES + 1):
             try:
-                self.conn.execute(sql, args)
-                self.conn.commit()
+                fn()
                 return
             except sqlite3.OperationalError as e:
                 if "locked" not in str(e).lower() or attempt == LOCK_RETRIES:
@@ -469,7 +483,7 @@ class Store:
                     self.conn.rollback()
                 except sqlite3.Error:                             # noqa: BLE001
                     pass
-                log.warning("jobs row %s: database is locked — retry %d/%d", job_id, attempt + 1, LOCK_RETRIES)
+                log.warning("%s: database is locked — retry %d/%d", what, attempt + 1, LOCK_RETRIES)
                 time.sleep(LOCK_RETRY_SEC * (attempt + 1))
 
     # ── phase timing history (feeds the ETA; see eta.py) ─────────────────────
@@ -558,10 +572,12 @@ class Store:
     def lane_start(self, job_id: int, lane: str) -> None:
         started, ended, ok, reason = self.LANE_COLS[lane]
         # Clear a previous run's outcome so a resumed job does not show a stale reason.
-        self.conn.execute(
-            f"UPDATE jobs SET {started}=?, {ended}=NULL, {ok}=NULL, {reason}=NULL WHERE id=?",
-            (now_iso(), job_id))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                f"UPDATE jobs SET {started}=?, {ended}=NULL, {ok}=NULL, {reason}=NULL WHERE id=?",
+                (now_iso(), job_id))
+            self.conn.commit()
+        self._write(f"jobs row {job_id} (lane_start {lane})", _do)
 
     def lane_disabled(self, job_id: int, lane: str) -> None:
         """Mark a lane this job will not run, and CLEAR its stamps.
@@ -572,17 +588,21 @@ class Store:
         running for ever, with a spinner, on a job that had finished.
         """
         started, ended, ok, reason_col = self.LANE_COLS[lane]
-        self.conn.execute(
-            f"UPDATE jobs SET {started}=NULL, {ended}=NULL, {ok}=NULL, {reason_col}='disabled' "
-            f"WHERE id=?", (job_id,))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                f"UPDATE jobs SET {started}=NULL, {ended}=NULL, {ok}=NULL, {reason_col}='disabled' "
+                f"WHERE id=?", (job_id,))
+            self.conn.commit()
+        self._write(f"jobs row {job_id} (lane_disabled {lane})", _do)
 
     def lane_end(self, job_id: int, lane: str, reason: str) -> None:
         started, ended, ok, reason_col = self.LANE_COLS[lane]
-        self.conn.execute(
-            f"UPDATE jobs SET {ended}=?, {ok}=?, {reason_col}=? WHERE id=?",
-            (now_iso(), 1 if reason in self.OK_REASONS else 0, reason, job_id))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                f"UPDATE jobs SET {ended}=?, {ok}=?, {reason_col}=? WHERE id=?",
+                (now_iso(), 1 if reason in self.OK_REASONS else 0, reason, job_id))
+            self.conn.commit()
+        self._write(f"jobs row {job_id} (lane_end {lane})", _do)
 
     def lanes(self, job_id: int) -> dict[str, dict[str, Any]]:
         """Per-lane {started_at, ended_at, ok, reason} for the info dialog."""
@@ -700,32 +720,37 @@ class Store:
         `checks` (W99) — that counter, not a row count, is what settles an 'unknown' after
         its second look (`_wa_unchecked`). Returns the new (wa_verified, whatsapp_number)."""
         e164 = plus(number)
-        self.conn.execute(
-            "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account, checks) "
-            "VALUES (?,?,?,?,?,?,?,1) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
-            "source=excluded.source, verdict=excluded.verdict, checked_at=excluded.checked_at, "
-            "account=excluded.account, checks=COALESCE(wa_checks.checks, 1) + 1",
-            (job_id, place_key, e164, source, verdict, now_iso(), account))
-        checks = self.wa_checks(job_id, place_key)
-        agg, wa_num = aggregate_wa(checks)
-        summary = json.dumps([{"number": c["number"], "source": c["source"], "verdict": c["verdict"],
-                               "checks": int(c.get("checks") or 1)}
-                              for c in checks], ensure_ascii=False)
-        self.conn.execute(
-            "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=?, wa_numbers=? "
-            "WHERE job_id=? AND place_key=?",
-            (agg, now_iso(), account, summary, job_id, place_key))
-        if agg == "yes" and wa_num:
+        result: dict[str, Any] = {}
+
+        def _do() -> None:
             self.conn.execute(
-                "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
-                (wa_num, job_id, place_key))
-        elif agg == "no":
+                "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account, checks) "
+                "VALUES (?,?,?,?,?,?,?,1) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
+                "source=excluded.source, verdict=excluded.verdict, checked_at=excluded.checked_at, "
+                "account=excluded.account, checks=COALESCE(wa_checks.checks, 1) + 1",
+                (job_id, place_key, e164, source, verdict, now_iso(), account))
+            checks = self.wa_checks(job_id, place_key)
+            agg, wa_num = aggregate_wa(checks)
+            summary = json.dumps([{"number": c["number"], "source": c["source"], "verdict": c["verdict"],
+                                   "checks": int(c.get("checks") or 1)}
+                                  for c in checks], ensure_ascii=False)
             self.conn.execute(
-                "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL "
-                "WHERE job_id=? AND place_key=? AND whatsapp_source IN ('unverified','assumed_mobile')",
-                (job_id, place_key))
-        self.conn.commit()
-        return agg, wa_num
+                "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=?, wa_numbers=? "
+                "WHERE job_id=? AND place_key=?",
+                (agg, now_iso(), account, summary, job_id, place_key))
+            if agg == "yes" and wa_num:
+                self.conn.execute(
+                    "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
+                    (wa_num, job_id, place_key))
+            elif agg == "no":
+                self.conn.execute(
+                    "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL "
+                    "WHERE job_id=? AND place_key=? AND whatsapp_source IN ('unverified','assumed_mobile')",
+                    (job_id, place_key))
+            self.conn.commit()
+            result["agg"], result["wa_num"] = agg, wa_num
+        self._write(f"wa_checks {job_id}/{place_key}", _do)
+        return result["agg"], result["wa_num"]
 
     def seed_wa_checks(self, job_id: int, place_key: str, entries: list[dict[str, Any]]) -> int:
         """W104: carry the CRM's per-number WhatsApp history into a fresh local mirror.
@@ -746,11 +771,19 @@ class Store:
                 continue
             verdict = str(e.get("verdict") or "unknown")
             checks = max(1, int(e.get("checks") or 1))
-            self.conn.execute(
-                "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account, checks) "
-                "VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
-                "checks=MAX(COALESCE(wa_checks.checks, 1), excluded.checks)",
-                (job_id, place_key, "+" + digits, str(e.get("source") or "maps"), verdict, now_iso(), checks))
+            args = (job_id, place_key, "+" + digits, str(e.get("source") or "maps"), verdict, now_iso(), checks)
+
+            def _do(args=args) -> None:
+                self.conn.execute(
+                    "INSERT INTO wa_checks(job_id, place_key, number, source, verdict, checked_at, account, checks) "
+                    "VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(job_id, place_key, number) DO UPDATE SET "
+                    "checks=MAX(COALESCE(wa_checks.checks, 1), excluded.checks)", args)
+                self.conn.commit()
+            # W113 (CRM T624): this loop used to leave every INSERT above uncommitted — the caller
+            # (agent.py's CRM-results hydrate) only commits once after its own loop, so a large job
+            # could hold this connection's write transaction open across hundreds of rows. Commit
+            # (with lock retry) per row instead.
+            self._write(f"wa_checks seed {job_id}/{place_key}", _do)
             n += 1
         return n
 
@@ -769,16 +802,20 @@ class Store:
     # ── job_links: what the Maps feed offered vs what was opened ───────────────
     def save_links(self, job_id: int, cards: list[Any]) -> None:
         """Upsert the feed cards of this run; `opened` is never reset here."""
-        self.conn.executemany(
-            "INSERT INTO job_links(job_id, key, href, name, rating, reviews, lat, lng) "
-            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(job_id, key) DO UPDATE SET href=excluded.href, "
-            "name=COALESCE(excluded.name, job_links.name)",
-            [(job_id, c.key, c.href, c.name, c.rating, c.reviews_count, c.lat, c.lng) for c in cards])
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.executemany(
+                "INSERT INTO job_links(job_id, key, href, name, rating, reviews, lat, lng) "
+                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(job_id, key) DO UPDATE SET href=excluded.href, "
+                "name=COALESCE(excluded.name, job_links.name)",
+                [(job_id, c.key, c.href, c.name, c.rating, c.reviews_count, c.lat, c.lng) for c in cards])
+            self.conn.commit()
+        self._write(f"job_links {job_id}", _do)
 
     def mark_link_opened(self, job_id: int, key: str) -> None:
-        self.conn.execute("UPDATE job_links SET opened=1 WHERE job_id=? AND key=?", (job_id, key))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute("UPDATE job_links SET opened=1 WHERE job_id=? AND key=?", (job_id, key))
+            self.conn.commit()
+        self._write(f"job_links {job_id}/{key}", _do)
 
     def pending_links(self, job_id: int) -> list[dict[str, Any]]:
         """Feed links this job never opened, in feed order."""
@@ -790,12 +827,16 @@ class Store:
         return {r[0] for r in self.conn.execute("SELECT step FROM collect_steps WHERE job_id=?", (job_id,))}
 
     def mark_collect_step(self, job_id: int, step: str) -> None:
-        self.conn.execute("INSERT OR IGNORE INTO collect_steps(job_id, step) VALUES (?, ?)", (job_id, step))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute("INSERT OR IGNORE INTO collect_steps(job_id, step) VALUES (?, ?)", (job_id, step))
+            self.conn.commit()
+        self._write(f"collect_steps {job_id}/{step}", _do)
 
     def clear_collect_steps(self, job_id: int) -> None:
-        self.conn.execute("DELETE FROM collect_steps WHERE job_id=?", (job_id,))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute("DELETE FROM collect_steps WHERE job_id=?", (job_id,))
+            self.conn.commit()
+        self._write(f"collect_steps {job_id}", _do)
 
     def next_pending_link(self, job_id: int) -> dict[str, Any] | None:
         """The oldest unopened feed link — what the opener thread takes next (W26)."""
@@ -814,12 +855,17 @@ class Store:
         which is exactly what a stub is. Clearing the flag hands them back to the ordinary
         opener, which is the code that knows how to read a panel.
         """
-        cur = self.conn.execute(
-            "UPDATE job_links SET opened=0 WHERE job_id=? AND opened=1 AND key IN ("
-            "  SELECT place_key FROM places WHERE job_id=? AND detail_status='pending')",
-            (job_id, job_id))
-        self.conn.commit()
-        return int(cur.rowcount or 0)
+        result: dict[str, Any] = {}
+
+        def _do() -> None:
+            cur = self.conn.execute(
+                "UPDATE job_links SET opened=0 WHERE job_id=? AND opened=1 AND key IN ("
+                "  SELECT place_key FROM places WHERE job_id=? AND detail_status='pending')",
+                (job_id, job_id))
+            self.conn.commit()
+            result["rowcount"] = cur.rowcount
+        self._write(f"job_links reopen {job_id}", _do)
+        return int(result["rowcount"] or 0)
 
     def count_unopened_links(self, job_id: int) -> int:
         r = self.conn.execute(
@@ -833,15 +879,23 @@ class Store:
         a place already opened (or enriched) keeps everything. Returns rows inserted."""
         n = 0
         ts = now_iso()
-        for c in cards:
+
+        def _do(c) -> int:
             cur = self.conn.execute(
                 "INSERT INTO places(job_id, place_key, name, rating, reviews_count, lat, lng, maps_url, "
                 "country, enrich_status, detail_status, scraped_at, emails, team, site_phones, raw) "
                 "VALUES (?,?,?,?,?,?,?,?,?,'pending','pending',?,'[]','[]','[]','{}') "
                 "ON CONFLICT(job_id, place_key) DO NOTHING",
                 (job_id, c.key, c.name, c.rating, c.reviews_count, c.lat, c.lng, c.href, country, ts))
-            n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-        self.conn.commit()
+            self.conn.commit()
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        for c in cards:
+            result: dict[str, Any] = {}
+
+            def _once(c=c) -> None:
+                result["n"] = _do(c)
+            self._write(f"places stub {job_id}/{c.key}", _once)
+            n += result["n"]
         return n
 
     def drop_stub(self, job_id: int, place_key: str) -> bool:
@@ -856,11 +910,16 @@ class Store:
         exactly those (2026-09-05). Every reader that means "a real place" already filters
         on `COALESCE(detail_status,'done')='done'`, so a 'far' row is invisible to the
         lanes. Only ever touches a row still at detail_status='pending'."""
-        cur = self.conn.execute(
-            "UPDATE places SET detail_status='far' WHERE job_id=? AND place_key=? AND detail_status='pending'",
-            (job_id, place_key))
-        self.conn.commit()
-        return bool(cur.rowcount)
+        result: dict[str, Any] = {}
+
+        def _do() -> None:
+            cur = self.conn.execute(
+                "UPDATE places SET detail_status='far' WHERE job_id=? AND place_key=? AND detail_status='pending'",
+                (job_id, place_key))
+            self.conn.commit()
+            result["rowcount"] = cur.rowcount
+        self._write(f"places drop_stub {job_id}/{place_key}", _do)
+        return bool(result["rowcount"])
 
     def count_places_detailed(self, job_id: int) -> int:
         """Places whose panel was actually read (stubs excluded) — the discovery lane's done."""
@@ -941,21 +1000,23 @@ class Store:
     # ── WhatsApp verification: numbers + account rotation with a per-account daily cap ──
     def set_wa_verify(self, job_id: int, place_key: str, status: str, account: str | None,
                       wa_number: str | None = None, prior_source: str | None = None) -> None:
-        self.conn.execute(
-            "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=? WHERE job_id=? AND place_key=?",
-            (status, now_iso(), account, job_id, place_key))
-        # On a confirmed hit, promote the verified number into whatsapp_number and mark the
-        # source 'verified' (replacing an 'unverified' candidate). On a miss, drop the
-        # candidate so an unverified number never lingers as if it were a WhatsApp.
-        if status == "yes" and wa_number:
+        def _do() -> None:
             self.conn.execute(
-                "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
-                (plus(wa_number), job_id, place_key))
-        elif status == "no" and prior_source in ("unverified", "assumed_mobile"):
-            self.conn.execute(
-                "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL WHERE job_id=? AND place_key=?",
-                (job_id, place_key))
-        self.conn.commit()
+                "UPDATE places SET wa_verified=?, wa_verified_at=?, wa_verify_account=? WHERE job_id=? AND place_key=?",
+                (status, now_iso(), account, job_id, place_key))
+            # On a confirmed hit, promote the verified number into whatsapp_number and mark the
+            # source 'verified' (replacing an 'unverified' candidate). On a miss, drop the
+            # candidate so an unverified number never lingers as if it were a WhatsApp.
+            if status == "yes" and wa_number:
+                self.conn.execute(
+                    "UPDATE places SET whatsapp_number=?, whatsapp_source='verified' WHERE job_id=? AND place_key=?",
+                    (plus(wa_number), job_id, place_key))
+            elif status == "no" and prior_source in ("unverified", "assumed_mobile"):
+                self.conn.execute(
+                    "UPDATE places SET whatsapp_number=NULL, whatsapp_source=NULL WHERE job_id=? AND place_key=?",
+                    (job_id, place_key))
+            self.conn.commit()
+        self._write(f"places wa_verify {job_id}/{place_key}", _do)
 
     def list_wa_accounts(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM wa_accounts ORDER BY name")]
@@ -975,11 +1036,13 @@ class Store:
                 self.conn.execute(f"ALTER TABLE wa_accounts ADD COLUMN {col} {typ}")
             except Exception:                                     # noqa: BLE001 — already there
                 pass
-        self.conn.execute(
-            "INSERT INTO wa_accounts(name, added_at, status, status_at) VALUES (?,?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET status=excluded.status, status_at=excluded.status_at",
-            (name, now_iso(), status, now_iso()))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                "INSERT INTO wa_accounts(name, added_at, status, status_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET status=excluded.status, status_at=excluded.status_at",
+                (name, now_iso(), status, now_iso()))
+            self.conn.commit()
+        self._write(f"wa_accounts {name}", _do)
 
     def wa_relinked_since(self, since_iso: str) -> bool:
         """W110: has an enabled account been SEEN logged in at or after `since_iso`?"""
@@ -993,35 +1056,45 @@ class Store:
     def add_wa_account(self, name: str) -> None:
         # Upsert + re-enable: a fresh wa-login clears a prior 'disabled' flag (e.g. one
         # set when a headless verify misread the session as logged-out).
-        self.conn.execute(
-            "INSERT INTO wa_accounts(name, added_at) VALUES (?, ?) "
-            "ON CONFLICT(name) DO UPDATE SET disabled=0", (name, now_iso()))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                "INSERT INTO wa_accounts(name, added_at) VALUES (?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET disabled=0", (name, now_iso()))
+            self.conn.commit()
+        self._write(f"wa_accounts add {name}", _do)
 
     def rename_wa_account(self, old: str, new: str) -> bool:
         """W80: rename an account row (and its per-number history) — False if `old` is unknown
         or `new` is already taken. The profile directory is the caller's business."""
         if self.conn.execute("SELECT 1 FROM wa_accounts WHERE name=?", (new,)).fetchone():
             return False
-        cur = self.conn.execute("UPDATE wa_accounts SET name=? WHERE name=?", (new, old))
-        if cur.rowcount == 0:
-            return False
-        try:
-            self.conn.execute("UPDATE wa_checks SET account=? WHERE account=?", (new, old))
-        except sqlite3.Error:                                     # noqa: BLE001 — older schema
-            pass
-        self.conn.commit()
-        return True
+        result: dict[str, Any] = {}
+
+        def _do() -> None:
+            cur = self.conn.execute("UPDATE wa_accounts SET name=? WHERE name=?", (new, old))
+            result["rowcount"] = cur.rowcount
+            if cur.rowcount:
+                try:
+                    self.conn.execute("UPDATE wa_checks SET account=? WHERE account=?", (new, old))
+                except sqlite3.Error:                             # noqa: BLE001 — older schema
+                    pass
+            self.conn.commit()
+        self._write(f"wa_accounts rename {old}->{new}", _do)
+        return bool(result["rowcount"])
 
     def remove_wa_account(self, name: str) -> None:
-        self.conn.execute("DELETE FROM wa_accounts WHERE name=?", (name,))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute("DELETE FROM wa_accounts WHERE name=?", (name,))
+            self.conn.commit()
+        self._write(f"wa_accounts remove {name}", _do)
 
     def _roll_day(self, today: str) -> None:
         """Zero every account's counter whose stored day is not today (lazy daily reset)."""
-        self.conn.execute("UPDATE wa_accounts SET sent_today=0, day=? WHERE day IS NULL OR day<>?",
-                          (today, today))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute("UPDATE wa_accounts SET sent_today=0, day=? WHERE day IS NULL OR day<>?",
+                              (today, today))
+            self.conn.commit()
+        self._write(f"wa_accounts roll_day {today}", _do)
 
     def wa_capacity(self, cap: int, today: str) -> int:
         """Total remaining checks across all enabled accounts for `today`."""
@@ -1048,10 +1121,12 @@ class Store:
         return row[0] if row else None
 
     def bump_wa_account(self, name: str, today: str) -> None:
-        self.conn.execute(
-            "UPDATE wa_accounts SET sent_today=sent_today+1, last_used_at=?, day=? WHERE name=?",
-            (now_iso(), today, name))
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                "UPDATE wa_accounts SET sent_today=sent_today+1, last_used_at=?, day=? WHERE name=?",
+                (now_iso(), today, name))
+            self.conn.commit()
+        self._write(f"wa_accounts bump {name}", _do)
 
     def export_xlsx(self, job_id: int | None, out: Path | None = None, unique: bool = False) -> Path:
         from openpyxl import Workbook
@@ -1090,23 +1165,31 @@ class Store:
                    window_start: str | None = None, window_end: str | None = None,
                    center_lat: float | None = None, center_lng: float | None = None,
                    max_minutes: int | None = None, unique_new: bool = False) -> int:
-        cur = self.conn.execute(
-            "INSERT INTO jobs(query, location, max_places, delay_sec, status, created_at, phase, do_enrich, headless, "
-            "country, radius_km, window_start, window_end, center_lat, center_lng, max_minutes, unique_new) "
-            "VALUES (?,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,?,?)",
-            (query, location, max_places, delay_sec, now_iso(), phase, int(do_enrich), int(headless), country,
-             radius_km, window_start, window_end, center_lat, center_lng, max_minutes, int(unique_new)),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
+        result: dict[str, Any] = {}
+
+        def _do() -> None:
+            cur = self.conn.execute(
+                "INSERT INTO jobs(query, location, max_places, delay_sec, status, created_at, phase, do_enrich, headless, "
+                "country, radius_km, window_start, window_end, center_lat, center_lng, max_minutes, unique_new) "
+                "VALUES (?,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,?,?)",
+                (query, location, max_places, delay_sec, now_iso(), phase, int(do_enrich), int(headless), country,
+                 radius_km, window_start, window_end, center_lat, center_lng, max_minutes, int(unique_new)),
+            )
+            self.conn.commit()
+            result["id"] = cur.lastrowid
+        self._write(f"jobs create ({query!r})", _do)
+        return int(result["id"])
 
     def finish_job(self, job_id: int, status: str = "done", note: str | None = None) -> None:
         n = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()[0]
-        self.conn.execute(
-            "UPDATE jobs SET status=?, note=?, found_count=?, finished_at=? WHERE id=?",
-            (status, note, n, now_iso(), job_id),
-        )
-        self.conn.commit()
+
+        def _do() -> None:
+            self.conn.execute(
+                "UPDATE jobs SET status=?, note=?, found_count=?, finished_at=? WHERE id=?",
+                (status, note, n, now_iso(), job_id),
+            )
+            self.conn.commit()
+        self._write(f"jobs finish {job_id}", _do)
 
     def get_job(self, job_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1162,12 +1245,14 @@ class Store:
         # nulled them. Non-null values still overwrite (a re-scrape is authoritative).
         updates = ",".join(f"{c}=COALESCE(excluded.{c}, places.{c})"
                            for c in PLACE_COLS if c not in ("job_id", "place_key"))
-        self.conn.execute(
-            f"INSERT INTO places({','.join(PLACE_COLS)}) VALUES ({placeholders}) "
-            f"ON CONFLICT(job_id, place_key) DO UPDATE SET {updates}",
-            vals,
-        )
-        self.conn.commit()
+        def _do() -> None:
+            self.conn.execute(
+                f"INSERT INTO places({','.join(PLACE_COLS)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(job_id, place_key) DO UPDATE SET {updates}",
+                vals,
+            )
+            self.conn.commit()
+        self._write(f"places upsert {p.job_id}/{p.place_key}", _do)
 
     def update_enrichment(self, job_id: int, place_key: str, fields: dict[str, Any]) -> None:
         fields = dict(fields)
@@ -1181,11 +1266,14 @@ class Store:
             if isinstance(v, (list, dict, tuple, set)):
                 fields[k] = json.dumps(list(v) if isinstance(v, (tuple, set)) else v, ensure_ascii=False)
         cols = ",".join(f"{k}=?" for k in fields)
-        self.conn.execute(
-            f"UPDATE places SET {cols} WHERE job_id=? AND place_key=?",
-            [*fields.values(), job_id, place_key],
-        )
-        self.conn.commit()
+
+        def _do() -> None:
+            self.conn.execute(
+                f"UPDATE places SET {cols} WHERE job_id=? AND place_key=?",
+                [*fields.values(), job_id, place_key],
+            )
+            self.conn.commit()
+        self._write(f"places update_enrichment {job_id}/{place_key}", _do)
 
     def places_changed_since(self, job_id: int, since: str, upto_rowid: int) -> tuple[list[dict[str, Any]], str]:
         """Places already streamed (rowid <= upto_rowid) that changed after `since`, plus the
