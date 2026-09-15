@@ -12,6 +12,7 @@ import logging
 import queue
 import random
 import re
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -474,6 +475,42 @@ def _card_from_link(r: dict) -> FeedCard:
                     reviews_count=r.get("reviews"), lat=r.get("lat"), lng=r.get("lng"))
 
 
+#: W115 (CRM T646): retries of ONE tile's persist on top of Store._write's own LOCK_RETRIES,
+#: before giving up on just that tile instead of letting the lock climb out and end collection.
+PERSIST_RETRIES = 4
+PERSIST_RETRY_SEC = 3.0
+
+
+def _persist_tile(cstore: Store, job_id: int, fresh: list, country: str | None, step: str,
+                  tile: int, tiles: int, emit: Callable[[str, dict], None]) -> bool:
+    """W115 (CRM T646): save this tile's stub places + links and mark its step done, retrying
+    a locked DB rather than raising it into `_collect_links`'s outer `except Exception` — that
+    used to end the WHOLE collection on one transient lock (job #323 on the Dell agent: 7
+    "database is locked" retries in `Store._write`, then "link collection stopped ... opening
+    what was found", losing every tile still to search). `Store._write` already retries each
+    individual statement; this wraps the tile's two-part write (stubs + links, then the step
+    marker) so a lock spanning that whole sequence still resolves with the job's OWN connections
+    (worker/opener/enrich lanes on the same sqlite file) rather than aborting the run. Returns
+    False only after every retry is spent, and only for this one tile — the caller carries on."""
+    for attempt in range(PERSIST_RETRIES + 1):
+        try:
+            if fresh:
+                cstore.save_stub_places(job_id, fresh, country)
+                cstore.save_links(job_id, fresh)
+            cstore.mark_collect_step(job_id, step)
+            return True
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise                      # a genuine schema/bind error must still surface
+            if attempt == PERSIST_RETRIES:
+                emit("tile_persist_failed", {"tile": tile, "tiles": tiles,
+                                             "error": f"{type(e).__name__}: {str(e)[:160]}"})
+                return False
+            emit("tile_persist_retry", {"tile": tile, "tiles": tiles, "attempt": attempt + 1})
+            time.sleep(PERSIST_RETRY_SEC * (attempt + 1))
+    return False
+
+
 def _collect_links(*, store_path: Path, job_id: int, queries: list[str], location: str | None,
                    limit: int, unlimited: bool, max_places: int, headless: bool, country: str,
                    emit: Callable[[str, dict], None], radius_km: float | None,
@@ -526,9 +563,12 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 # to SPLIT_MIN_KM. Dense cities end up on fine tiles, empty land costs one search.
                 SPLIT_AT = MAPS_PAGE_CAP - 10     # a feed this full was probably truncated
                 SPLIT_MIN_KM = 0.5
-                # W111 (CRM T606): a Maps timeout retries the tile once, then skips only that tile;
+                # W111 (CRM T606): a Maps timeout retries the tile, then skips only that tile;
                 # MAX_TILE_FAILS skipped tiles in a row (Maps really down) still ends the collection.
-                TILE_TIMEOUT_RETRIES = 1
+                # W115 (CRM T646): two in-place retries now (was one), with growing backoff, and the
+                # LAST retry gets a fresh page — a page that has already timed out twice tends to be
+                # the thing that's stuck (detached frame, wedged renderer), not just a slow tile.
+                TILE_TIMEOUT_RETRIES = 2
                 MAX_TILE_FAILS = 3
                 MAX_STEPS = 6000                  # (tile, keyword) pairs — safety, the time budget rules in practice
                 if tiling:
@@ -565,6 +605,10 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 tiles_seen: set[tuple[float, float]] = set(centers)
                 s_i = 0
                 fail_streak = 0
+                # W115 (CRM T646): tiles that ran out of in-place retries, grouped by band, so
+                # they can be re-queued once at the end of their band instead of just vanishing.
+                band_failed: dict[int, list[tuple]] = {}
+                requeued: set[str] = set()
                 while s_i < len(steps):
                     s_i += 1
                     qy, c, tk, band = steps[s_i - 1]
@@ -617,14 +661,37 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                             first_line = str(e).split("\n")[0][:160]
                             timeouts += 1
                             if timeouts <= TILE_TIMEOUT_RETRIES:
+                                if timeouts == TILE_TIMEOUT_RETRIES:
+                                    # W115: the last in-place attempt gets a fresh page — a page
+                                    # that has already timed out is often the actual problem.
+                                    try:
+                                        stale = page
+                                        page = ctx.new_page()
+                                        stale.close()
+                                        emit("tile_page_recycled", {"tile": s_i, "tiles": len(steps)})
+                                    except PWError:
+                                        pass                       # keep the stale page, still worth a try
                                 emit("tile_retry", {"tile": s_i, "tiles": len(steps), "error": first_line})
-                                time.sleep(random.uniform(5, 10))
+                                time.sleep(min(30.0, 5.0 * timeouts) + random.uniform(0, 3))  # growing backoff
                                 continue
                             fail_streak += 1
                             if fail_streak >= MAX_TILE_FAILS:
                                 raise
                             emit("tile_failed", {"tile": s_i, "tiles": len(steps), "error": first_line})
+                            if key not in requeued:               # W115: give it one more shot, band-end
+                                band_failed.setdefault(band, []).append(steps[s_i - 1])
                             break
+                    # W115 (CRM T646): reached the end of this band (no more queued steps share its
+                    # band number, or this was the last step) — re-queue anything that band lost to
+                    # a timeout, once, instead of the run just carrying on without it.
+                    band_end = s_i == len(steps) or steps[s_i][3] != band
+                    if band_end and band in band_failed:
+                        for st_ in band_failed.pop(band):
+                            stk = step_key(*st_)
+                            if stk not in requeued:
+                                requeued.add(stk)
+                                steps.append(st_)
+                        emit("tiles", {"count": len(steps)})
                     if cards is None:
                         continue                          # W111: this tile skipped, the rest carry on
                     fail_streak = 0
@@ -649,14 +716,19 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                     # stub rows are what the CRM shows before the panel has been read.
                     # Stub rows BEFORE the links: the opener takes a link the instant it is
                     # committed, and its fill must land on an existing row.
-                    if fresh:
-                        cstore.save_stub_places(job_id, fresh, country)
-                        cstore.save_links(job_id, fresh)
-                    emit("tile", {"tile": s_i, "tiles": len(steps), "added": len(fresh), "total": len(merged)})
+                    # W115 (CRM T646): a lock here used to raise straight out of the collector
+                    # and end the whole run; now it retries (beyond Store's own retries) and,
+                    # only if still locked, leaves this one tile unmarked (a re-run repeats it)
+                    # instead of losing every tile after it.
+                    persisted = _persist_tile(cstore, job_id, fresh, country, key, s_i, len(steps), emit)
+                    if not persisted:
+                        merged.difference_update(c.key for c in fresh)   # free them to retry if seen again
+                    emit("tile", {"tile": s_i, "tiles": len(steps),
+                                  "added": len(fresh) if persisted else 0, "total": len(merged)})
                     emit("links", {"count": len(merged), "tile": s_i, "tiles": len(steps)})
-                    # W112: remember this step (a re-run carries on after it) and report coverage.
-                    cstore.mark_collect_step(job_id, key)
-                    done_steps.add(key)
+                    if persisted:
+                        # W112: remember this step (a re-run carries on after it) and report coverage.
+                        done_steps.add(key)
                     run_steps += 1
                     if band == 0 and tk == tile_km and top_left.get(c, 0) > 0:
                         top_left[c] -= 1

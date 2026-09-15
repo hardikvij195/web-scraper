@@ -293,6 +293,14 @@ class Store:
         self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # W115 (CRM T646): explicit busy_timeout matches the connect(timeout=) above (belt and
+        # braces — some sqlite builds only honour one of the two) and synchronous=NORMAL is the
+        # standard WAL pairing: it skips the fsync after every commit (WAL's own checkpoint still
+        # fsyncs), so a writer holds the lock for far less time under the small-frequent-commit
+        # pattern every `_write()` caller uses — fewer, shorter locks for every other connection
+        # on this same file (worker + web UI + collector/opener Stores) to wait behind.
+        self.conn.execute("PRAGMA busy_timeout=30000")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self._migrate()
 
