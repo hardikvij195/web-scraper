@@ -11,7 +11,7 @@ import logging
 import sys
 import threading
 import time
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import httpx
 
@@ -943,10 +943,19 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             ACTIVE_PHASES).fetchone()
         return row is not None
 
+    prev_busy = False  # W115: edge-detect busy->idle so a self-update check fires right
+                       # at the job boundary, not just on the 30-min idle timer.
+
     while True:
         if kind == "crm":
             _poll_command(cloud)
             _ship_agent_logs(cloud, crm_log)
+            try:
+                now_busy = _busy()
+                _maybe_self_update(cloud, force=(prev_busy and not now_busy))
+                prev_busy = now_busy
+            except Exception:                              # noqa: BLE001
+                log.debug("self-update check failed", exc_info=True)
         # W69: a revoked token is not a network hiccup. Stop the work this machine is
         # doing — the CRM can no longer see it, so anything it opens is unaccountable —
         # and park, which is the same state Stop leaves the agent in and is recoverable
@@ -1245,6 +1254,75 @@ def _do_restart(cloud: "CrmCloud", cmd_id: int | None) -> None:
         cloud.command_done(int(cmd_id), True, "restarting")
     _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
     _close_browsers(); _os._exit(0)
+
+
+#: W115 (CRM T646): opt-in (default ON) self-update. The fleet stayed on 1.9.3 while 1.9.4
+#: was already out — nothing ever asked a machine to check for itself, only a human pressing
+#: "Update agent" in the CRM did. Checked at every job boundary and, while idle, at most once
+#: every SELF_UPDATE_CHECK_SEC — never more often, `git fetch` + a subprocess is not free.
+SELF_UPDATE_CHECK_SEC = 1800.0
+_last_self_update_check = [0.0]
+
+
+def _self_update_enabled() -> bool:
+    import os
+    return (os.getenv("WEBSCRAPER_AUTO_UPDATE") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _version_tuple(v: str) -> tuple:
+    out = []
+    for p in (v or "").strip().split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def _remote_version() -> str | None:
+    """origin/main's VERSION file via a cheap `git fetch` + `git show` — never checks
+    anything out itself, so it cannot disturb a job that starts while this runs."""
+    import subprocess
+    from webscraper.config import ROOT
+    try:
+        fetch = subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=30)
+        if fetch.returncode != 0:
+            log.debug("self-update: git fetch failed: %s", (fetch.stderr or "").strip()[:200])
+            return None
+        show = subprocess.run(["git", "show", "origin/main:VERSION"], cwd=ROOT,
+                              capture_output=True, text=True, timeout=15)
+        if show.returncode != 0:
+            return None
+        return show.stdout.strip()
+    except Exception:                                             # noqa: BLE001
+        log.debug("self-update: version check failed", exc_info=True)
+        return None
+
+
+def _maybe_self_update(cloud: "CrmCloud", *, force: bool = False) -> None:
+    """Queue the exact same deferred `update` W100 already runs at the next job boundary
+    (`_run_deferred` / `_do_update`), if origin/main's VERSION is ahead of this machine's
+    own. Never runs an update itself — it only ever sets `_DEFERRED_CMD`, the same slot a
+    CRM-sent `update` command fills, so "never while a job runs" and "at the job boundary"
+    are exactly `_run_deferred`'s own guards, not a second copy of them here."""
+    if not _self_update_enabled() or _DEFERRED_CMD[0] is not None:
+        return                                    # disabled, or an update/restart is already queued
+    now = time.monotonic()
+    if not force and (now - _last_self_update_check[0]) < SELF_UPDATE_CHECK_SEC:
+        return
+    _last_self_update_check[0] = now
+    from webscraper.config import ROOT
+    try:
+        local = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    remote = _remote_version()
+    if not remote or _version_tuple(remote) <= _version_tuple(local):
+        return
+    log.info("self-update: origin/main is on %s, this machine is on %s — queuing an update "
+             "for the next job boundary", remote, local)
+    _DEFERRED_CMD[0] = "update"
 
 
 def _run_deferred(cloud: "CrmCloud") -> bool:
@@ -1968,6 +2046,32 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
 #: `synced_upto`; a restart re-sends one tick's worth of updates, absorbed by the upsert.
 _changed_upto: dict[int, str] = {}
 
+#: W115 (CRM T646): backoff schedule for `_cloud_retry` — transient network blips
+#: ("Server disconnected without sending a response", a read timeout, `getaddrinfo failed`
+#: DNS hiccups) resolve within seconds; without an in-tick retry every one of them fell
+#: through to "will retry next tick" and waited a full poll interval.
+_CLOUD_RETRY_BACKOFF = (2.0, 5.0, 10.0)
+
+
+def _cloud_retry(fn: Callable[[], Any], what: str) -> Any:
+    """Run one cloud call, retrying a transient `httpx.HTTPError` with backoff before it
+    reaches the caller's own "give up, retry next tick" handling. The watermark a caller
+    advances only on success either way — this just means most transient failures never
+    get that far, so a batch already fetched does not sit unsent for a whole poll interval
+    (and never has to be re-fetched/re-flattened for the next tick's attempt)."""
+    last: httpx.HTTPError | None = None
+    for attempt, wait in enumerate((*_CLOUD_RETRY_BACKOFF, None)):
+        try:
+            return fn()
+        except httpx.HTTPError as e:
+            last = e
+            if wait is None:
+                raise
+            log.warning("%s: transient error (%s) — retry %d/%d in %.0fs",
+                        what, e, attempt + 1, len(_CLOUD_RETRY_BACKOFF), wait)
+            time.sleep(wait)
+    raise last   # pragma: no cover — the loop above always returns or raises first
+
 
 def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
           synced_upto: dict[int, int] | None = None) -> None:
@@ -2080,21 +2184,28 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 if changed:
                     try:
                         for i in range(0, len(changed), 200):
-                            cloud.sync(cid, [_flat(c) for c in changed[i:i + 200]])
+                            batch = [_flat(c) for c in changed[i:i + 200]]
+                            _cloud_retry(lambda b=batch: cloud.sync(cid, b), f"update stream to #{cid}")
                         _changed_upto[row["id"]] = ctop
                         log.info("streamed %d updated lead(s) to job #%s", len(changed), cid)
                     except httpx.HTTPError as e:
+                        # W115: watermark untouched — the whole batch is re-fetched and
+                        # re-sent next tick, nothing in it is lost.
                         log.warning("update stream to #%s failed (will retry next tick): %s", cid, e)
                 fresh, top = store.places_after(row["id"], synced_upto.get(row["id"], 0))
                 if fresh:
                     try:
                         for i in range(0, len(fresh), 200):
-                            cloud.sync(cid, [_flat(f) for f in fresh[i:i + 200]])
+                            batch = [_flat(f) for f in fresh[i:i + 200]]
+                            _cloud_retry(lambda b=batch: cloud.sync(cid, b), f"stream to #{cid}")
                         synced_upto[row["id"]] = top
                         log.info("streamed %d new lead(s) to job #%s", len(fresh), cid)
                     except httpx.HTTPError as e:
+                        # W115: watermark untouched — the whole batch is re-fetched and
+                        # re-sent next tick, nothing in it is lost.
                         log.warning("stream to #%s failed (will retry next tick): %s", cid, e)
-            reply = cloud.progress(cid, row["phase"], _local_progress(row, store))
+            reply = _cloud_retry(lambda: cloud.progress(cid, row["phase"], _local_progress(row, store)),
+                                 f"progress for #{cid}")
             if reply.cancelled:
                 store.update_job(row["id"], stop_requested=1, note="synced")
             elif reply.reassigned:
@@ -2107,7 +2218,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             rows = store.places(row["id"])
             quota_hit = False
             for i in range(0, len(rows), 200):
-                res = cloud.sync(cid, [_flat(r) for r in rows[i:i + 200]])
+                batch = [_flat(r) for r in rows[i:i + 200]]
+                res = _cloud_retry(lambda b=batch: cloud.sync(cid, b), f"final sync for #{cid}")
                 log.info("sync job #%s: accepted %s, rejected_quota %s",
                          cid, res.get("accepted"), res.get("rejected_quota"))
                 if res.get("rejected_quota"):
@@ -2125,7 +2237,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 # status=running / reason=None and had to guess: job #13 (2026-08-25)
                 # showed enrichment + WhatsApp "Completed" on 0 / 0 after discovery died.
                 try:
-                    cloud.progress(cid, row["phase"], _local_progress(row, store))
+                    _cloud_retry(lambda: cloud.progress(cid, row["phase"], _local_progress(row, store)),
+                                f"final progress for #{cid}")
                 except httpx.HTTPError as e:
                     log.warning("final progress for #%s failed (done still sent): %s", cid, e)
                 # W83: 'stopped' after every lane completed (a watchdog that fired during
