@@ -13,6 +13,19 @@
 
 ---
 
+- [x] **W118** `agent.py` + `server.py` (CRM T765, 2026-09-17/18) — "cross check duplicate
+  leads … both scraper and Leads module": `unique_new` jobs also skip places ANY OTHER
+  machine already scraped, not just this one's local sqlite. `CrmCloud.known_keys(country)`
+  hits a new CRM Edge Fn action (`lead_gen_known_place_keys` RPC, service_role only) once per
+  job start (never per tile — the collector only ever sees the already-merged set);
+  `server.fetch_known_cloud_keys()` merges it into the local `all_place_keys()` set and logs
+  `known places skipped: local N + cloud M`. An old Edge Fn / a down CRM / the SaaS `Cloud`
+  (no such method) all degrade to "no cloud keys", never a failed job; a job without
+  `unique_new` never calls the cloud. CRM half (same migration): a BEFORE INSERT/UPDATE
+  trigger on `lead_gen_results` links a result to a live `leads` row by phone (exact, else
+  last-10 digits, same expression as `lead_finder_import_whatsapp`) when not already linked —
+  the scraper against the Leads module, at result-write time. Tests:
+  `tests/test_w118_known_keys.py` (8, no network).
 - [x] **W117** `geocode.py` (new) + `maps.py` + `server.py` (CRM T759, 2026-09-17) — a tiny UK
   place ("Sandwick") that Maps can't find served results near the scraping machines
   (Noida/India), and the radius centre (median of those results) drifted with them so the

@@ -13,7 +13,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -200,6 +200,22 @@ def _refresh_wa_status(store, when: str) -> None:
         log.debug("WhatsApp status refresh skipped", exc_info=True)
 
 
+def fetch_known_cloud_keys(unique_new: bool, fetcher: Callable[[str | None], set[str]] | None,
+                            country: str | None, job_id: int = 0) -> set[str]:
+    """W118 (CRM T765): one network call per job start, never per tile/area. A job without
+    `unique_new` never calls the cloud at all (nothing to merge into); no fetcher configured
+    (local-only run, or the old SaaS `Cloud` with no such method) or any failure while calling
+    it both degrade to an empty set — the cross-machine check is best-effort and must never
+    fail a job."""
+    if not unique_new or fetcher is None:
+        return set()
+    try:
+        return set(fetcher(country) or set())
+    except Exception:                                             # noqa: BLE001
+        log.warning("job #%s: cloud known_keys fetch failed — local keys only", job_id, exc_info=True)
+        return set()
+
+
 class Worker(threading.Thread):
     """Sequential job runner. Polls the DB for `phase='queued'` so jobs survive a restart."""
 
@@ -207,6 +223,10 @@ class Worker(threading.Thread):
         super().__init__(name="scrape-worker", daemon=True)
         self.wake = threading.Event()
         self.current_job: int | None = None
+        #: W118 (CRM T765): set by the CRM agent (`run_agent`) to `CrmCloud.known_keys` —
+        #: a local-only run (no `srv.worker.known_keys_fetcher`) or the old SaaS `Cloud`
+        #: (no such method) both leave this `None`, so `unique_new` falls back to local-only.
+        self.known_keys_fetcher: Callable[[str | None], set[str]] | None = None
 
     def run(self) -> None:  # noqa: C901 — linear orchestration, fine
         from webscraper.enrich import enrich_places
@@ -502,12 +522,25 @@ class Worker(threading.Thread):
                         areas_to_run: list = []
                     else:
                         areas_to_run = list(areas)
+                    # W118 (CRM T765): 'only new businesses' also skips places ANY OTHER
+                    # machine already scraped, not just this one's local sqlite. Fetched ONCE
+                    # per job start (a network call), never per area/tile — the collector
+                    # thread only ever sees the already-merged set (CLAUDE.md: it never calls
+                    # a lane callback). An old Edge Fn / a down CRM / the SaaS `Cloud` (no
+                    # such method) all degrade to "no cloud keys", never to a failed job.
+                    known_cloud = (fetch_known_cloud_keys(bool(job["unique_new"]), self.known_keys_fetcher,
+                                                           job["country"], job_id)
+                                   if areas_to_run else set())
                     for idx, area in enumerate(areas_to_run):
                         if should_stop():
                             break
                         area_label["txt"] = (f"area {idx + 1}/{len(areas)} ({area['location'] or 'anywhere'}): "
                                              if len(areas) > 1 else "")
-                        known = store.all_place_keys() if job["unique_new"] else None
+                        known_local = store.all_place_keys() if job["unique_new"] else None
+                        known = (known_local | known_cloud) if known_local is not None else None
+                        if known_local is not None and idx == 0:
+                            store.log(job_id, "discovery",
+                                      f"known places skipped: local {len(known_local)} + cloud {len(known_cloud)}")
                         run_scrape(store, job_id, job["query"], area["location"], int(job["max_places"]), pacing,
                                    headless=False, country=job["country"],   # W65 — see above
                                    on_event=on_event, should_stop=should_stop,

@@ -357,6 +357,23 @@ class CrmCloud:
         d = r.json()
         return d if isinstance(d, dict) else {}
 
+    def known_keys(self, country: str | None) -> set[str]:
+        """W118 (CRM T765): place keys ANY machine has already sent the CRM, optionally
+        narrowed to one job's country (a UK job does not download Australian keys). Merged
+        into `unique_new` jobs on top of this machine's own local set. An old Edge Fn without
+        this action, a timeout, or any other failure all degrade to "no cloud keys" — a job
+        must never fail because the cloud side of this cross-check is unavailable."""
+        try:
+            r = self._post(crm_payload("known_keys", country=country))
+            if r.status_code >= 400:
+                return set()
+            d = r.json()
+            keys = d.get("keys") if isinstance(d, dict) else None
+            return set(keys) if isinstance(keys, list) else set()
+        except httpx.HTTPError:
+            log.debug("known_keys fetch failed (cloud down?) — local keys only", exc_info=True)
+            return set()
+
     def agent_logs(self, rows: list[dict]) -> None:
         """Ship device-level log lines (T208). A 404 from an older Edge Fn is fine."""
         self._post(crm_payload("agent_logs", rows=rows)).raise_for_status()
@@ -900,6 +917,9 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             log.info("launchd plist updated with NumberOfFiles=%d — applies from the next login; this process already raised its own limit", 4096)
         elif fix == "error":
             log.warning("launchd plist could not be updated — re-run scripts/install-agent-autostart-mac.sh once")
+    # W118 (CRM T765): CrmCloud has known_keys(); the SaaS Cloud does not — getattr leaves
+    # the fetcher None there, so a 'saas' agent behaves exactly as before.
+    srv.worker.known_keys_fetcher = getattr(cloud, "known_keys", None)
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
