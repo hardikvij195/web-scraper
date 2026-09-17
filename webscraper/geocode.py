@@ -26,7 +26,7 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 #: Nominatim's usage policy (https://operations.osmfoundation.org/policies/nominatim/)
 #: requires a descriptive UA identifying the application — NOT a browser UA. One call per
 #: job, well under their ~1 req/s guidance, so no owner-side approval / API key is needed.
-USER_AGENT = "hvt-lead-finder/1.0 (web-scraper job geocoder; contact: as_dev_team@appsynergies.com)"
+USER_AGENT = "hvt-lead-finder/1.0 (web-scraper job geocoder; +https://www.hvtechnologies.app)"
 TIMEOUT_SEC = 10.0
 
 
