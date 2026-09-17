@@ -221,6 +221,25 @@ def grid_centers(center: tuple[float, float], radius_km: float, tile_km: float) 
     return out[:150]
 
 
+#: W119 (CRM T765): circles up to this radius start as ONE tile — the whole circle in one viewport — and are
+#: refined by the saturation quadtree. Bigger circles keep the coarse radius/8 grid (one viewport cannot hold them).
+COARSE_FIRST_MAX_KM = 16.0
+
+
+def initial_tiles(center: tuple[float, float], radius_km: float) -> tuple[list[tuple[float, float]], float]:
+    """(tile centres, tile_km) a tiled collection starts from."""
+    if radius_km <= COARSE_FIRST_MAX_KM:
+        return [center], float(radius_km)
+    tile_km = max(2.0, radius_km / 8.0)
+    return grid_centers(center, radius_km, tile_km), tile_km
+
+
+def saturated_keywords(band: list[str], kw_hits: dict, tile: tuple[float, float], split_at: int) -> list[str]:
+    """The band's keywords whose feed on `tile` came back (nearly) full, in band order — only those are worth
+    searching again on the tile's four children."""
+    return [q for q in band if kw_hits.get((tile, q), 0) >= split_at]
+
+
 # One round-trip per sweep: for every place link in the feed, walk up to the card and read the
 # "4.8 stars 1,263 Reviews" aria-label. The place panel itself no longer shows a review count in
 # the layout Google serves to headless sessions, so the feed is where we get it.
@@ -615,8 +634,12 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 MAX_TILE_FAILS = 3
                 MAX_STEPS = 6000                  # (tile, keyword) pairs — safety, the time budget rules in practice
                 if tiling:
-                    tile_km = max(2.0, float(radius_km) / 8.0) if float(radius_km) > 16 else min(float(radius_km), 2.0)
-                    centers = grid_centers(center, float(radius_km), tile_km)
+                    # W119 (CRM T765): a circle of <= COARSE_FIRST_MAX_KM starts as ONE tile (the whole
+                    # circle) instead of a fixed 2 km grid. A 10 km job used to be 37 tiles x every keyword
+                    # (8,500 searches for a 230-keyword sector — no time cap ever finished it); most B2B
+                    # keywords return far fewer than Maps' ~110-result cap over 10 km, so one search IS the
+                    # full answer, and only a keyword whose feed came back full gets the quadtree treatment.
+                    centers, tile_km = initial_tiles(center, float(radius_km))
                     emit("tiles", {"count": len(centers)})
                 else:
                     centers = [center]
@@ -645,6 +668,8 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                   "pace_sec": round((time.monotonic() - run_t0) / run_steps, 1) if run_steps else None})
                 emit_plan()
                 tile_hits: dict[tuple[float, float], int] = {}
+                kw_hits: dict[tuple[tuple[float, float], str], int] = {}     # W119: fullness per (tile, keyword)
+                kid_seen: set[tuple[tuple[float, float], int]] = set()       # W119: (child tile, band) already planned
                 tiles_seen: set[tuple[float, float]] = set(centers)
                 s_i = 0
                 fail_streak = 0
@@ -779,9 +804,14 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                     # W50 — split a saturated tile once its last keyword has run.
                     if tiling:
                         tile_hits[c] = max(tile_hits.get(c, 0), len(cards))
+                        kw_hits[(c, qy)] = len(cards)
                         last_for_tile = s_i == len(steps) or steps[s_i][1] != c
-                        if (last_for_tile and tile_hits[c] >= SPLIT_AT and tk > SPLIT_MIN_KM
-                                and len(steps) + 4 * len(queries) <= MAX_STEPS):
+                        # W119: only the keywords whose own feed came back full are searched again on the
+                        # four child tiles — a full "cleaning company" feed is no reason to re-run "bird
+                        # control" four more times.
+                        sat = saturated_keywords(bands[band], kw_hits, c, SPLIT_AT)
+                        if (last_for_tile and sat and tk > SPLIT_MIN_KM
+                                and len(steps) + 4 * len(sat) <= MAX_STEPS):
                             import math as _m
                             half = tk / 2.0
                             off = tk * 0.4                                   # children cover the parent's 1.6×tile square
@@ -790,12 +820,13 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                 kc = (c[0] + dy / 111.0, c[1] + dx / (111.0 * max(0.2, _m.cos(_m.radians(c[0])))))
                                 if haversine_km(center[0], center[1], kc[0], kc[1]) > float(radius_km) + half:
                                     continue
-                                if kc in tiles_seen:
+                                if (kc, band) in kid_seen:
                                     continue
+                                kid_seen.add((kc, band))
                                 tiles_seen.add(kc)
                                 kids.append(kc)
                             if kids:
-                                steps.extend((q2, kc, half, band) for kc in kids for q2 in bands[band])
+                                steps.extend((q2, kc, half, band) for kc in kids for q2 in sat)
                                 emit("tiles", {"count": len(tiles_seen)})
                                 emit("tile_split", {"tile": s_i, "hits": tile_hits[c], "from_km": round(tk, 2),
                                                     "to_km": round(half, 2), "children": len(kids), "tiles": len(tiles_seen)})

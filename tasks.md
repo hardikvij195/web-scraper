@@ -13,6 +13,14 @@
 
 ---
 
+- [x] **W119** `maps.py` (CRM T765, 2026-09-18) — "run … for 3 hrs or until we have properly
+  covered the whole 10 km radius area": a circle of ≤ 16 km now starts as ONE whole-circle tile
+  (`initial_tiles`) instead of the fixed 2 km grid (a 10 km job was 37 tiles × every keyword =
+  8,510 searches for a 230-keyword sector at ~22 s each; the 72-min collector share covered ~5 of 37
+  tiles and no job ever ended on "covered"). The saturation quadtree still refines — but only the
+  keywords whose own feed came back full (`saturated_keywords`, `kw_hits`) are re-searched on the
+  four children, per band (`kid_seen`). Circles > 16 km keep the radius/8 grid. 287 tests.
+
 - [x] **W118** `agent.py` + `server.py` (CRM T765, 2026-09-17/18) — "cross check duplicate
   leads … both scraper and Leads module": `unique_new` jobs also skip places ANY OTHER
   machine already scraped, not just this one's local sqlite. `CrmCloud.known_keys(country)`

@@ -57,7 +57,8 @@ data/           gitignored: leads.db, browser profiles, exports
 - Stable hooks: `div[role="feed"] a[href*="/maps/place/"]`, `button[data-item-id="address"|"oloc"|^"phone:tel:"]`,
   `a[data-item-id="authority"]`, URL `!3d<lat>!4d<lng>`, `!19s<place_id>`.
 - One crawl per website domain, per-host cap 2. Radius centre = median of first ~30 results' coords;
-  big asks tiled (~2 km tiles, <=150) because one search caps ~120.
+  one search caps ~120, so: circle <= 16 km = one whole-circle tile, > 16 km = radius/8 grid; a keyword
+  whose feed comes back full is re-searched on four half-size child tiles (W50 / W119).
 - Windows console is cp1252 — keep `→` out of typer help strings.
 
 ## Env (all optional)
