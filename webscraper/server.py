@@ -405,6 +405,16 @@ class Worker(threading.Thread):
                         store.update_job(job_id, scraped_count=store.get_job(job_id)["scraped_count"] + 1,
                                          skipped_far=data["skipped"],
                                          message=f"{pfx}skipped {data['skipped']} outside radius (last: {data['name']}, {data['distance_km']} km)")
+                        if data.get("reason") == "location_drift":
+                            # W117: this one was rejected against the independently geocoded
+                            # location, not the (possibly drifted) search centre.
+                            agg["drift_far"] = agg.get("drift_far", 0) + 1
+                    elif kind == "location_drift":
+                        # W117: the median-of-results centre disagreed with the geocode by
+                        # more than the drift threshold — the geocoded centre was used instead.
+                        store.log(job_id, "discovery",
+                                  f"{pfx}Maps results looked like they drifted {data['km']} km from "
+                                  f"the geocoded location — using the geocoded centre instead")
                     elif kind == "captcha":
                         store.update_job(job_id, message=f"{pfx}Google captcha — backing off {data['backoff_sec']:.0f}s")
                     elif kind == "skip":
@@ -525,6 +535,13 @@ class Worker(threading.Thread):
                                  _after_maps["scrape_started_at"])
                     if store.stop_requested(job_id):
                         return lanes_mod.R_STOPPED
+                    # W117: every place this job found was rejected as drifted (geocoded
+                    # location says otherwise) and nothing real was saved — say so, instead
+                    # of the honest-sounding "completed" that used to mask a 0-result job.
+                    _final = store.get_job(job_id)
+                    if agg.get("drift_far") and not int(_final["scraped_count"] or 0):
+                        loc = (areas[0]["location"] if areas else "") or job.get("query") or "?"
+                        return f'location_drift: Maps returned results near the searcher, none near "{loc}"'[:200]
                     # `time_up` is set by should_stop() the moment the Maps deadline passes,
                     # which is the difference between "found everything" and "ran out of
                     # clock" — previously indistinguishable in the UI.

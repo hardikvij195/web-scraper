@@ -13,6 +13,17 @@
 
 ---
 
+- [x] **W117** `geocode.py` (new) + `maps.py` + `server.py` (CRM T759, 2026-09-17) — a tiny UK
+  place ("Sandwick") that Maps can't find served results near the scraping machines
+  (Noida/India), and the radius centre (median of those results) drifted with them so the
+  `far` guard never fired; `geocode_location()` (Nominatim, 1 call/job, LRU-cached, never
+  raises) now cross-checks the median and, past `center_drift_km`, wins as the centre
+  (`location_drift` event); a per-place `is_place_far_from_geocode` guard also runs with no
+  radius at all (`place_far_km`); rejected places are `store.drop_stub` → `detail_status='far'`
+  → `agent._flat()` `_delete`, same as the existing radius guard — never sent to the CRM. An
+  all-drifted job ends via `location_drift: … none near "<location>"` instead of "completed".
+  Tests: `tests/test_w117_geocode.py` (8, no network).
+
 ## Session 2026-09-09 — W77: a mid-job wa-login no longer kills the WhatsApp lane (CRM T477)
 
 - [x] **W79** `research.py` — **several keys per AI provider (CRM T478).** The CRM's new

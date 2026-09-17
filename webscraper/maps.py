@@ -27,6 +27,7 @@ from webscraper.extractors import (
     clean_url, country_from_address, domain_of, extract_whatsapp, normalise_phone, normalise_wa,
     region_of_phone,
 )
+from webscraper.geocode import GeoHit, geocode_location
 from webscraper.models import Place
 from webscraper.browser_recovery import (RESTORE_BUBBLE_ARGS, Relauncher, close_blank_pages,
                                          is_closed, mark_profile_clean)
@@ -164,6 +165,28 @@ def resolve_center(page: Page, query: str, location: str) -> tuple[float, float]
     lats = sorted(p[0] for p in pts)
     lngs = sorted(p[1] for p in pts)
     return lats[len(lats) // 2], lngs[len(lngs) // 2]
+
+
+def center_drift_km(radius_km: float) -> float:
+    """Threshold past which the median-of-results centre is treated as having drifted from
+    the independently geocoded location (W117): the "searcher's own city" failure mode."""
+    return max(3 * radius_km, 50)
+
+
+def place_far_km(radius_km: float | None) -> float:
+    """Threshold past which a PLACE (not the search centre) is too far from the geocoded
+    job location to be real, used even when the job has no radius at all."""
+    return max(3 * float(radius_km), 150) if radius_km else 300.0
+
+
+def is_place_far_from_geocode(place_lat: float, place_lng: float, geo: "GeoHit | None",
+                              radius_km: float | None) -> tuple[bool, float]:
+    """(is_far, distance_km). `geo is None` (geocoding unavailable/failed) always keeps the
+    place — never reject on a guard we could not compute."""
+    if geo is None:
+        return False, 0.0
+    km = haversine_km(geo.lat, geo.lng, place_lat, place_lng)
+    return km > place_far_km(radius_km), km
 
 
 @dataclass
@@ -516,7 +539,8 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                    emit: Callable[[str, dict], None], radius_km: float | None,
                    center: tuple[float, float] | None, known_keys: set[str] | None,
                    collect_until: float | None, collect_target: int | None,
-                   stop_ev: threading.Event, pause_ev: threading.Event, result: dict) -> None:
+                   stop_ev: threading.Event, pause_ev: threading.Event, result: dict,
+                   geo: "GeoHit | None" = None) -> None:
     """COLLECTOR thread (W26): the tile × keyword loop, persisting every tile's cards to
     `job_links` + a stub `places` row the moment they are seen, so the opener (and, through
     it, the CRM) can start on them while the next tile is still loading.
@@ -545,7 +569,26 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 zoom: float | None = None
                 if radius_km and (center or location):
                     if not center:                     # no pinned centre from the map picker → ask Maps
-                        center = resolve_center(page, queries[0], location or "")
+                        median = resolve_center(page, queries[0], location or "")
+                        if median and geo:
+                            drift = haversine_km(median[0], median[1], geo.lat, geo.lng)
+                            if drift > center_drift_km(radius_km):
+                                # W117: Maps' own results drifted (typically to the
+                                # searcher's own city) — trust the independent geocode
+                                # instead so the "outside radius → far" guard below can
+                                # actually catch the drifted results.
+                                emit("location_drift", {
+                                    "expected": {"lat": geo.lat, "lng": geo.lng,
+                                                 "country": geo.country_code},
+                                    "got": {"lat": median[0], "lng": median[1]},
+                                    "km": round(drift, 1)})
+                                center = (geo.lat, geo.lng)
+                            else:
+                                center = median
+                        elif median:
+                            center = median
+                        elif geo:
+                            center = (geo.lat, geo.lng)
                     if center:
                         zoom = zoom_for_radius_km(radius_km)
                         emit("center", {"lat": center[0], "lng": center[1], "zoom": zoom})
@@ -813,7 +856,10 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
     stop_ev = threading.Event()
     pause_ev = threading.Event()
     collector_done = threading.Event()
-    shared = {"center": center}
+    # W117: one geocode call per job, independent of Maps — used to catch a drifted centre
+    # AND, below, to guard individual places even on a job with no radius at all.
+    geo = geocode_location(location) if location else None
+    shared = {"center": center, "geo": geo}
     cresult: dict = {"error": None, "count": 0, "skipped_far": 0, "skipped_known": 0, "budget_hit": False}
 
     def drain() -> None:
@@ -849,7 +895,8 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                     limit=limit, unlimited=unlimited, max_places=max_places, headless=headless,
                     country=country, emit=lambda k, d: events.put((k, d)), radius_km=radius_km,
                     center=center, known_keys=known_keys, collect_until=collect_until,
-                    collect_target=collect_target, stop_ev=stop_ev, pause_ev=pause_ev, result=cresult)
+                    collect_target=collect_target, stop_ev=stop_ev, pause_ev=pause_ev, result=cresult,
+                    geo=geo)
             finally:
                 collector_done.set()
         collector = threading.Thread(target=_run_collector, name=f"maps-collect-{job_id}", daemon=True)
@@ -978,6 +1025,23 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                             except Exception:                             # noqa: BLE001
                                 pass
                             emit_direct("far", {"name": place.name, "distance_km": place.distance_km,
+                                                "skipped": cresult["skipped_far"]})
+                            continue
+                    # W117: independent of `radius_km`/`center` — a place whose pin is nowhere
+                    # near the geocoded job location (typically drifted to the searcher's own
+                    # city) is 'far' too, even on a job with no radius at all.
+                    geo0 = shared.get("geo")
+                    if geo0 and place.lat is not None and place.lng is not None:
+                        is_far, geo_km = is_place_far_from_geocode(place.lat, place.lng, geo0, radius_km)
+                        if is_far:
+                            cresult["skipped_far"] += 1
+                            cresult["skipped_drift"] = cresult.get("skipped_drift", 0) + 1
+                            try:
+                                store.drop_stub(job_id, place.place_key)
+                            except Exception:                             # noqa: BLE001
+                                pass
+                            emit_direct("far", {"name": place.name, "distance_km": round(geo_km, 2),
+                                                "reason": "location_drift",
                                                 "skipped": cresult["skipped_far"]})
                             continue
                     if place.place_key in known:
