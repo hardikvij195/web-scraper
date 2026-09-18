@@ -2093,10 +2093,19 @@ def _cloud_retry(fn: Callable[[], Any], what: str) -> Any:
     raise last   # pragma: no cover — the loop above always returns or raises first
 
 
+def _claims_held() -> bool:
+    """W121 (CRM T767): an update/restart is parked behind the running job. `_tick` mirrors
+    the finished job AND claims the next queued one in the same pass, so with a full queue
+    the machine was never idle for `_run_deferred` (5 - MI took #6994 on 1.9.9 right after
+    #6992 was cancelled, and the 2.0.0 update kept waiting). Claim nothing until it ran."""
+    return _DEFERRED_CMD[0] is not None
+
+
 def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
           synced_upto: dict[int, int] | None = None) -> None:
     mirrored = {r["cloud_id"] for r in store.conn.execute(
         "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=?", (kind,)).fetchall()}
+    held = _claims_held()
     for cj in cloud.jobs():
         # On-demand WhatsApp re-verify: no scrape/enrich — fetch the job's existing
         # results, check each number, write wa_verified back. CRM-only. Checked BEFORE
@@ -2105,7 +2114,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         if kind == "crm" and cj.get("wa_verify_only"):
             # W108: never a second re-verify while one runs (its progress can go stale during
             # a long sync wait, and a stale job is claimable again by this same device).
-            if _reverify_busy() is not None:
+            if _reverify_busy() is not None or held:
                 continue
             if cloud.claim(cj["id"]) is None:
                 continue
@@ -2124,7 +2133,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 _requeue_rerun(cloud, store, cj, kind)
             continue
         # W108: a re-verify holds this machine's WhatsApp profiles — start nothing new beside it.
-        if _reverify_busy() is not None:
+        # W121: nor while an update/restart waits for the job boundary.
+        if _reverify_busy() is not None or held:
             continue
         if cloud.claim(cj["id"]) is None:
             continue

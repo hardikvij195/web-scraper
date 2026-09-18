@@ -13,6 +13,7 @@
 
 ---
 
+- [x] **W121** `agent.py` (CRM T767, 2026-09-18) — "update the agents first": with a full queue `_tick` mirrored the finished job AND claimed the next queued one in the same pass, so `_run_deferred` never saw an idle machine (5 - MI took #6994 on 1.9.9 the moment #6992 was cancelled; its 2.0.0 update kept waiting). Now `_claims_held()` (a parked update/restart) makes `_tick` skip every claim — Maps and re-verify — until the deferred command has run. 2 tests. Live workaround used: accept-jobs OFF + cancel → updated in 75 s → ON. v2.0.1.
 - [x] **W120** `browser_recovery.py` + `maps.py` + `browser_fetch.py` (CRM T767,
   2026-09-18) — Windows agent black-screened OOM at 76% RAM with two headed "Chrome for
   Testing" Maps tabs plus the real-Chrome enrichment fallback all alive at once. Measured:
