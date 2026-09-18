@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import queue
 import random
 import re
@@ -444,6 +445,17 @@ def scrape_place(page: Page, href: str, job_id: int, country: str) -> Place:
 
 #: Poll interval for the opener while the collector is still tiling and the queue is empty.
 OPENER_POLL_SEC = 2.0
+#: W120 (CRM T767): planned browser relaunch cadence. One headed Maps tab grows ~500 MB →
+#: ~1.4 GB within 40 place navigations (renderer 175 → 800 MB) and a new page does not give
+#: it back; a context relaunch does (~280 MB, ~2 s). Two such tabs + the enrichment Chrome
+#: pushed a Windows agent into out-of-memory black screens. 0 disables.
+OPENER_RELAUNCH_EVERY = int(os.getenv("MAPS_RELAUNCH_EVERY_PLACES", "40") or 0)
+COLLECT_RELAUNCH_EVERY = int(os.getenv("MAPS_RELAUNCH_EVERY_TILES", "20") or 0)
+
+
+def recycle_due(count: int, every: int) -> bool:
+    """True right before the (every+1)-th, (2·every+1)-th … unit — never before the first."""
+    return every > 0 and count > 1 and (count - 1) % every == 0
 # W103 — a place whose `page.goto` fails with a plain navigation error (net::ERR_ABORTED,
 # ERR_CONNECTION_RESET/CLOSED, ERR_NETWORK_CHANGED …) is retried once after this pause,
 # then skipped. Only this many skipped places IN A ROW fail the lane: one flaky request
@@ -673,6 +685,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                 tiles_seen: set[tuple[float, float]] = set(centers)
                 s_i = 0
                 fail_streak = 0
+                tiles_run = 0
                 # W115 (CRM T646): tiles that ran out of in-place retries, grouped by band, so
                 # they can be re-queued once at the end of their band instead of just vanishing.
                 band_failed: dict[int, list[tuple]] = {}
@@ -698,6 +711,16 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                         emit("links_budget", {"count": len(merged), "tile": s_i,
                                               "tiles": len(steps), "reason": "enough"})
                         break
+                    tiles_run += 1
+                    if recycle_due(tiles_run, COLLECT_RELAUNCH_EVERY):
+                        try:
+                            ctx, page = rl.recycle(f"tile {s_i}/{len(steps)}")
+                        except Exception as e:                        # noqa: BLE001
+                            log.warning("recycle failed (%s) — taking the crash path", _first_line(e))
+                            if not rl.recover(f"recycle at tile {s_i}"):
+                                raise
+                            ctx, page = rl.current
+                        emit("browser_recycled", {"where": "collector", "count": tiles_run - 1})
                     pause_gate()
                     want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
                     # Retry this tile through the relauncher until it reads or the relaunch
@@ -979,6 +1002,15 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                         store.mark_link_opened(job_id, card.key)
                     except Exception:                                 # noqa: BLE001
                         pass
+                    if recycle_due(opened, OPENER_RELAUNCH_EVERY):
+                        try:
+                            ctx, page = rl.recycle(f"place {opened}")
+                        except Exception as e:                        # noqa: BLE001
+                            log.warning("recycle failed (%s) — taking the crash path", _first_line(e))
+                            if not rl.recover(f"recycle at place {opened}"):
+                                raise
+                            ctx, page = rl.current
+                        emit_direct("browser_recycled", {"where": "opener", "count": opened - 1})
                     _set_active(1)
                     pacing.sleep_between()
                     place = None

@@ -45,6 +45,8 @@ data/           gitignored: leads.db, browser profiles, exports
   Never assume a WhatsApp; numbers stored `+E.164`.
 - **Chrome profiles are ours to kill** (T397): `Relauncher(profile_dir=)` evicts the holder,
   `close_blank_pages`, `mark_profile_clean` + `RESTORE_BUBBLE_ARGS`. Crash recovery = `browser_recovery`.
+  W120: Maps contexts are recycled every N places/tiles (`Relauncher.recycle`) because a long-lived
+  tab grows past 1 GB.
 - New field -> `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()`, `EXPORT_COLS`. Parsing in `extractors.py`
   with a test; Playwright only in `maps.py`.
 - Every scraper change is measured with `python scripts/regress-sites.py` against `docs/test-sites.md`.
@@ -73,6 +75,8 @@ data/           gitignored: leads.db, browser profiles, exports
 | `ENRICH_PROXIES` (supersedes `ENRICH_PROXY`) | — | proxy pool; `_FIRST`, `_MAX_FAILURES` (3), `_COOLDOWN_SEC` (300) |
 | `ENRICH_CF_CLICK` | `1` | click Turnstile (user directive: on) |
 | `ENRICH_BROWSER_CAMOUFOX` | `0` | Camoufox last tier |
+| `ENRICH_BROWSER_IDLE_SEC` | `300` | close idle fallback Chrome (W120, `browser_fetch.py`) |
+| `MAPS_RELAUNCH_EVERY_PLACES` / `_TILES` | `40` / `20` | planned Maps context relaunch (W120); 0 = off |
 
 ## Lead Finder Cloud (vercel-app)
 

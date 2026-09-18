@@ -147,6 +147,10 @@ LAUNCH_TIMEOUT_MS = int((BOOT_TIMEOUT_SEC - 15) * 1000)
 #: Generous because calls queue behind each other on the single worker thread.
 FETCH_TIMEOUT_SEC = 180.0
 MAX_BYTES = 1_500_000
+#: W120 (CRM T767): close the fallback Chrome after this long without a fetch (it is launched
+#: once per run and used to sit at ~370 MB for the whole job); the next blocked site relaunches
+#: it. 0 = never close.
+IDLE_CLOSE_SEC = float(os.getenv("ENRICH_BROWSER_IDLE_SEC", "300") or 0)
 
 _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking your browser",
                   "access denied", "error 1015", "error 1020", "error code: 1020", "request blocked", "are you a robot",
@@ -309,11 +313,20 @@ class BrowserFetcher:
                 self._ready.set()
                 try:
                     while True:
-                        item = self._jobs.get()
+                        try:
+                            item = self._jobs.get(timeout=IDLE_CLOSE_SEC or None)
+                        except queue.Empty:
+                            if rl.ctx is not None:
+                                rl.close()
+                                log.info("browser fetch idle for %.0fs — Chrome closed until "
+                                         "the next blocked site", IDLE_CLOSE_SEC)
+                            continue
                         if item is None:
                             return
                         url, slot, done = item
                         try:
+                            if rl.ctx is None:
+                                rl.open()
                             slot.append(self._goto(rl, url))
                         except Exception:                          # noqa: BLE001
                             log.debug("browser fetch crashed on %s", url, exc_info=True)

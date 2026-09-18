@@ -450,6 +450,10 @@ class Worker(threading.Thread):
                     elif kind == "browser_restart":
                         store.log(job_id, "discovery",
                                   f"browser died during {data['where']} — relaunched ({data['attempt']})", "warn")
+                    elif kind == "browser_recycled":            # W120 (CRM T767): planned, not a crash
+                        unit = "tiles" if data.get("where") == "collector" else "places"
+                        store.log(job_id, "discovery",
+                                  f"browser recycled after {data['count']} {unit} to release memory")
                     elif kind == "links_budget":
                         why = ("collection time up" if data.get("reason") == "time"
                                else "enough places for the time left")

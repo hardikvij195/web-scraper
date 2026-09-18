@@ -320,3 +320,13 @@ class Relauncher:
         except Exception:                                         # noqa: BLE001
             pass
         self.ctx = self.page = None
+
+    def recycle(self, where: str) -> tuple[Any, Any]:
+        """W120 (CRM T767): planned relaunch to hand memory back — a headed Maps tab grows
+        ~500 MB → ~1.4 GB over a few dozen navigations and `new_page()` does not reclaim it
+        (old renderers linger); closing the context does (~280 MB, ~2 s). Not a crash: the
+        relaunch cap and `on_restart` are untouched."""
+        log.info("browser recycle at %s — relaunching to release memory", where)
+        self.close()
+        time.sleep(RELAUNCH_SETTLE_SEC)
+        return self.open()

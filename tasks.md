@@ -13,6 +13,23 @@
 
 ---
 
+- [x] **W120** `browser_recovery.py` + `maps.py` + `browser_fetch.py` (CRM T767,
+  2026-09-18) — Windows agent black-screened OOM at 76% RAM with two headed "Chrome for
+  Testing" Maps tabs plus the real-Chrome enrichment fallback all alive at once. Measured:
+  one Maps tab grows 513 → 1,450 MB over 40 `page.goto` navigations (renderer 175 → 800
+  MB); `ctx.new_page()` + closing the old page does NOT reclaim it (grew to 2,150 MB
+  instead — old renderers linger); `--disable-features=BackForwardCache` made no
+  difference; `--js-flags=--max-old-space-size=256` barely helped (1,290 MB — the growth is
+  DOM/compositor, JS heap stayed 60-160 MB); closing and relaunching the persistent context
+  brought it back to ~280 MB every time, ~1.8 s cost. Fix: `Relauncher.recycle()` (close +
+  settle + reopen, relaunch cap/`on_restart` untouched) called on a cadence from both Maps
+  loops — `MAPS_RELAUNCH_EVERY_PLACES` (opener, default 40) and `MAPS_RELAUNCH_EVERY_TILES`
+  (collector, default 20), `recycle_due()` picks the point, 0 disables either. The
+  enrichment fallback Chrome (`browser_fetch.py`, launched once per run and previously kept
+  open forever at ~370 MB idle) now closes itself after `ENRICH_BROWSER_IDLE_SEC` (default
+  300s) with no fetch and reopens lazily on the next blocked site. 294 tests
+  (`tests/test_w120_browser_memory.py`).
+
 - [x] **W119** `maps.py` (CRM T765, 2026-09-18) — "run … for 3 hrs or until we have properly
   covered the whole 10 km radius area": a circle of ≤ 16 km now starts as ONE whole-circle tile
   (`initial_tiles`) instead of the fixed 2 km grid (a 10 km job was 37 tiles × every keyword =
