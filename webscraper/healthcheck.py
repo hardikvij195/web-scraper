@@ -11,10 +11,12 @@ from __future__ import annotations
 import importlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from webscraper.config import ROOT
 
@@ -234,6 +236,127 @@ def _autostart() -> dict:
         return _check(False, f"autostart check failed: {e}")
 
 
+def _memory() -> dict:
+    """W122: total/available RAM in MB — stdlib only, no psutil. Never raises; missing
+    fields come back None so the CRM can show 'unknown' instead of a stale number."""
+    out: dict[str, Any] = {"total_mb": None, "available_mb": None, "used_pct": None}
+    try:
+        sysname = platform.system()
+        if sysname == "Darwin":
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                       text=True, timeout=5).stdout.strip())
+            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            page_size = 4096
+            m = re.search(r"page size of (\d+) bytes", vm)
+            if m:
+                page_size = int(m.group(1))
+            pages = {}
+            for line in vm.splitlines():
+                mm = re.match(r"Pages (\w[\w ]*):\s+(\d+)\.", line)
+                if mm:
+                    pages[mm.group(1)] = int(mm.group(2))
+            free_pages = (pages.get("free", 0) + pages.get("inactive", 0)
+                          + pages.get("speculative", 0))
+            avail = free_pages * page_size
+            out["total_mb"] = round(total / 1e6, 1)
+            out["available_mb"] = round(avail / 1e6, 1)
+            out["used_pct"] = round(100 * (1 - avail / total), 1) if total else None
+        elif sysname == "Windows":
+            import ctypes
+
+            class _MEMSTAT(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            stat = _MEMSTAT()
+            stat.dwLength = ctypes.sizeof(_MEMSTAT)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))  # type: ignore[attr-defined]
+            out["total_mb"] = round(stat.ullTotalPhys / 1e6, 1)
+            out["available_mb"] = round(stat.ullAvailPhys / 1e6, 1)
+            out["used_pct"] = float(stat.dwMemoryLoad)
+        else:  # Linux
+            info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    mm = re.match(r"\s*(\d+)", v)
+                    if mm:
+                        info[k.strip()] = int(mm.group(1))  # kB
+            total = info.get("MemTotal")
+            avail = info.get("MemAvailable")
+            if total:
+                out["total_mb"] = round(total / 1e3, 1)
+            if avail:
+                out["available_mb"] = round(avail / 1e3, 1)
+            if total and avail:
+                out["used_pct"] = round(100 * (1 - avail / total), 1)
+    except Exception:                                             # noqa: BLE001
+        pass
+    return out
+
+
+#: Matches Chrome/Chromium/Playwright's "Chrome for Testing" process names.
+_CHROME_RE = re.compile(r"chrome|chromium|Chrome for Testing", re.IGNORECASE)
+
+
+def _chrome() -> dict:
+    """W122: how many Chrome-family processes are running and their combined RSS (MB) —
+    the discovery/enrichment/WhatsApp lanes each open their own, so a runaway count is the
+    first sign of a leak (T397 profile-eviction territory)."""
+    out: dict[str, Any] = {"processes": None, "rss_mb": None}
+    try:
+        sysname = platform.system()
+        if sysname == "Windows":
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/FO", "CSV"],
+                               capture_output=True, text=True, timeout=10)
+            lines = [ln for ln in r.stdout.splitlines() if ln.startswith('"chrome.exe"')]
+            out["processes"] = len(lines)
+            rss_kb = 0
+            for ln in lines:
+                cols = [c.strip('"') for c in ln.split('","')]
+                if len(cols) >= 5:
+                    try:
+                        rss_kb += int(cols[4].replace(",", "").replace(" K", ""))
+                    except ValueError:
+                        pass
+            out["rss_mb"] = round(rss_kb / 1e3, 1) if lines else 0.0
+        else:  # macOS / Linux
+            r = subprocess.run(["ps", "-axo", "rss=,comm="], capture_output=True, text=True, timeout=10)
+            n, rss_kb = 0, 0
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                rss, comm = parts
+                if _CHROME_RE.search(comm):
+                    n += 1
+                    try:
+                        rss_kb += int(rss)
+                    except ValueError:
+                        pass
+            out["processes"] = n
+            out["rss_mb"] = round(rss_kb / 1e3, 1)
+    except Exception:                                             # noqa: BLE001
+        pass
+    return out
+
+
+def _load() -> dict:
+    """W122: 1-minute load average where the OS offers one (macOS/Linux); Windows has no
+    equivalent so both fields stay None there."""
+    out: dict[str, Any] = {"cpu_pct": None}
+    try:
+        out["cpu_pct"] = os.getloadavg()[0]
+    except Exception:                                              # noqa: BLE001
+        pass
+    return out
+
+
 def _git_rev() -> str:
     try:
         r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
@@ -280,4 +403,9 @@ def run_checks() -> dict:
         # user knows which checkout a machine runs (own folder vs the mono repo).
         "root": str(ROOT),
         "checks": checks,
+        # W122: capacity signals for the CRM's scheduling — top-level (not inside
+        # `checks`) so the existing per-check UI rendering is untouched.
+        "memory": _memory(),
+        "chrome": _chrome(),
+        "load": _load(),
     }

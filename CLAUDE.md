@@ -77,6 +77,9 @@ data/           gitignored: leads.db, browser profiles, exports
 | `ENRICH_BROWSER_CAMOUFOX` | `0` | Camoufox last tier |
 | `ENRICH_BROWSER_IDLE_SEC` | `300` | close idle fallback Chrome (W120, `browser_fetch.py`) |
 | `MAPS_RELAUNCH_EVERY_PLACES` / `_TILES` | `40` / `20` | planned Maps context relaunch (W120); 0 = off |
+| `MAX_INFLIGHT_JOBS` | `3` | jobs the Worker may run at once (W122); Maps discovery still one job at a time |
+| `LANE_SLOTS_ENRICHMENT` | `1` | jobs whose enrichment lane may run concurrently (W122 `StageGate`) |
+| `LANE_SLOTS_WHATSAPP` | `1` | jobs whose WhatsApp lane may run concurrently (W122 `StageGate`) |
 
 ## Lead Finder Cloud (vercel-app)
 

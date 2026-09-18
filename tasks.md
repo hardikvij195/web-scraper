@@ -13,6 +13,19 @@
 
 ---
 
+- [x] **W122** `store.py` + `lanes.py` + `server.py` + `agent.py` + `healthcheck.py` (CRM
+  T784/T786, owner directive 2026-09-19): "start the maps lane for the next job so it
+  never stops" + "give each job a priority number". `jobs.priority` (default 0),
+  `queued_jobs()` orders by priority desc, id. `Worker` runs up to `MAX_INFLIGHT_JOBS`
+  (default 3) jobs at once, each its own thread, but still ONE Maps tab at a time
+  (`_disc_job`) — the next job's discovery starts the moment the current job's discovery
+  lane ends, even while its enrichment/WhatsApp keep draining. `current_job` is now a
+  property; new `inflight_jobs()` + `capacity()`. Enrichment/WhatsApp concurrency across
+  jobs is capped separately by `lanes.StageGate` (FIFO, `LANE_SLOTS_ENRICHMENT` /
+  `LANE_SLOTS_WHATSAPP`, default 1 each). `agent.py` claims one fresh cloud job/tick,
+  mirrors `priority`, sends `capacity()` = `{pipelining, discovery_free, inflight,
+  max_inflight}` in the CRM `jobs`/`claim` payloads. `healthcheck.run_checks()` gained
+  top-level `memory`/`chrome`/`load` (stdlib only). 6 new tests, 300 total. v2.0.2.
 - [x] **W121** `agent.py` (CRM T767, 2026-09-18) — "update the agents first": with a full queue `_tick` mirrored the finished job AND claimed the next queued one in the same pass, so `_run_deferred` never saw an idle machine (5 - MI took #6994 on 1.9.9 the moment #6992 was cancelled; its 2.0.0 update kept waiting). Now `_claims_held()` (a parked update/restart) makes `_tick` skip every claim — Maps and re-verify — until the deferred command has run. 2 tests. Live workaround used: accept-jobs OFF + cancel → updated in 75 s → ON. v2.0.1.
 - [x] **W120** `browser_recovery.py` + `maps.py` + `browser_fetch.py` (CRM T767,
   2026-09-18) — Windows agent black-screened OOM at 76% RAM with two headed "Chrome for

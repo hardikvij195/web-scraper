@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   found_count INTEGER NOT NULL DEFAULT 0,
   note TEXT,
   created_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  priority INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS places (
   job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -417,6 +418,9 @@ class Store:
             # leads settled without crawling) | wa_missing (crawl only leads with no
             # verified WhatsApp). Set by the CRM's re-run dialog.
             ("enrich_scope", "TEXT"),
+            # W122: "give each job a priority number" (owner directive 2026-09-19) — the
+            # Worker and the CRM's job-list both order by this, highest first.
+            ("priority", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
@@ -1003,7 +1007,9 @@ class Store:
         ).fetchone()
 
     def queued_jobs(self) -> list[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM jobs WHERE phase IN ('queued','waiting') ORDER BY id").fetchall()
+        # W122: highest priority first, then FIFO within a priority tier.
+        return self.conn.execute(
+            "SELECT * FROM jobs WHERE phase IN ('queued','waiting') ORDER BY priority DESC, id").fetchall()
 
     # ── WhatsApp verification: numbers + account rotation with a per-account daily cap ──
     def set_wa_verify(self, job_id: int, place_key: str, status: str, account: str | None,
@@ -1172,16 +1178,17 @@ class Store:
                    country: str | None = None, radius_km: float | None = None,
                    window_start: str | None = None, window_end: str | None = None,
                    center_lat: float | None = None, center_lng: float | None = None,
-                   max_minutes: int | None = None, unique_new: bool = False) -> int:
+                   max_minutes: int | None = None, unique_new: bool = False, priority: int = 0) -> int:
         result: dict[str, Any] = {}
 
         def _do() -> None:
             cur = self.conn.execute(
                 "INSERT INTO jobs(query, location, max_places, delay_sec, status, created_at, phase, do_enrich, headless, "
-                "country, radius_km, window_start, window_end, center_lat, center_lng, max_minutes, unique_new) "
-                "VALUES (?,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,?,?)",
+                "country, radius_km, window_start, window_end, center_lat, center_lng, max_minutes, unique_new, priority) "
+                "VALUES (?,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (query, location, max_places, delay_sec, now_iso(), phase, int(do_enrich), int(headless), country,
-                 radius_km, window_start, window_end, center_lat, center_lng, max_minutes, int(unique_new)),
+                 radius_km, window_start, window_end, center_lat, center_lng, max_minutes, int(unique_new),
+                 int(priority)),
             )
             self.conn.commit()
             result["id"] = cur.lastrowid

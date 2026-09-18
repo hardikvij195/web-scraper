@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -216,40 +218,130 @@ def fetch_known_cloud_keys(unique_new: bool, fetcher: Callable[[str | None], set
         return set()
 
 
+#: W122 (CRM T784/T786): how many jobs may be in flight (any lane running) at once. Google
+#: Maps discovery is still ONE job at a time (`_disc_job`, exactly two Chrome tabs total —
+#: CLAUDE.md); this caps how many jobs' enrichment/WhatsApp lanes may be draining
+#: concurrently alongside it.
+MAX_INFLIGHT_JOBS = int(os.getenv("MAX_INFLIGHT_JOBS", "3") or "3")
+
+
 class Worker(threading.Thread):
-    """Sequential job runner. Polls the DB for `phase='queued'` so jobs survive a restart."""
+    """Runs up to `MAX_INFLIGHT_JOBS` jobs at once, each on its own thread (`_run_job`).
+
+    Owner directive 2026-09-19: "if maps lane is completed for a job and its enrichment is
+    going on then start the maps lane for the next job so that it never stops" — so Google
+    Maps discovery for the NEXT job starts the moment the current one's discovery lane
+    ends, instead of waiting out that job's enrichment + WhatsApp. Discovery itself stays
+    serialised to one job at a time (`_disc_job`); enrichment/WhatsApp concurrency across
+    jobs is capped separately by `lanes.StageGate` (`LANE_SLOTS_ENRICHMENT`/`_WHATSAPP`).
+    Polls the DB for `phase='queued'` so jobs survive a restart.
+    """
 
     def __init__(self) -> None:
         super().__init__(name="scrape-worker", daemon=True)
         self.wake = threading.Event()
-        self.current_job: int | None = None
+        self._lock = threading.Lock()
+        #: job_id -> its Pipeline once `_run_job` has built one (None until then). Guarded
+        #: by `_lock`: read by this thread (capacity/scheduling) and written by every
+        #: job thread.
+        self._inflight: dict[int, Pipeline | None] = {}
+        #: job_id -> its Thread. Only this thread (the scheduler loop) ever touches this,
+        #: so it needs no lock.
+        self._threads: dict[int, threading.Thread] = {}
+        #: The job whose discovery slot is in use, or None when free. Guarded by `_lock`.
+        self._disc_job: int | None = None
         #: W118 (CRM T765): set by the CRM agent (`run_agent`) to `CrmCloud.known_keys` —
         #: a local-only run (no `srv.worker.known_keys_fetcher`) or the old SaaS `Cloud`
         #: (no such method) both leave this `None`, so `unique_new` falls back to local-only.
         self.known_keys_fetcher: Callable[[str | None], set[str]] | None = None
 
+    # -- status, read by agent.py and the API (unchanged shape: agent.py reads
+    # `srv.worker.current_job` in many places and must keep working as before) -----------
+    @property
+    def current_job(self) -> int | None:
+        with self._lock:
+            if self._disc_job is not None:
+                return self._disc_job
+            return min(self._inflight) if self._inflight else None
+
+    @current_job.setter
+    def current_job(self, value: int | None) -> None:
+        """Existing tests (pre-W122) poke `worker.current_job` directly to fake "idle" /
+        "busy with job N" — kept working by translating that into the new state instead
+        of dropping the assertions. Real code should read this, never write it."""
+        with self._lock:
+            if value is None:
+                self._disc_job = None
+                self._inflight.clear()
+            else:
+                self._disc_job = int(value)
+                self._inflight.setdefault(int(value), None)
+
+    def inflight_jobs(self) -> list[int]:
+        with self._lock:
+            return sorted(self._inflight)
+
+    def capacity(self) -> dict[str, Any]:
+        """Sent to the CRM (`agent.py` CrmCloud `jobs`/`claim` payloads) so the Edge
+        Function can decide whether to offer this machine another job."""
+        with self._lock:
+            return {"pipelining": True, "discovery_free": self._disc_job is None,
+                    "inflight": len(self._inflight), "max_inflight": MAX_INFLIGHT_JOBS}
+
     def run(self) -> None:  # noqa: C901 — linear orchestration, fine
+        while True:
+            # 1. reap finished job threads.
+            for jid in [j for j, th in self._threads.items() if not th.is_alive()]:
+                del self._threads[jid]
+                with self._lock:
+                    self._inflight.pop(jid, None)
+                    if self._disc_job == jid:
+                        self._disc_job = None
+
+            # 2. free the discovery slot once that job no longer needs the Maps tab.
+            with self._lock:
+                disc_job = self._disc_job
+                disc_pipe = self._inflight.get(disc_job) if disc_job is not None else None
+            if disc_job is not None and disc_pipe is not None and disc_pipe.discovery_slot_free():
+                with self._lock:
+                    if self._disc_job == disc_job:
+                        self._disc_job = None
+
+            # 3. start the next job's discovery if there is room for it.
+            with self._lock:
+                can_start = self._disc_job is None and len(self._inflight) < MAX_INFLIGHT_JOBS
+            if can_start:
+                store = Store()
+                # First queued job whose window is open; jobs outside their window show
+                # 'waiting'. The CRM returns/queues jobs highest-priority-first (W122).
+                job = None
+                for cand in store.queued_jobs():
+                    if in_window(cand["window_start"], cand["window_end"]):
+                        job = cand
+                        break
+                    if cand["phase"] != "waiting":
+                        store.update_job(int(cand["id"]), phase="waiting",
+                                         message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
+                store.close()
+                if job is not None:
+                    job_id = int(job["id"])
+                    with self._lock:
+                        self._disc_job = job_id
+                        self._inflight[job_id] = None
+                    th = threading.Thread(target=self._run_job, args=(job,), name=f"job-{job_id}", daemon=True)
+                    self._threads[job_id] = th
+                    th.start()
+
+            self.wake.wait(timeout=2.0)
+            self.wake.clear()
+
+    def _run_job(self, job: sqlite3.Row) -> None:
         from webscraper.enrich import enrich_places
         from webscraper.maps import Pacing, run_scrape
 
-        while True:
-            store = Store()
-            # First queued job whose window is open; jobs outside their window show 'waiting'.
-            job = None
-            for cand in store.queued_jobs():
-                if in_window(cand["window_start"], cand["window_end"]):
-                    job = cand
-                    break
-                if cand["phase"] != "waiting":
-                    store.update_job(int(cand["id"]), phase="waiting",
-                                     message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
-            if job is None:
-                store.close()
-                self.wake.wait(timeout=2.0)
-                self.wake.clear()
-                continue
+        store = Store()
+        try:
             job_id = int(job["id"])
-            self.current_job = job_id
             # W46: a job that never logs its first tile is invisible from the CRM otherwise.
             log.info("job #%s starting: %r near %r (headless=%s)", job_id, job["query"][:60], job["location"], bool(job["headless"]))
             # ── time budget ─────────────────────────────────────────────────────────
@@ -614,6 +706,8 @@ class Worker(threading.Thread):
                 except Exception:                                 # noqa: BLE001
                     log.debug("could not log the WhatsApp state onto the job", exc_info=True)
                 pipe = Pipeline(job_id, dict(job), _discovery)
+                with self._lock:
+                    self._inflight[job_id] = pipe
                 reasons = pipe.run()
                 log.info("job %s lanes finished: %s", job_id, reasons)
 
@@ -649,8 +743,15 @@ class Worker(threading.Thread):
                 store.update_job(job_id, phase="failed", status="failed", message=str(e)[:300])
                 store.finish_job(job_id, "failed", str(e)[:300])
             finally:
-                self.current_job = None
                 store.close()
+        finally:
+            # W122: free this job's slot even if it crashed before its discovery ended —
+            # otherwise a job that dies early would wedge the discovery slot forever.
+            with self._lock:
+                self._inflight.pop(job_id, None)
+                if self._disc_job == job_id:
+                    self._disc_job = None
+            store.close()
 
 
 worker = Worker()
@@ -744,7 +845,7 @@ def index() -> str:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "version": __version__, "worker_alive": worker.is_alive(),
-            "current_job": worker.current_job}
+            "current_job": worker.current_job, "inflight": worker.inflight_jobs()}
 
 
 @app.post("/api/jobs")

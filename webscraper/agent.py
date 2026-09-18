@@ -297,6 +297,11 @@ class CrmCloud:
     CHECKS_EVERY_SEC = 300.0
     _checks_sent_at = 0.0
 
+    #: W122: set by `run_agent` to `srv.worker.capacity` so the CRM Edge Function can see
+    #: whether this machine has room (and a free discovery slot) for another job. `None`
+    #: on any caller that never wires it up (e.g. a test using CrmCloud directly).
+    capacity_fn: Callable[[], dict] | None = None
+
     def jobs(self) -> list[dict]:
         extra: dict = {}
         if time.monotonic() - self._checks_sent_at >= self.CHECKS_EVERY_SEC:
@@ -307,12 +312,23 @@ class CrmCloud:
             except Exception:                                     # noqa: BLE001
                 log.debug("self-check failed", exc_info=True)
             self._checks_sent_at = time.monotonic()
+        if self.capacity_fn is not None:
+            try:
+                extra["capacity"] = self.capacity_fn()
+            except Exception:                                     # noqa: BLE001
+                log.debug("capacity() failed", exc_info=True)
         r = self._post(crm_payload("jobs", **extra))
         r.raise_for_status()
         return r.json()
 
     def claim(self, jid: int) -> dict | None:
-        r = self._post(crm_payload("claim", job_id=jid))
+        extra: dict = {}
+        if self.capacity_fn is not None:
+            try:
+                extra["capacity"] = self.capacity_fn()
+            except Exception:                                     # noqa: BLE001
+                log.debug("capacity() failed", exc_info=True)
+        r = self._post(crm_payload("claim", job_id=jid, **extra))
         if r.status_code == 409:
             return None
         r.raise_for_status()
@@ -920,6 +936,8 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     # W118 (CRM T765): CrmCloud has known_keys(); the SaaS Cloud does not — getattr leaves
     # the fetcher None there, so a 'saas' agent behaves exactly as before.
     srv.worker.known_keys_fetcher = getattr(cloud, "known_keys", None)
+    if isinstance(cloud, CrmCloud):                    # W122
+        cloud.capacity_fn = srv.worker.capacity
     if not srv.worker.is_alive():
         srv.worker.start()                   # same Worker the local UI uses
     store = Store()
@@ -985,8 +1003,9 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             # There is no "stop this job" API on the worker; the flag in its own store is
             # what the lanes poll, and it is what the CRM's Stop button sets too.
             try:
-                cur = getattr(srv.worker, "current_job", None)
-                if cur:
+                # W122: flag EVERY job in flight, not just the one-time "current" job —
+                # several may be running their lanes at once now.
+                for cur in getattr(srv.worker, "inflight_jobs", lambda: [])():
                     store.update_job(int(cur), stop_requested=1,
                                      message="stopped — this agent's CRM token was revoked")
                     store.log(int(cur), "job", "stopped: the CRM no longer accepts this "
@@ -1564,14 +1583,14 @@ def _poll_command(cloud: "CrmCloud") -> None:
                     # (2026-09-08, 17:27:58: "parked" and "relaunching" in the same second).
                     # The lanes poll stop_requested every batch; set it first, then close.
                     try:
-                        cur = getattr(srv.worker, "current_job", None)
-                        if cur:
-                            # W101: this thread has no `store` of its own (the loop's one
-                            # lives in run_agent, and sqlite connections are thread-bound
-                            # anyway) — the old `store.update_job` here was a NameError
-                            # swallowed by the except below, so a park never flagged the
-                            # job and the lanes only stopped once the CRM's cancel came
-                            # back through cloud.progress(). Open one like _cloud_job_id.
+                        # W101: this thread has no `store` of its own (the loop's one
+                        # lives in run_agent, and sqlite connections are thread-bound
+                        # anyway) — the old `store.update_job` here was a NameError
+                        # swallowed by the except below, so a park never flagged the
+                        # job and the lanes only stopped once the CRM's cancel came
+                        # back through cloud.progress(). Open one like _cloud_job_id.
+                        # W122: every job in flight, not just the single "current" one.
+                        for cur in getattr(srv.worker, "inflight_jobs", lambda: [])():
                             _st = Store()
                             try:
                                 _st.update_job(int(cur), stop_requested=1,
@@ -1964,6 +1983,7 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         # toggle was dropped on every re-run — the local job kept its original headless
         # value, so a re-enrich asked to run headed still ran hidden.
         headless=int(bool(cj.get("headless", True))),
+        priority=int(cj.get("priority") or 0),                        # W122
         message="re-run requested from the CRM",
     )
     # W59: the WhatsApp lane has its own window choice, and it is tri-state — NULL means
@@ -2106,6 +2126,11 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
     mirrored = {r["cloud_id"] for r in store.conn.execute(
         "SELECT cloud_id FROM jobs WHERE cloud_id IS NOT NULL AND cloud_kind=?", (kind,)).fetchall()}
     held = _claims_held()
+    claimed_fresh = False   # W122: at most one FRESH cloud job claimed per tick — the CRM
+                             # already returns jobs highest-priority-first, so the first
+                             # one seen here is the right one; claiming more than one per
+                             # tick let a low-priority job jump ahead of one added between
+                             # ticks with a higher number.
     for cj in cloud.jobs():
         # On-demand WhatsApp re-verify: no scrape/enrich — fetch the job's existing
         # results, check each number, write wa_verified back. CRM-only. Checked BEFORE
@@ -2136,8 +2161,11 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # W121: nor while an update/restart waits for the job boundary.
         if _reverify_busy() is not None or held:
             continue
+        if claimed_fresh:
+            continue
         if cloud.claim(cj["id"]) is None:
             continue
+        claimed_fresh = True
         limit = cj.get("limit_places")
         local_id = store.create_job(
             query=cj["query"], location=cj.get("location"),
@@ -2150,7 +2178,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             radius_km=cj.get("radius_km"),
             center_lat=cj.get("lat"), center_lng=cj.get("lng"),
             max_minutes=cj.get("max_minutes"),
-            unique_new=bool(cj.get("unique_new", False)))
+            unique_new=bool(cj.get("unique_new", False)),
+            priority=int(cj.get("priority") or 0))
         if cj.get("wa_headless") is not None:                     # W59 — see above
             store.update_job(local_id, wa_headless=int(bool(cj["wa_headless"])))
         import json as _json

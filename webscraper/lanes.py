@@ -35,9 +35,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
+from collections import deque
 from typing import Any, Callable
 
 from webscraper.config import settings
@@ -95,6 +97,89 @@ R_WA_CAP = "wa_daily_cap"          # per-account WhatsApp cap reached
 R_WA_LOGIN = "wa_not_logged_in"    # no live WhatsApp Web session
 R_DISABLED = "disabled"            # the job did not ask for this lane
 
+
+class StageGate:
+    """W122 (CRM T784/T786): a FIFO gate shared by ONE STAGE (enrichment or WhatsApp)
+    across every job in flight at once, so "one job's enrichment/WhatsApp at a time" (the
+    default, `slots=1`) is enforced fairly ACROSS jobs instead of by running one whole job
+    at a time — while Google Maps discovery for the next job is free to start the moment
+    the current job's discovery ends (see `Worker` in server.py, which serialises
+    discovery itself; this gate only ever holds "enrichment"/"whatsapp").
+
+    FIFO by arrival: a job that has been waiting longest gets the next free slot, never a
+    job that only just asked. Waiting lanes poll once a second so `stopped()` (the Stop
+    button) is noticed quickly; `on_wait` fires once immediately and then every 90 s so a
+    lane stuck for a long time keeps logging (`agent.py::_fail_stalled` fails any job
+    whose log has gone quiet for 120 s — a silent wait would look like a stall)."""
+
+    NOTE_EVERY_SEC = 90.0
+    POLL_SEC = 1.0
+
+    def __init__(self, key: str, slots: int) -> None:
+        self.key = key
+        self.slots = max(1, int(slots))
+        self._cond = threading.Condition()
+        self._queue: "deque[int]" = deque()
+        self._holders: set[int] = set()
+
+    def acquire(self, job_id: int, stopped: Callable[[], bool], on_wait: Callable[[str], None]) -> bool:
+        with self._cond:
+            if job_id not in self._queue and job_id not in self._holders:
+                self._queue.append(job_id)
+        noted_at: float | None = None
+        while True:
+            with self._cond:
+                if stopped():
+                    if job_id in self._queue:
+                        self._queue.remove(job_id)
+                    self._cond.notify_all()
+                    return False
+                free = self.slots - len(self._holders)
+                if free > 0 and job_id in self._queue and self._queue.index(job_id) < free:
+                    self._queue.remove(job_id)
+                    self._holders.add(job_id)
+                    self._cond.notify_all()
+                    return True
+                holder = next(iter(self._holders), None)
+            now = time.monotonic()
+            if noted_at is None or now - noted_at >= self.NOTE_EVERY_SEC:
+                on_wait(f"waiting for the {self.key} slot — held by job #{holder}")
+                noted_at = now
+            time.sleep(self.POLL_SEC)
+
+    def release(self, job_id: int) -> None:
+        with self._cond:
+            self._holders.discard(job_id)
+            if job_id in self._queue:
+                self._queue.remove(job_id)
+            self._cond.notify_all()
+
+
+def _stage_slots(var: str) -> int:
+    try:
+        return max(1, int(os.getenv(var, "1")))
+    except ValueError:
+        return 1
+
+
+def _build_stage_gates() -> dict[str, StageGate]:
+    return {
+        "enrichment": StageGate("enrichment", _stage_slots("LANE_SLOTS_ENRICHMENT")),
+        "whatsapp": StageGate("whatsapp", _stage_slots("LANE_SLOTS_WHATSAPP")),
+    }
+
+
+#: One gate per stage, shared by every job's lanes for the life of the process. Discovery
+#: has no entry here — it is serialised by the Worker (one job's Maps tab at a time), not
+#: by this gate.
+STAGE_GATES: dict[str, StageGate] = _build_stage_gates()
+
+
+def reset_stage_gates() -> None:
+    """Test hook: rebuild the module-level stage gates — fresh queues, and re-reads the
+    env vars (so a test's `monkeypatch.setenv` before calling this takes effect)."""
+    STAGE_GATES.clear()
+    STAGE_GATES.update(_build_stage_gates())
 
 
 #: enrich_error token -> (what it means, whether re-enriching could ever help). User
@@ -229,6 +314,8 @@ class Lane(threading.Thread):
         # point the lanes at a temp DB — and so the "one connection per lane" rule stays
         # visible at the single place it is enforced.
         self.store = self.ctl.new_store()
+        gate = STAGE_GATES.get(self.key)
+        gate_acquired = False
         try:
             if not self.enabled():
                 self.reason = R_DISABLED
@@ -237,6 +324,14 @@ class Lane(threading.Thread):
                 # otherwise make a switched-off lane read as still running.
                 self.store.lane_disabled(self.job_id, self.key)
                 return
+            if gate is not None:
+                # W122: wait my turn for this stage's shared slot(s) before touching the
+                # DB as "running" — a job N+1 whose enrichment/WhatsApp is merely queued
+                # behind job N's must not show as started.
+                if not gate.acquire(self.job_id, self.stopped, lambda m: self.note(m)):
+                    self.reason = R_STOPPED
+                    return
+                gate_acquired = True
             self.store.lane_start(self.job_id, self.key)
             self.reason = self.work() or R_COMPLETED
         except Exception as e:                                    # noqa: BLE001
@@ -269,6 +364,8 @@ class Lane(threading.Thread):
                 if self.store and self.reason != R_DISABLED:
                     self.store.lane_end(self.job_id, self.key, self.reason or R_COMPLETED)
             finally:
+                if gate is not None and gate_acquired:
+                    gate.release(self.job_id)
                 # Set BEFORE closing the store: a downstream lane blocks on this event, and
                 # a lane that crashed must still release the one waiting on it.
                 self.done.set()
@@ -772,6 +869,12 @@ class Pipeline:
 
     def discovery_finished(self) -> bool:
         return self.discovery.done.is_set()
+
+    def discovery_slot_free(self) -> bool:
+        """W122: true once this job no longer needs the ONE shared Maps tab — either it
+        never asked for discovery, or discovery has ended — so the Worker can let the
+        next job's discovery start."""
+        return not self.discovery.enabled() or self.discovery.done.is_set()
 
     def enrichment_finished(self) -> bool:
         # A job with enrichment switched off still feeds WhatsApp: discovery writes the
