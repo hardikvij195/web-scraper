@@ -215,3 +215,28 @@ def test_w131b_recycle_counter_survives_the_lanes_25_number_calls():
     src = inspect.getsource(wa_verify.verify_places)
     assert "checks_since_recycle = _CHECKS_SINCE_RECYCLE" in src, "counter must be the module-level one"
     assert "checks_since_recycle: dict[str, int] = {}" not in src, "must not re-create it per call"
+
+
+def test_t793_per_device_memory_knobs(monkeypatch):
+    """T793: a RAM-bound laptop is tuned from the CRM — `WA_RELAUNCH__<DEVICE>`,
+    `MAPS_RELAUNCH__<DEVICE>` and `ENRICH_IDLE__<DEVICE>` beat the generic env, which beats
+    the default; all are read live so a change applies without a restart."""
+    from webscraper import agent, browser_fetch, maps, wa_verify
+
+    monkeypatch.setattr(agent, "DEVICE_NAME", "3 - ASUS")
+    for var in ("WA_RELAUNCH_EVERY_NUMBERS", "MAPS_RELAUNCH_EVERY_PLACES", "ENRICH_BROWSER_IDLE_SEC"):
+        monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setenv("WA_RELAUNCH__3 - ASUS", "60")
+    assert wa_verify.wa_relaunch_every() == 60
+    monkeypatch.setenv("MAPS_RELAUNCH__3 - ASUS", "20")
+    assert maps.opener_relaunch_every() == 20
+    assert maps.collect_relaunch_every() == 10        # tiles at half the place cadence
+    monkeypatch.setenv("ENRICH_IDLE__3 - ASUS", "60")
+    assert browser_fetch.idle_close_sec() == 60.0
+
+    # another machine falls back to the generic env / defaults
+    monkeypatch.setattr(agent, "DEVICE_NAME", "4 - DELL")
+    assert wa_verify.wa_relaunch_every() == 150
+    assert maps.opener_relaunch_every() == 40
+    assert browser_fetch.idle_close_sec() == 300.0

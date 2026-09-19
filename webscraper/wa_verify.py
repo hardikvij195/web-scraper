@@ -973,9 +973,17 @@ def _chrome_channel(name: str | None = None) -> dict[str, Any]:
 #: closed — the same finding as W120 for Maps. 150 keeps the re-sync cost (a few seconds every
 #: ~15 min of checking) far below the memory it reclaims.
 def wa_relaunch_every() -> int:
+    """W131 / T793: `WA_RELAUNCH__<DEVICE>` (CRM setting `wa_relaunch__<device>`, refreshed live)
+    beats `WA_RELAUNCH_EVERY_NUMBERS` in .env, which beats the 150 default. 0 = never recycle."""
     import os
     try:
-        return max(0, int(os.getenv("WA_RELAUNCH_EVERY_NUMBERS", "150") or 0))
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    raw = (os.getenv(f"WA_RELAUNCH__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
+        or os.getenv("WA_RELAUNCH_EVERY_NUMBERS") or "150"
+    try:
+        return max(0, int(str(raw).strip()))
     except ValueError:
         return 150
 

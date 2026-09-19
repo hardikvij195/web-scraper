@@ -13,6 +13,13 @@
 
 ---
 
+- [x] **T793** `maps.py` + `wa_verify.py` + `browser_fetch.py` + `agent.py` (owner, 2026-09-19: "can u fix asus one
+  and check dell, mac and mi ones as well") — the three browser-memory knobs are now per machine and live, set
+  from the CRM (`wa_relaunch__<device>` -> `WA_RELAUNCH__<DEVICE>`, `maps_relaunch__<device>`, `enrich_idle__<device>`;
+  migration 20260919T0950). ASUS (8 GB, 95 %): WhatsApp recycle every 60 checks, Maps every 20 places / 10 tiles,
+  enrichment Chrome closed after 60 s idle, cap 1 job. MI + Mac: 80 / 30 / 120 s. DELL (17 GB) and the PC keep the
+  defaults. 301 tests.
+
 - [x] **W131b** `wa_verify.py` (owner: "are all issues fixed?", 2026-09-19) — W131 never fired: the WhatsApp lane
   calls `verify_places` with 25 numbers at a time (`pending_wa_verify(job_id, 25)`), so the per-call counter
   reset long before 150 — 0 WhatsApp recycles in 3 h on every machine while the Maps ones fired constantly, and

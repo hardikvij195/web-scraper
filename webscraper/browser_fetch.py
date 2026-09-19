@@ -150,6 +150,23 @@ MAX_BYTES = 1_500_000
 #: W120 (CRM T767): close the fallback Chrome after this long without a fetch (it is launched
 #: once per run and used to sit at ~370 MB for the whole job); the next blocked site relaunches
 #: it. 0 = never close.
+def idle_close_sec() -> float:
+    """T793: `ENRICH_IDLE__<DEVICE>` (CRM setting, live) > `ENRICH_BROWSER_IDLE_SEC` > 300."""
+    try:
+        from webscraper.agent import DEVICE_NAME
+        dev = DEVICE_NAME.upper()
+    except Exception:                                             # noqa: BLE001
+        dev = ""
+    raw = (os.getenv(f"ENRICH_IDLE__{dev}") if dev else None) or os.getenv("ENRICH_BROWSER_IDLE_SEC")
+    if raw is None:
+        # No env at all: honour the module-level default, which a test may monkeypatch.
+        return float(IDLE_CLOSE_SEC)
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return 300.0
+
+
 IDLE_CLOSE_SEC = float(os.getenv("ENRICH_BROWSER_IDLE_SEC", "300") or 0)
 
 _BLOCK_MARKERS = ("just a moment", "attention required! | cloudflare", "checking your browser",
@@ -314,12 +331,12 @@ class BrowserFetcher:
                 try:
                     while True:
                         try:
-                            item = self._jobs.get(timeout=IDLE_CLOSE_SEC or None)
+                            item = self._jobs.get(timeout=idle_close_sec() or None)
                         except queue.Empty:
                             if rl.ctx is not None:
                                 rl.close()
                                 log.info("browser fetch idle for %.0fs — Chrome closed until "
-                                         "the next blocked site", IDLE_CLOSE_SEC)
+                                         "the next blocked site", idle_close_sec())
                             continue
                         if item is None:
                             return

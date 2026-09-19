@@ -449,8 +449,37 @@ OPENER_POLL_SEC = 2.0
 #: ~1.4 GB within 40 place navigations (renderer 175 → 800 MB) and a new page does not give
 #: it back; a context relaunch does (~280 MB, ~2 s). Two such tabs + the enrichment Chrome
 #: pushed a Windows agent into out-of-memory black screens. 0 disables.
-OPENER_RELAUNCH_EVERY = int(os.getenv("MAPS_RELAUNCH_EVERY_PLACES", "40") or 0)
-COLLECT_RELAUNCH_EVERY = int(os.getenv("MAPS_RELAUNCH_EVERY_TILES", "20") or 0)
+def _device_upper() -> str:
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        return ""
+    return DEVICE_NAME.upper()
+
+
+def _per_device(name: str, generic: str, default: str) -> int:
+    """T793: `<NAME>__<DEVICE>` (a CRM setting, refreshed live) > the generic env > the default."""
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    raw = (os.getenv(f"{name}__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
+        or os.getenv(generic) or default
+    try:
+        return max(0, int(str(raw).strip()))
+    except ValueError:
+        return int(default)
+
+
+def opener_relaunch_every() -> int:
+    return _per_device("MAPS_RELAUNCH", "MAPS_RELAUNCH_EVERY_PLACES", "40")
+
+
+def collect_relaunch_every() -> int:
+    # The tile cadence follows the same per-device knob at half the value (a tile is cheaper
+    # than a place panel), so one CRM setting tunes both loops on a RAM-bound laptop.
+    n = _per_device("MAPS_RELAUNCH", "MAPS_RELAUNCH_EVERY_TILES", "20")
+    return max(1, n // 2) if os.getenv(f"MAPS_RELAUNCH__{_device_upper()}") else n
 
 
 def recycle_due(count: int, every: int) -> bool:
@@ -712,7 +741,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                               "tiles": len(steps), "reason": "enough"})
                         break
                     tiles_run += 1
-                    if recycle_due(tiles_run, COLLECT_RELAUNCH_EVERY):
+                    if recycle_due(tiles_run, collect_relaunch_every()):
                         try:
                             ctx, page = rl.recycle(f"tile {s_i}/{len(steps)}")
                         except Exception as e:                        # noqa: BLE001
@@ -1002,7 +1031,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                         store.mark_link_opened(job_id, card.key)
                     except Exception:                                 # noqa: BLE001
                         pass
-                    if recycle_due(opened, OPENER_RELAUNCH_EVERY):
+                    if recycle_due(opened, opener_relaunch_every()):
                         try:
                             ctx, page = rl.recycle(f"place {opened}")
                         except Exception as e:                        # noqa: BLE001

@@ -1444,7 +1444,9 @@ _CLOUD_ENV: set[str] = set()
 #: W128: per-machine tuning knobs the periodic refresh is allowed to update live (a
 #: restart-free way to pick up a lowered `MAX_INFLIGHT__<DEVICE>` etc. from the CRM
 #: Systems tab). Anything else pulled from cloud config still only applies once, at start.
-_CONFIG_REFRESH_PREFIXES = ("MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__")
+_CONFIG_REFRESH_PREFIXES = ("MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__",
+                            # T793: per-machine memory knobs, same live-refresh path
+                            "WA_RELAUNCH__", "MAPS_RELAUNCH__", "ENRICH_IDLE__")
 
 #: How often the main loop re-fetches cloud config for the knobs above.
 CONFIG_REFRESH_SEC = 300.0
