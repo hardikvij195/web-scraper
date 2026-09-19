@@ -13,6 +13,13 @@
 
 ---
 
+- [x] **W128/W129** `server.py`/`agent.py` (2026-09-19) — 8 GB laptops OOM under W122 pipelining. W128:
+  `MAX_INFLIGHT_JOBS` is now `max_inflight_jobs()`, re-evaluated per scheduling decision (env
+  `MAX_INFLIGHT__<DEVICE>` > `MAX_INFLIGHT_JOBS` > 3, clamp 1..6); `agent.py` refreshes cloud-sourced
+  `MAX_INFLIGHT__`/`WA_PARALLEL__`/`WA_DELAY__`/`WA_WINDOW__` env every `CONFIG_REFRESH_SEC` (300s), local
+  `.env` still wins. W129: `memory_blocked()` (`MEMORY_START_MAX_PCT`, default 85%) stops the Worker from
+  starting a new job while RAM is high; `capacity()` reports `discovery_free: False` + `memory_pct`. 297 tests.
+
 - [x] **W127** `agent.py` (CRM T788, 2026-09-19) — a leads re-verify (#21475) started beside a running job's
   WhatsApp lane on the Mac and died on "profile is already in use by another instance of Chromium": both drive
   the same WhatsApp profiles. The re-verify thread now takes the W122 `whatsapp` stage slot (key `-cloud_id`)

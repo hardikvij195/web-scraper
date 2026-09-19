@@ -218,15 +218,66 @@ def fetch_known_cloud_keys(unique_new: bool, fetcher: Callable[[str | None], set
         return set()
 
 
-#: W122 (CRM T784/T786): how many jobs may be in flight (any lane running) at once. Google
-#: Maps discovery is still ONE job at a time (`_disc_job`, exactly two Chrome tabs total —
-#: CLAUDE.md); this caps how many jobs' enrichment/WhatsApp lanes may be draining
-#: concurrently alongside it.
-MAX_INFLIGHT_JOBS = int(os.getenv("MAX_INFLIGHT_JOBS", "3") or "3")
+def max_inflight_jobs() -> int:
+    """W122/W128: how many jobs may be in flight (any lane running) at once. Google Maps
+    discovery is still ONE job at a time (`_disc_job`, exactly two Chrome tabs total —
+    CLAUDE.md); this caps how many jobs' enrichment/WhatsApp lanes may be draining
+    concurrently alongside it. Evaluated fresh on every scheduling decision (not read
+    once at import) so a live change — a local `.env` edit, or `agent.py`'s periodic
+    cloud-config refresh — takes effect without a restart. Order: env
+    `MAX_INFLIGHT__<DEVICE>` (device upper-cased, same lookup as `lanes._wa_parallel()`)
+    > env `MAX_INFLIGHT_JOBS` > default 3; clamped 1..6.
+    """
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    raw = (os.getenv(f"MAX_INFLIGHT__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
+        or os.getenv("MAX_INFLIGHT_JOBS") or "3"
+    try:
+        return max(1, min(6, int(str(raw).strip())))
+    except ValueError:
+        return 3
+
+
+#: W129: cache for `healthcheck._memory()` (it shells out to sysctl/vm_stat/WMI) — good
+#: for 20s, refreshed lazily. [timestamp, reading].
+_MEM_CACHE: list[Any] = [0.0, None]
+_MEM_CACHE_SEC = 20.0
+
+
+def _cached_memory() -> dict:
+    now = time.monotonic()
+    if _MEM_CACHE[1] is None or now - _MEM_CACHE[0] >= _MEM_CACHE_SEC:
+        from webscraper import healthcheck
+        try:
+            _MEM_CACHE[1] = healthcheck._memory()
+        except Exception:                                         # noqa: BLE001
+            _MEM_CACHE[1] = {"used_pct": None}
+        _MEM_CACHE[0] = now
+    return _MEM_CACHE[1]
+
+
+def memory_blocked() -> bool:
+    """W129: True when used RAM% >= `MEMORY_START_MAX_PCT` (env, default 85) — the Worker
+    then holds off starting NEW jobs (jobs already in flight keep running) until it drops.
+    False whenever `_memory()` can't tell (`used_pct` is `None`) or raises — never blocks
+    on a machine we can't read."""
+    try:
+        used = _cached_memory().get("used_pct")
+    except Exception:                                             # noqa: BLE001
+        return False
+    if used is None:
+        return False
+    try:
+        limit = float(os.getenv("MEMORY_START_MAX_PCT", "85") or "85")
+    except ValueError:
+        limit = 85.0
+    return used >= limit
 
 
 class Worker(threading.Thread):
-    """Runs up to `MAX_INFLIGHT_JOBS` jobs at once, each on its own thread (`_run_job`).
+    """Runs up to `max_inflight_jobs()` jobs at once, each on its own thread (`_run_job`).
 
     Owner directive 2026-09-19: "if maps lane is completed for a job and its enrichment is
     going on then start the maps lane for the next job so that it never stops" — so Google
@@ -250,6 +301,9 @@ class Worker(threading.Thread):
         self._threads: dict[int, threading.Thread] = {}
         #: The job whose discovery slot is in use, or None when free. Guarded by `_lock`.
         self._disc_job: int | None = None
+        #: W129: monotonic time of the last "not starting a new job — memory" log line,
+        #: so it prints at most once per 5 minutes instead of every 2s poll.
+        self._last_mem_note = 0.0
         #: W118 (CRM T765): set by the CRM agent (`run_agent`) to `CrmCloud.known_keys` —
         #: a local-only run (no `srv.worker.known_keys_fetcher`) or the old SaaS `Cloud`
         #: (no such method) both leave this `None`, so `unique_new` falls back to local-only.
@@ -284,9 +338,13 @@ class Worker(threading.Thread):
     def capacity(self) -> dict[str, Any]:
         """Sent to the CRM (`agent.py` CrmCloud `jobs`/`claim` payloads) so the Edge
         Function can decide whether to offer this machine another job."""
+        mem = _cached_memory()
+        blocked = memory_blocked()
         with self._lock:
-            return {"pipelining": True, "discovery_free": self._disc_job is None,
-                    "inflight": len(self._inflight), "max_inflight": MAX_INFLIGHT_JOBS}
+            return {"pipelining": True,
+                    "discovery_free": (self._disc_job is None) and not blocked,
+                    "inflight": len(self._inflight), "max_inflight": max_inflight_jobs(),
+                    "memory_pct": mem.get("used_pct")}
 
     def run(self) -> None:  # noqa: C901 — linear orchestration, fine
         while True:
@@ -307,9 +365,19 @@ class Worker(threading.Thread):
                     if self._disc_job == disc_job:
                         self._disc_job = None
 
-            # 3. start the next job's discovery if there is room for it.
+            # 3. start the next job's discovery if there is room for it and memory allows.
+            mem_blocked = memory_blocked()
             with self._lock:
-                can_start = self._disc_job is None and len(self._inflight) < MAX_INFLIGHT_JOBS
+                slot_free = self._disc_job is None and len(self._inflight) < max_inflight_jobs()
+                can_start = slot_free and not mem_blocked
+            if slot_free and mem_blocked:
+                now = time.monotonic()
+                if now - self._last_mem_note >= 300:
+                    self._last_mem_note = now
+                    mem = _cached_memory()
+                    limit = os.getenv("MEMORY_START_MAX_PCT", "85") or "85"
+                    log.warning("not starting a new job — memory %s%% used (limit %s%%)",
+                                mem.get("used_pct"), limit)
             if can_start:
                 store = Store()
                 # First queued job whose window is open; jobs outside their window show

@@ -1010,6 +1010,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             env = k.upper()  # gemini_api_key -> GEMINI_API_KEY
             if v and not os.getenv(env):
                 os.environ[env] = v
+                _CLOUD_ENV.add(env)  # W128: eligible for the periodic refresh below
                 log.info("config: %s set from cloud", env)
     except httpx.HTTPError as e:
         log.warning("config fetch failed (continuing with local .env): %s", e)
@@ -1047,6 +1048,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
                 prev_busy = now_busy
             except Exception:                              # noqa: BLE001
                 log.debug("self-update check failed", exc_info=True)
+            _refresh_cloud_config(cloud)  # W128: never raises — see its own try/except
         # W69: a revoked token is not a network hiccup. Stop the work this machine is
         # doing — the CRM can no longer see it, so anything it opens is unaccountable —
         # and park, which is the same state Stop leaves the agent in and is recoverable
@@ -1407,6 +1409,58 @@ def _remote_version() -> str | None:
     except Exception:                                             # noqa: BLE001
         log.debug("self-update: version check failed", exc_info=True)
         return None
+
+
+#: W128: env names that were actually set FROM the cloud `config()` map when the agent
+#: started (i.e. the var was not already present in the local `.env`/process env — see
+#: the one-time apply loop in `run_agent`). Local always wins, so `_refresh_cloud_config`
+#: below only ever overwrites names in this set, never a var the machine set for itself.
+_CLOUD_ENV: set[str] = set()
+
+#: W128: per-machine tuning knobs the periodic refresh is allowed to update live (a
+#: restart-free way to pick up a lowered `MAX_INFLIGHT__<DEVICE>` etc. from the CRM
+#: Systems tab). Anything else pulled from cloud config still only applies once, at start.
+_CONFIG_REFRESH_PREFIXES = ("MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__")
+
+#: How often the main loop re-fetches cloud config for the knobs above.
+CONFIG_REFRESH_SEC = 300.0
+_last_config_refresh = [0.0]
+
+
+def _refresh_cloud_config(cloud: "CrmCloud", *, force: bool = False) -> None:
+    """W128: re-fetch `cloud.config()` at most every `CONFIG_REFRESH_SEC` and apply live
+    changes to the per-machine knobs in `_CONFIG_REFRESH_PREFIXES` (device-upper-cased,
+    e.g. `MAX_INFLIGHT__ASUS-LAPTOP`), so a value the owner changes on the CRM Systems tab
+    (e.g. lowering the in-flight job cap on a low-RAM machine) takes effect within one
+    refresh instead of needing a restart. Only ever overwrites a name in `_CLOUD_ENV`
+    (came from the cloud at agent start) — a local `.env`/process value keeps winning,
+    same rule as the one-time apply. A fetch failure never breaks the caller's loop."""
+    now = time.monotonic()
+    if not force and (now - _last_config_refresh[0]) < CONFIG_REFRESH_SEC:
+        return
+    _last_config_refresh[0] = now
+    try:
+        cfg = cloud.config()
+    except httpx.HTTPError as e:
+        log.warning("config refresh failed (keeping current values): %s", e)
+        return
+    except Exception as e:                                        # noqa: BLE001
+        log.warning("config refresh failed (keeping current values): %s", e)
+        return
+    for k, v in cfg.items():
+        env = k.upper()
+        if not v or not env.startswith(_CONFIG_REFRESH_PREFIXES):
+            continue
+        if env not in _CLOUD_ENV:
+            # A knob the CRM did not have at agent start (a key added today, e.g.
+            # `max_inflight__<device>`): adopt it now IF nothing local owns that name,
+            # and remember it as cloud-owned. A local `.env` value still keeps winning.
+            if os.environ.get(env):
+                continue
+            _CLOUD_ENV.add(env)
+        if os.environ.get(env) != v:
+            log.info("config: %s changed by cloud refresh (%r -> %r)", env, os.environ.get(env), v)
+            os.environ[env] = v
 
 
 def _maybe_self_update(cloud: "CrmCloud", *, force: bool = False) -> None:

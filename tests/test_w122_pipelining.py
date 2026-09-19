@@ -82,7 +82,7 @@ def _wait_until(cond, timeout=5.0) -> bool:
 def _patched_worker(tmp_path, monkeypatch):
     db_path = tmp_path / "sched.db"
     monkeypatch.setattr(server_mod, "Store", lambda *a, **kw: Store(db_path))
-    monkeypatch.setattr(server_mod, "MAX_INFLIGHT_JOBS", 3)
+    monkeypatch.setattr(server_mod, "max_inflight_jobs", lambda: 3)  # W128: now a function
 
     pipes: dict[int, _FakePipe] = {}
     finish_events: dict[int, threading.Event] = {}
@@ -170,8 +170,10 @@ def test_worker_pipelines_discovery_across_jobs_within_inflight_cap(_patched_wor
 def test_current_job_and_capacity_semantics():
     w = server_mod.Worker()
     assert w.current_job is None
-    assert w.capacity() == {"pipelining": True, "discovery_free": True,
-                            "inflight": 0, "max_inflight": server_mod.MAX_INFLIGHT_JOBS}
+    cap0 = w.capacity()
+    assert cap0["pipelining"] is True and cap0["discovery_free"] is True
+    assert cap0["inflight"] == 0 and cap0["max_inflight"] == server_mod.max_inflight_jobs()
+    assert "memory_pct" in cap0
 
     w._inflight[5] = None
     w._disc_job = 5
