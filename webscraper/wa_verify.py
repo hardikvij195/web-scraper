@@ -843,8 +843,10 @@ def verify_places(
                 rl = relaunchers.get(name)
                 if rl is not None:
                     try:
-                        ctx, _pg = rl.recycle(f"{name}: {_recycle_every} numbers checked")
-                        open_ctx[name] = ctx
+                        # `open_ctx` holds the (context, page) PAIR that `_ensure_session`
+                        # stored — store both, or the next check gets a context where it
+                        # expects a page.
+                        open_ctx[name] = rl.recycle(f"{name}: {_recycle_every} numbers checked")
                         log.info("[%s] recycled the WhatsApp browser after %d checks (W131)",
                                  name, _recycle_every)
                     except Exception as e:                        # noqa: BLE001

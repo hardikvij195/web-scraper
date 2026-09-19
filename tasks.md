@@ -17,7 +17,9 @@
   W120 gave the MAPS tabs a planned recycle but never the WhatsApp browser, and every verdict is a full
   `page.goto` of a wa.me send URL: the same DOM/compositor growth, never reclaimed. An 8 GB laptop running ONE
   job still sat at 86-92 % with 4.3-4.8 GB of Chrome. The lane now recycles each account's context every
-  `WA_RELAUNCH_EVERY_NUMBERS` checks (default 150, 0 = off, read live) via `Relauncher.recycle`. 299 tests.
+  `WA_RELAUNCH_EVERY_NUMBERS` checks (default 150, 0 = off, read live) via `Relauncher.recycle`, storing the
+  (context, page) pair back into `open_ctx` — 2.1.0 stored only the context, which would have broken the next
+  check on that account; fixed in 2.1.1 before any machine reached 150 checks. 299 tests.
 
 - [x] **W130** `agent.py` (CRM T788/T790, 2026-09-19) — a job the CRM itself stopped (roll-update pause, stuck-job
   cron, park, revoked token) no longer reports `done("error")`: the CRM re-queues such a job one tick later and
