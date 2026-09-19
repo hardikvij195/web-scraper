@@ -13,6 +13,13 @@
 
 ---
 
+- [x] **W131c** `wa_verify.py` (2026-09-19) — the recycle still never fired: `relaunchers[name]` is only
+  registered by the `_ensure_session` call that OPENS a session, so on every later `verify_places` call (the lane
+  hands it 25 numbers at a time and reuses the open handle) `relaunchers.get(name)` was None and the branch fell
+  through silently. It now closes the context directly in that case — the next number re-opens it via
+  `_ensure_session` — and logs "WhatsApp recycle due after N checks" whenever the branch is entered, so the CRM
+  agent log answers "did it fire?". 301 tests.
+
 - [x] **T793** `maps.py` + `wa_verify.py` + `browser_fetch.py` + `agent.py` (owner, 2026-09-19: "can u fix asus one
   and check dell, mac and mi ones as well") — the three browser-memory knobs are now per machine and live, set
   from the CRM (`wa_relaunch__<device>` -> `WA_RELAUNCH__<DEVICE>`, `maps_relaunch__<device>`, `enrich_idle__<device>`;

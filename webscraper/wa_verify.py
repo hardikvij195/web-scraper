@@ -848,7 +848,22 @@ def verify_places(
             _recycle_every = wa_relaunch_every()
             if _recycle_every and checks_since_recycle[name] >= _recycle_every:
                 checks_since_recycle[name] = 0
+                log.info("[%s] WhatsApp recycle due after %d checks (W131)", name, _recycle_every)
                 rl = relaunchers.get(name)
+                if rl is None:
+                    # W131c: no Relauncher registered for this account (the session was opened
+                    # on an earlier call and this `verify_places` invocation only reused the
+                    # handle) — close the context directly; the next check re-opens it through
+                    # `_ensure_session`, which is exactly what the recycle wants.
+                    pair = open_ctx.pop(name, None)
+                    ctx = pair[0] if isinstance(pair, tuple) else pair
+                    try:
+                        if ctx is not None:
+                            ctx.close()
+                        log.info("[%s] closed the WhatsApp browser after %d checks — it reopens on "
+                                 "the next number (W131c)", name, _recycle_every)
+                    except Exception as e:                        # noqa: BLE001
+                        log.warning("[%s] could not close the WhatsApp browser: %s", name, e)
                 if rl is not None:
                     try:
                         # `open_ctx` holds the (context, page) PAIR that `_ensure_session`
