@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 import threading
+import os
 import time
 from typing import Any, Callable, NamedTuple
 
@@ -621,15 +622,21 @@ _STALL_SEEN: dict[int, tuple[str, float]] = {}
 
 
 def _lanes_all_ended(store, jid: int) -> bool:
-    """Every lane the job ran has an end stamp (a lane the job never asked for has none
-    and an `ok` of None — it counts as ended)."""
+    """Every lane the job ran has an end stamp; a lane the job never asked for (no start
+    stamp) counts as ended.
+
+    W126 (2026-09-19): this used to read `ok is None` as "never asked for" — but `ok` is
+    also None for a lane that is still RUNNING (it is only stamped at lane_end), so any job
+    with a live lane counted as finished and the W66 stall watchdog never fired. The Mac
+    sat 45 min on job #7038 with a hung WhatsApp lane and nothing logged. Only a missing
+    START stamp means the lane was not asked for."""
     try:
         lanes = store.lanes(jid)
     except Exception:                                             # noqa: BLE001
         return False
     if not lanes:
         return False
-    return all(l.get("ended_at") or l.get("ok") is None for l in lanes.values())
+    return all(l.get("ended_at") or l.get("started_at") is None for l in lanes.values())
 
 
 def _lanes_all_ok(store, jid: int) -> bool:
@@ -696,6 +703,38 @@ def _fail_stalled(cloud: "Cloud | CrmCloud", store: Store, kind: str) -> None:
         except Exception as e:                                    # noqa: BLE001
             log.warning("could not report the stall for job %s: %s", jid, e)
         _STALL_SEEN.pop(jid, None)
+        _STALL_KILLED[jid] = now
+
+
+#: W126: job id -> when the watchdog failed it. A lane hung inside a browser call never sees
+#: stop_requested, so the worker thread keeps the job (and its W122 stage slot) forever: no
+#: further job can run its WhatsApp lane and every update is "deferred" for good. If the
+#: lanes have not ended STALL_EXIT_SEC after the kill, the agent restarts itself — the
+#: supervisor brings it back and the other jobs resume from sqlite (hydration).
+_STALL_KILLED: dict[int, float] = {}
+STALL_EXIT_SEC = 180.0
+
+
+def _restart_if_lane_hung(store: Store, srv) -> None:
+    now = time.monotonic()
+    for jid, at in list(_STALL_KILLED.items()):
+        if _lanes_all_ended(store, jid):
+            _STALL_KILLED.pop(jid, None)
+            continue
+        worker = getattr(srv, "worker", None)
+        if worker is not None and jid not in getattr(worker, "inflight_jobs", lambda: [])():
+            _STALL_KILLED.pop(jid, None)                     # the thread let go after all
+            continue
+        if now - at < STALL_EXIT_SEC:
+            continue
+        log.error("job %s: lanes still running %ds after the watchdog failed it — a lane is hung "
+                  "inside a browser call; restarting the agent so the machine can work again", jid, int(now - at))
+        try:
+            store.log(jid, "job", "agent restarting: a lane did not stop after the watchdog failed the job", "error")
+        except Exception:                                         # noqa: BLE001
+            pass
+        _close_browsers()
+        os._exit(3)
 
 
 def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> None:
@@ -1051,6 +1090,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             log.warning("start-watchdog: %s", e)
         try:
             _fail_stalled(cloud, store, kind)                     # W66
+            _restart_if_lane_hung(store, srv)                     # W126
         except Exception as e:                                    # noqa: BLE001
             log.warning("stall-watchdog: %s", e)
         try:

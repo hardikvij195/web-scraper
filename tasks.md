@@ -13,6 +13,15 @@
 
 ---
 
+- [x] **W126** `agent.py` (CRM T788, 2026-09-19) — the W66 stall watchdog had been a no-op since W83: `_lanes_all_ended`
+  read `ok is None` as "lane never asked for", but `ok` is None for a RUNNING lane too, so every job with a live
+  lane counted as finished and was never stopped (the Mac sat 45 min on #7038 with a hung WhatsApp lane, nothing
+  logged, every update "deferred"). Only a missing START stamp now means not asked for. And a job the watchdog
+  failed whose lanes still have not ended `STALL_EXIT_SEC` (180 s) later — a lane hung inside a browser call —
+  makes the agent close its Chromes and exit; the supervisor restarts it and the other jobs resume. 293 tests.
+- [x] **W125** `healthcheck.py` (2026-09-19) — absolute paths for `sysctl` / `vm_stat` / `ps`: launchd's PATH has no
+  `/usr/sbin`, so the Mac reported memory null.
+
 - [x] **W124** `agent.py` + `lanes.py` (CRM T788, 2026-09-19) — five re-enrich follow-ups (#7029 #7034 #7036 #7037
   #7041) were stopped by the CRM's `lead_gen_stop_stuck_jobs` (T746: progress JSON unchanged for 10 min) while
   their lanes queued on the W122 stage gates behind another job. `StageGate.waiting_on()` + a `waiting` block

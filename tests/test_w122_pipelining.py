@@ -284,3 +284,51 @@ def test_w124_progress_reports_gate_waits():
     t.join(timeout=5)
     assert gate.waiting_on(7) is None
     gate.release(7)
+
+
+def test_w126_running_lane_is_not_ended(tmp_path, monkeypatch):
+    """W126: a lane that has started but not ended keeps the stall watchdog armed; only a lane
+    with no start stamp (never asked for) counts as ended."""
+    from webscraper import agent
+
+    class _Store:
+        def __init__(self, lanes):
+            self._lanes = lanes
+
+        def lanes(self, jid):
+            return self._lanes
+
+    running = {"discovery": {"started_at": None, "ended_at": None, "ok": None},
+               "enrichment": {"started_at": "t", "ended_at": None, "ok": None},
+               "whatsapp": {"started_at": "t", "ended_at": None, "ok": None}}
+    assert agent._lanes_all_ended(_Store(running), 1) is False
+    ended = {k: {**v, "ended_at": "t2" if v["started_at"] else None} for k, v in running.items()}
+    assert agent._lanes_all_ended(_Store(ended), 1) is True
+
+
+def test_w126_restart_when_killed_lane_hangs(monkeypatch):
+    """W126: STALL_EXIT_SEC after the watchdog failed a job whose lanes never ended, the agent
+    closes its browsers and exits (the supervisor restarts it)."""
+    from webscraper import agent
+
+    calls = []
+    monkeypatch.setattr(agent, "_close_browsers", lambda *a, **k: calls.append("close"))
+    monkeypatch.setattr(agent.os, "_exit", lambda code: calls.append(("exit", code)))
+    monkeypatch.setattr(agent, "_lanes_all_ended", lambda store, jid: False)
+
+    class _Worker:
+        def inflight_jobs(self):
+            return [9]
+
+    class _Srv:
+        worker = _Worker()
+
+    class _Store:
+        def log(self, *a, **k):
+            pass
+
+    agent._STALL_KILLED.clear()
+    agent._STALL_KILLED[9] = agent.time.monotonic() - agent.STALL_EXIT_SEC - 1
+    agent._restart_if_lane_hung(_Store(), _Srv())
+    assert calls == ["close", ("exit", 3)]
+    agent._STALL_KILLED.clear()
