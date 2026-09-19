@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W123** `lanes.py` (CRM T788, 2026-09-19) — a WhatsApp lane parked on `_wait_for_relink` (no linked
+  account on the machine) held its W122 stage slot for enrichment + 30 min per job, so on ASUS / DELL / MI every
+  later job's WhatsApp lane queued behind it and the in-flight cap filled with parked jobs. The lane now releases
+  the gate while parked and re-acquires it on relink. 301 tests.
+
 - [x] **W122** `store.py` + `lanes.py` + `server.py` + `agent.py` + `healthcheck.py` (CRM
   T784/T786, owner directive 2026-09-19): "start the maps lane for the next job so it
   never stops" + "give each job a priority number". `jobs.priority` (default 0),

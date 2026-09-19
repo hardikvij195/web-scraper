@@ -70,17 +70,25 @@ def _wait_for_relink(lane, store: Store, err: Exception):
     since = now_iso()
     lane.note(f"WhatsApp lane waiting — {err}. Link a WhatsApp account on this machine from the "
               "CRM and it carries on by itself", "warn")
+    # W123: a parked lane must not hold the WhatsApp stage slot (W122) — on a machine with no
+    # linked account every job's lane would otherwise sit here for enrichment + 30 min while the
+    # next jobs' lanes queue behind it. Give the slot back while parked, take it again on resume.
+    gate = STAGE_GATES.get(lane.key)
+    if gate is not None:
+        gate.release(lane.job_id)
     grace_end = None
     while True:
         if lane.stopped():
             return R_STOPPED
         if store.wa_relinked_since(since):
             lane.note("WhatsApp account linked — WhatsApp lane resuming", "info")
+            if gate is not None and not gate.acquire(lane.job_id, lane.stopped, lambda m: lane.note(m)):
+                return R_STOPPED
             return True
         if lane.ctl.enrichment_finished():
             grace_end = grace_end or time.monotonic() + WA_RELINK_GRACE_SEC
             if time.monotonic() >= grace_end:
-                return False
+                return False                 # gave up: Lane.run's finally releases again (a no-op now)
         time.sleep(WA_RELINK_POLL_SEC)
 
 

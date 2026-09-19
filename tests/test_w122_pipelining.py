@@ -214,3 +214,48 @@ def test_run_checks_has_capacity_keys_and_never_raises(monkeypatch):
     r2 = HC.run_checks()  # must not raise even with every subprocess call broken
     for key in ("memory", "chrome", "load"):
         assert key in r2 and isinstance(r2[key], dict)
+
+
+def test_w123_parked_wa_lane_gives_back_its_stage_slot(monkeypatch):
+    """W123: a WhatsApp lane parked on `_wait_for_relink` releases the whatsapp gate so the next
+    job's lane can run, and takes it back when the account is linked again."""
+    import threading
+    from webscraper import lanes
+
+    lanes.reset_stage_gates()
+    gate = lanes.STAGE_GATES["whatsapp"]
+    assert gate.acquire(1, lambda: False, lambda m: None)
+
+    relinked = {"v": False}
+
+    class _Store:
+        def wa_relinked_since(self, since):
+            return relinked["v"]
+
+    class _Ctl:
+        def enrichment_finished(self):
+            return False
+
+    class _Lane:
+        key = "whatsapp"
+        job_id = 1
+        ctl = _Ctl()
+
+        def note(self, *a, **k):
+            pass
+
+        def stopped(self):
+            return False
+
+    monkeypatch.setattr(lanes, "WA_RELINK_POLL_SEC", 0.01)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", lanes._wait_for_relink(_Lane(), _Store(), RuntimeError("no accounts"))))
+    t.start()
+    # While job 1 is parked, job 2 can take the single whatsapp slot.
+    assert gate.acquire(2, lambda: False, lambda m: None)
+    gate.release(2)
+    relinked["v"] = True
+    t.join(timeout=5)
+    assert out["r"] is True
+    assert 1 in gate._holders
+    gate.release(1)
