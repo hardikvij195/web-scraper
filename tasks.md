@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W132** `agent.py` (2026-09-19) — `STALL_SEC` 120 -> 600. W126 made the stall watchdog work again and it
+  promptly failed a HEALTHY job (#19882, DELL): a WhatsApp verdict that ends "could not decide" burns its full
+  ~25 s timeout, and a few of those in a row (plus pacing) leave a 3-minute gap between log lines with nothing
+  wrong. A hung lane is still caught long before the CRM's 30-min stuck-job cron. 301 tests.
+
 - [x] **W131c** `wa_verify.py` (2026-09-19) — the recycle still never fired: `relaunchers[name]` is only
   registered by the `_ensure_session` call that OPENS a session, so on every later `verify_places` call (the lane
   hands it 25 numbers at a time and reuses the open handle) `relaunchers.get(name)` was None and the branch fell

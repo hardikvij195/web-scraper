@@ -616,7 +616,12 @@ START_GRACE_SEC = 5 * 60
 #: narrates what it is doing every few seconds, so two minutes of total silence is a
 #: hang, not slow work — a Maps panel that takes a minute, a paced WhatsApp check and a
 #: slow site crawl all still log.
-STALL_SEC = 120.0
+#: W132 (2026-09-19): 600 s, not 120. W126 made this watchdog actually work again — and it
+#: immediately killed a HEALTHY job (#19882 on the DELL): a WhatsApp verdict that ends in
+#: "could not decide" spends its full ~25 s timeout, and with pacing a few of those in a row
+#: leave a 3-minute gap between log lines. Nothing is wrong in that window. A truly hung lane
+#: is still caught well before the CRM's own 30-min stuck-job cron.
+STALL_SEC = 600.0
 
 #: job id -> (signature, first time we saw it)
 _STALL_SEEN: dict[int, tuple[str, float]] = {}
