@@ -201,3 +201,17 @@ def test_w131_wa_browser_recycles_on_a_cadence(monkeypatch):
     import inspect
     src = inspect.getsource(wa_verify.verify_places)
     assert "rl.recycle(" in src and "checks_since_recycle" in src
+
+
+def test_w131b_recycle_counter_survives_the_lanes_25_number_calls():
+    """W131b: the WhatsApp lane calls verify_places with 25 numbers at a time, so the check
+    counter must live outside the call — a per-call dict never reached 150 and the recycle
+    never fired (0 recycles in 3 h on every machine, measured 2026-09-19)."""
+    import inspect
+
+    from webscraper import wa_verify
+
+    assert isinstance(wa_verify._CHECKS_SINCE_RECYCLE, dict)
+    src = inspect.getsource(wa_verify.verify_places)
+    assert "checks_since_recycle = _CHECKS_SINCE_RECYCLE" in src, "counter must be the module-level one"
+    assert "checks_since_recycle: dict[str, int] = {}" not in src, "must not re-create it per call"

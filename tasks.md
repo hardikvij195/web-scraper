@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W131b** `wa_verify.py` (owner: "are all issues fixed?", 2026-09-19) — W131 never fired: the WhatsApp lane
+  calls `verify_places` with 25 numbers at a time (`pending_wa_verify(job_id, 25)`), so the per-call counter
+  reset long before 150 — 0 WhatsApp recycles in 3 h on every machine while the Maps ones fired constantly, and
+  ASUS climbed back to 92 % / 4.9 GB. The counter is now module-level (`_CHECKS_SINCE_RECYCLE`). 300 tests.
+
 - [x] **W131** `wa_verify.py` (owner, 2026-09-19: "why is so much RAM being used… it's mainly because of Chrome") —
   W120 gave the MAPS tabs a planned recycle but never the WhatsApp browser, and every verdict is a full
   `page.goto` of a wa.me send URL: the same DOM/compositor growth, never reclaimed. An 8 GB laptop running ONE

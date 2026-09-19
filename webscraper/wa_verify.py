@@ -570,6 +570,10 @@ def account_status(name: str) -> str:
 
 
 # -- batch verification with account rotation + daily cap -----------------------
+#: W131b: per-account check counter, module-level so it survives the lane's 25-number calls.
+_CHECKS_SINCE_RECYCLE: dict[str, int] = {}
+
+
 def verify_places(
     store: Store,
     rows: list[dict[str, Any]],
@@ -610,7 +614,11 @@ def verify_places(
 
     open_ctx: dict[str, Any] = {}      # name -> (pw_ctx, page); all closed in `finally`
     relaunchers: dict[str, Relauncher] = {}   # name -> its own relaunch budget
-    checks_since_recycle: dict[str, int] = {}  # W131: per-account counter for the planned recycle
+    # W131b: the counter MUST live outside this call — the WhatsApp lane calls verify_places
+    # with 25 numbers at a time (`pending_wa_verify(job_id, 25)`) and the re-verify slices
+    # similarly, so a per-call dict never reached 150 and the recycle never fired (measured:
+    # 0 recycles in 3 h on every machine while the Maps ones fired constantly).
+    checks_since_recycle = _CHECKS_SINCE_RECYCLE
     # W102: the Playwright driver is started INSIDE the try below (after the targets are
     # expanded), so there is no window where a live driver sits outside the `finally`.
     # It used to start here, before the expansion loop — and that loop writes to sqlite
