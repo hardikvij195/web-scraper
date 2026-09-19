@@ -227,6 +227,8 @@ def _autostart() -> dict:
                           f'scheduled task "{_WIN_TASK}" registered but its logon mode is '
                           f'"{mode or "unknown"}" - browser windows will be INVISIBLE. Re-run the '
                           f'installer, or set the task to "Run only when user is logged on".', fix)
+        # W125: absolute paths — under launchd the PATH has no /usr/sbin, so `sysctl` was
+        # not found and the Mac reported memory null (2026-09-19).
         if sysname == "Darwin":
             ok = _LAUNCHD_PLIST.exists()
             return _check(ok, f"launchd job {'installed' if ok else 'not installed'}",
@@ -243,9 +245,9 @@ def _memory() -> dict:
     try:
         sysname = platform.system()
         if sysname == "Darwin":
-            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+            total = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True,
                                        text=True, timeout=5).stdout.strip())
-            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            vm = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=5).stdout
             page_size = 4096
             m = re.search(r"page size of (\d+) bytes", vm)
             if m:
@@ -323,7 +325,7 @@ def _chrome() -> dict:
                         pass
             out["rss_mb"] = round(rss_kb / 1e3, 1) if lines else 0.0
         else:  # macOS / Linux
-            r = subprocess.run(["ps", "-axo", "rss=,comm="], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["/bin/ps", "-axo", "rss=,comm="], capture_output=True, text=True, timeout=10)
             n, rss_kb = 0, 0
             for line in r.stdout.splitlines():
                 line = line.strip()
