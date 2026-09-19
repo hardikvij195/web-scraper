@@ -182,3 +182,22 @@ def test_w130_crm_stop_is_not_reported_as_a_verdict(tmp_path):
     st.log(jid2, "job", "cancelled in the CRM while the agent was down - not resumed", "warn")
     assert agent._cancelled_by_crm(st, jid2) is True
     st.close()
+
+
+def test_w131_wa_browser_recycles_on_a_cadence(monkeypatch):
+    """W131: the WhatsApp browser has a planned recycle like Maps (W120), read live from
+    WA_RELAUNCH_EVERY_NUMBERS so it can be tuned from the CRM without a code change."""
+    from webscraper import wa_verify
+
+    monkeypatch.delenv("WA_RELAUNCH_EVERY_NUMBERS", raising=False)
+    assert wa_verify.wa_relaunch_every() == 150
+    monkeypatch.setenv("WA_RELAUNCH_EVERY_NUMBERS", "60")
+    assert wa_verify.wa_relaunch_every() == 60
+    monkeypatch.setenv("WA_RELAUNCH_EVERY_NUMBERS", "0")      # 0 = never recycle
+    assert wa_verify.wa_relaunch_every() == 0
+    monkeypatch.setenv("WA_RELAUNCH_EVERY_NUMBERS", "junk")
+    assert wa_verify.wa_relaunch_every() == 150
+    # the loop calls Relauncher.recycle, which closes and reopens the context (W120)
+    import inspect
+    src = inspect.getsource(wa_verify.verify_places)
+    assert "rl.recycle(" in src and "checks_since_recycle" in src

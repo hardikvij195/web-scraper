@@ -610,6 +610,7 @@ def verify_places(
 
     open_ctx: dict[str, Any] = {}      # name -> (pw_ctx, page); all closed in `finally`
     relaunchers: dict[str, Relauncher] = {}   # name -> its own relaunch budget
+    checks_since_recycle: dict[str, int] = {}  # W131: per-account counter for the planned recycle
     # W102: the Playwright driver is started INSIDE the try below (after the targets are
     # expanded), so there is no window where a live driver sits outside the `finally`.
     # It used to start here, before the expansion loop — and that loop writes to sqlite
@@ -828,6 +829,27 @@ def verify_places(
                 log.warning("%s: could not bump daily count (db busy) — continuing", name)
             counts[status] += 1
             counts["checked"] += 1
+            # W131 (2026-09-19): recycle this account's Chrome every `WA_RELAUNCH_EVERY`
+            # checks. Each verdict is a full `page.goto` of a wa.me send URL, so the WhatsApp
+            # tab grows exactly the way W120 measured on the Maps tab (0.5 -> 1.45 GB over ~40
+            # navigations; only closing the context gives it back). W120 recycled Maps but not
+            # this loop — which is why an 8 GB laptop running ONE job still sat at 86-92 % with
+            # 4-5 GB of Chrome. Close + reopen costs ~2 s plus WhatsApp Web's own re-sync,
+            # hence a much larger N than Maps uses.
+            checks_since_recycle[name] = checks_since_recycle.get(name, 0) + 1
+            _recycle_every = wa_relaunch_every()
+            if _recycle_every and checks_since_recycle[name] >= _recycle_every:
+                checks_since_recycle[name] = 0
+                rl = relaunchers.get(name)
+                if rl is not None:
+                    try:
+                        ctx, _pg = rl.recycle(f"{name}: {_recycle_every} numbers checked")
+                        open_ctx[name] = ctx
+                        log.info("[%s] recycled the WhatsApp browser after %d checks (W131)",
+                                 name, _recycle_every)
+                    except Exception as e:                        # noqa: BLE001
+                        log.warning("[%s] could not recycle the WhatsApp browser: %s", name, e)
+                        open_ctx.pop(name, None)
             # Bare digits were only ever for the send URL; everything persisted or reported
             # carries the '+' (directive 2026-08-23). plus() is idempotent. The cloud path
             # (job_id=None) never touches set_wa_verify - agent.py writes the callback's
@@ -934,6 +956,18 @@ def _chrome_channel(name: str | None = None) -> dict[str, Any]:
     """Playwright channel kwargs for `browser_for(name)` (W90 kept every launch on one binary;
     W93 makes that binary the one that linked the profile)."""
     return _channel_of(browser_for(name))
+
+
+#: W131: recycle an account's WhatsApp Chrome after this many checks (0 = never). Each check is
+#: a full navigation and the tab's DOM/compositor memory only comes back when the context is
+#: closed — the same finding as W120 for Maps. 150 keeps the re-sync cost (a few seconds every
+#: ~15 min of checking) far below the memory it reclaims.
+def wa_relaunch_every() -> int:
+    import os
+    try:
+        return max(0, int(os.getenv("WA_RELAUNCH_EVERY_NUMBERS", "150") or 0))
+    except ValueError:
+        return 150
 
 
 def wa_delay_range() -> tuple[float, float]:

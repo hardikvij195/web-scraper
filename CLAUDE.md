@@ -70,6 +70,7 @@ data/           gitignored: leads.db, browser profiles, exports
 | `<PROVIDER>_API_KEY_2..n` | — | extra AI keys per provider, pushed from the CRM registry; local `.env` wins |
 | `WA_WINDOW[__<DEVICE>]` | `visible` | WhatsApp Chrome: `visible` / `hidden` / `headless` |
 | `WA_DAILY_CAP` | `0` | 0 = unlimited (user directive) |
+| `WA_RELAUNCH_EVERY_NUMBERS` | `150` | W131: recycle an account's WhatsApp Chrome after N checks; 0 = never |
 | `ENRICH_TLS_IMPERSONATE` / `_ROTATION` | `true` / `chrome` | curl_cffi tier + identity list |
 | `ENRICH_BROWSER_FALLBACK` / `_HEADLESS` / `_REAL_CHROME` | `true` | browser tier |
 | `ENRICH_PROXIES` (supersedes `ENRICH_PROXY`) | — | proxy pool; `_FIRST`, `_MAX_FAILURES` (3), `_COOLDOWN_SEC` (300) |
