@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W124** `agent.py` + `lanes.py` (CRM T788, 2026-09-19) — five re-enrich follow-ups (#7029 #7034 #7036 #7037
+  #7041) were stopped by the CRM's `lead_gen_stop_stuck_jobs` (T746: progress JSON unchanged for 10 min) while
+  their lanes queued on the W122 stage gates behind another job. `StageGate.waiting_on()` + a `waiting` block
+  (`{enrichment: {behind, position}, minute}`) in the progress payload keep the row changing while the wait is real.
+
 - [x] **W123** `lanes.py` (CRM T788, 2026-09-19) — a WhatsApp lane parked on `_wait_for_relink` (no linked
   account on the machine) held its W122 stage slot for enrichment + 30 min per job, so on ASUS / DELL / MI every
   later job's WhatsApp lane queued behind it and the in-flight cap filled with parked jobs. The lane now releases

@@ -162,6 +162,14 @@ class StageGate:
                 self._queue.remove(job_id)
             self._cond.notify_all()
 
+    def waiting_on(self, job_id: int) -> dict | None:
+        """W124: `{"behind": [holders], "position": n}` while `job_id` is queued for this gate,
+        else None. Read by the agent's progress builder so a parked job still *changes*."""
+        with self._cond:
+            if job_id not in self._queue:
+                return None
+            return {"behind": sorted(self._holders), "position": self._queue.index(job_id) + 1}
+
 
 def _stage_slots(var: str) -> int:
     try:

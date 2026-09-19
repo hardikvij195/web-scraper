@@ -259,3 +259,28 @@ def test_w123_parked_wa_lane_gives_back_its_stage_slot(monkeypatch):
     assert out["r"] is True
     assert 1 in gate._holders
     gate.release(1)
+
+
+def test_w124_progress_reports_gate_waits():
+    """W124: a job queued behind another on a stage gate shows up in `waiting_on` (what the
+    agent's progress builder ships so the CRM's stuck-job cron sees the row changing)."""
+    from webscraper import lanes
+
+    lanes.reset_stage_gates()
+    gate = lanes.STAGE_GATES["enrichment"]
+    assert gate.waiting_on(7) is None
+    assert gate.acquire(5, lambda: False, lambda m: None)
+    import threading
+    t = threading.Thread(target=lambda: gate.acquire(7, lambda: False, lambda m: None))
+    t.start()
+    for _ in range(100):
+        w = gate.waiting_on(7)
+        if w:
+            break
+        import time
+        time.sleep(0.01)
+    assert w == {"behind": [5], "position": 1}
+    gate.release(5)
+    t.join(timeout=5)
+    assert gate.waiting_on(7) is None
+    gate.release(7)

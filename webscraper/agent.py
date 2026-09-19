@@ -523,6 +523,19 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
                 "phase_eta_sec": s["phase_eta_sec"], "estimating": s["estimating"],
                 "budget_left_sec": (round(s["budget_left_sec"])
                                     if s["budget_left_sec"] is not None else None)})
+    # W124 (CRM T788): a job whose lanes are queued on the W122 stage gates has a frozen lanes
+    # block, and the CRM's lead_gen_stop_stuck_jobs (T746) stops any job whose progress JSON
+    # does not change for 10 min — five jobs died that way on 2026-09-19 while waiting for
+    # another job's enrichment. Report what they wait on, with a minute counter, so the
+    # progress row keeps changing while the wait is real.
+    try:
+        from .lanes import STAGE_GATES
+        waits = {k: g.waiting_on(int(row["id"])) for k, g in STAGE_GATES.items()}
+        waits = {k: v for k, v in waits.items() if v}
+        if waits:
+            out["waiting"] = {**waits, "minute": int(time.time() // 60)}
+    except Exception:                                             # noqa: BLE001
+        pass
     return out
 
 
