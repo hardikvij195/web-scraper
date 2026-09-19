@@ -161,3 +161,24 @@ def test_refresh_cloud_config_overwrites_only_cloud_env(monkeypatch):
 
     assert os.environ["MAX_INFLIGHT__ASUS-1"] == "2"    # overwritten: was cloud-sourced
     assert os.environ["WA_PARALLEL__ASUS-1"] == "1"     # untouched: local value wins
+
+
+def test_w130_crm_stop_is_not_reported_as_a_verdict(tmp_path):
+    """W130: a job the CRM paused/cancelled must not send done('error') — the CRM has already
+    moved that row on (a roll-update re-queues it one tick later)."""
+    from pathlib import Path
+
+    from webscraper import agent
+    from webscraper.store import Store
+
+    st = Store(Path(tmp_path) / "leads.db")
+    jid = st.create_job(query="x", location="y", max_places=1, delay_sec=0)
+    st.update_job(jid, message="stopped - the agent was parked from the CRM")
+    assert agent._cancelled_by_crm(st, jid) is True
+
+    jid2 = st.create_job(query="x", location="y", max_places=1, delay_sec=0)
+    st.update_job(jid2, message="finished")
+    assert agent._cancelled_by_crm(st, jid2) is False
+    st.log(jid2, "job", "cancelled in the CRM while the agent was down - not resumed", "warn")
+    assert agent._cancelled_by_crm(st, jid2) is True
+    st.close()

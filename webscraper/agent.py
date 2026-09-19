@@ -738,6 +738,30 @@ def _restart_if_lane_hung(store: Store, srv) -> None:
         os._exit(3)
 
 
+#: W130: phrases the agent itself writes onto a job when the CRM (not this machine) ended it —
+#: a cancel/pause seen on a progress ping, a park, or a revoked token. A run that ended this way
+#: must not report a verdict: the CRM has already moved the row on (often re-queued it).
+_CRM_STOP_MARKS = ("cancelled in the crm", "the crm cancelled", "stopped by the crm",
+                   "the agent was parked from the crm", "token was revoked",
+                   "cancelled while the agent", "paused for scraper update")
+
+
+def _cancelled_by_crm(store: Store, job_id: int) -> bool:
+    try:
+        row = store.conn.execute("SELECT message FROM jobs WHERE id=?", (job_id,)).fetchone()
+        msg = str((row["message"] if row else "") or "").lower()
+    except Exception:                                             # noqa: BLE001
+        return False
+    if any(m in msg for m in _CRM_STOP_MARKS):
+        return True
+    try:
+        logs = store.conn.execute(
+            "SELECT message FROM job_logs WHERE job_id=? ORDER BY rowid DESC LIMIT 12", (job_id,)).fetchall()
+    except Exception:                                             # noqa: BLE001
+        return False
+    return any(any(m in str(l["message"] or "").lower() for m in _CRM_STOP_MARKS) for l in logs)
+
+
 def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> None:
     """Job #32 on the Dell Vostro (2026-08-27) sat at 'queued' for 11 minutes: the agent
     claimed it, the heartbeat stayed green, and nothing ever ran. Here every mirrored
@@ -2427,6 +2451,16 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 # W83: 'stopped' after every lane completed (a watchdog that fired during
                 # the after-job housekeeping, or Stop pressed as the last lane ended) is a
                 # finished job — the CRM row read "Error: discovery: completed · …" before.
+                # W130 (CRM T788/T790, 2026-09-19): do not report a STOP the CRM itself asked for.
+                # A roll-update (or the stuck-job cron) pauses a job, the agent stops its lanes and
+                # one tick later the CRM re-queues it — and this `done("error")`, describing a run
+                # the CRM already ended, landed on the fresh row and turned it into Error (#7038,
+                # #19888, #20004 on the 2.0.8 roll). The leads keep syncing above; only the verdict
+                # is suppressed, and the CRM already knows the job's state.
+                if _cancelled_by_crm(store, int(row["id"])):
+                    log.info("job #%s was stopped by the CRM — skipping the done() report", cid)
+                    store.update_job(row["id"], note="synced")
+                    continue
                 finished = row["phase"] == "done" or (row["phase"] == "stopped" and _lanes_all_ok(store, int(row["id"])))
                 cloud.done(cid, "done" if finished else "error",
                            None if finished else failure[:300])

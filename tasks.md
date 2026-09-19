@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W130** `agent.py` (CRM T788/T790, 2026-09-19) — a job the CRM itself stopped (roll-update pause, stuck-job
+  cron, park, revoked token) no longer reports `done("error")`: the CRM re-queues such a job one tick later and
+  the stale verdict landed on the fresh row, turning #7038 / #19888 / #20004 into Error during the 2.0.8 roll.
+  Leads still sync; only the verdict is suppressed (`_cancelled_by_crm`, `_CRM_STOP_MARKS`). 298 tests.
+
 - [x] **W128/W129** `server.py`/`agent.py` (2026-09-19) — 8 GB laptops OOM under W122 pipelining. W128:
   `MAX_INFLIGHT_JOBS` is now `max_inflight_jobs()`, re-evaluated per scheduling decision (env
   `MAX_INFLIGHT__<DEVICE>` > `MAX_INFLIGHT_JOBS` > 3, clamp 1..6); `agent.py` refreshes cloud-sourced
