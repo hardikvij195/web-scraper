@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from webscraper import eta
 from webscraper import server as srv
 from webscraper.store import Store
+from webscraper.lanes import STAGE_GATES
 
 log = logging.getLogger("webscraper.agent")
 
@@ -1176,11 +1177,27 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
     connections are not thread-safe); the main loop keeps heartbeating and polling."""
     def _run() -> None:
         st = Store()
+        # W127 (CRM T788, 2026-09-19): a re-verify drives the same WhatsApp profiles as a running
+        # job's WhatsApp lane; started beside one it died on "profile is already in use by another
+        # instance of Chromium" (#21475 on the Mac). Take the W122 whatsapp stage slot first — the
+        # lane ahead finishes, the lanes behind wait — under a key no job id can collide with.
+        gate = STAGE_GATES.get("whatsapp")
+        slot = -int(jid)
+        stop_ev = _REVERIFY.get("stop")
+        got = True
         try:
-            _reverify_wa(cloud, st, jid, leads_verify=leads_verify)
+            if gate is not None:
+                got = gate.acquire(slot, lambda: bool(stop_ev and stop_ev.is_set()),
+                                   lambda m: log.info("re-verify #%s %s", jid, m))
+            if got:
+                _reverify_wa(cloud, st, jid, leads_verify=leads_verify)
+            else:
+                log.info("re-verify #%s stopped while waiting for the WhatsApp slot", jid)
         except Exception:                                         # noqa: BLE001
             log.exception("re-verify #%s crashed", jid)
         finally:
+            if gate is not None:
+                gate.release(slot)
             try:
                 st.close()
             except Exception:                                     # noqa: BLE001

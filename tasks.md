@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W127** `agent.py` (CRM T788, 2026-09-19) — a leads re-verify (#21475) started beside a running job's
+  WhatsApp lane on the Mac and died on "profile is already in use by another instance of Chromium": both drive
+  the same WhatsApp profiles. The re-verify thread now takes the W122 `whatsapp` stage slot (key `-cloud_id`)
+  before verifying, so it waits for the lane ahead and the lanes behind wait for it. 293 tests.
+
 - [x] **W126** `agent.py` (CRM T788, 2026-09-19) — the W66 stall watchdog had been a no-op since W83: `_lanes_all_ended`
   read `ok is None` as "lane never asked for", but `ok` is None for a RUNNING lane too, so every job with a live
   lane counted as finished and was never stopped (the Mac sat 45 min on #7038 with a hung WhatsApp lane, nothing
