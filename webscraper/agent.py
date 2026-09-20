@@ -1217,9 +1217,21 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
         stop_ev = _REVERIFY.get("stop")
         got = True
         try:
+            def _waiting(m: str) -> None:
+                """W133 (CRM T788): the wait for the WhatsApp slot must reach the CRM, not just
+                this machine's log. A re-verify has no lanes to tick, so while it queued behind
+                another job's WhatsApp lane its row never changed and `lead_gen_stop_stuck_jobs`
+                marked it incomplete after 30 min (#21476 on the PC, 2026-09-20). Ping progress
+                with a minute counter so the row moves for exactly as long as the wait is real."""
+                log.info("re-verify #%s %s", jid, m)
+                try:
+                    cloud.progress(jid, "waiting", {"waiting": {"whatsapp": m,
+                                                               "minute": int(time.time() // 60)}})
+                except Exception:                                 # noqa: BLE001
+                    log.debug("could not report the re-verify wait for #%s", jid, exc_info=True)
+
             if gate is not None:
-                got = gate.acquire(slot, lambda: bool(stop_ev and stop_ev.is_set()),
-                                   lambda m: log.info("re-verify #%s %s", jid, m))
+                got = gate.acquire(slot, lambda: bool(stop_ev and stop_ev.is_set()), _waiting)
             if got:
                 _reverify_wa(cloud, st, jid, leads_verify=leads_verify)
             else:

@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W133** `agent.py` (CRM T788, 2026-09-20) — a leads re-verify waiting for the machine's WhatsApp slot
+  (W127) logged only to the agent log: its job row never changed, so the CRM's `lead_gen_stop_stuck_jobs(30)`
+  marked #21476 incomplete after 31 min of a perfectly correct wait. The wait now pings `progress` with a
+  `waiting` block + minute counter, the same shape W124 gave the lanes. 302 tests.
+
 - [x] **W132** `agent.py` (2026-09-19) — `STALL_SEC` 120 -> 600. W126 made the stall watchdog work again and it
   promptly failed a HEALTHY job (#19882, DELL): a WhatsApp verdict that ends "could not decide" burns its full
   ~25 s timeout, and a few of those in a row (plus pacing) leave a 3-minute gap between log lines with nothing

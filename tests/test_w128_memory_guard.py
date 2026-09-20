@@ -240,3 +240,15 @@ def test_t793_per_device_memory_knobs(monkeypatch):
     assert wa_verify.wa_relaunch_every() == 150
     assert maps.opener_relaunch_every() == 40
     assert browser_fetch.idle_close_sec() == 300.0
+
+
+def test_w133_reverify_reports_its_slot_wait(monkeypatch):
+    """W133: while a leads re-verify waits for the machine's WhatsApp slot it must ping the CRM,
+    or `lead_gen_stop_stuck_jobs` marks the job incomplete after 30 min of an unchanged row."""
+    import inspect
+
+    from webscraper import agent
+
+    src = inspect.getsource(agent._start_reverify)
+    assert "cloud.progress(" in src, "the wait must reach the CRM, not just the local log"
+    assert '"minute"' in src, "the ping must change every minute or the row still looks frozen"
