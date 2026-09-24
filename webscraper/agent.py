@@ -305,7 +305,11 @@ class CrmCloud:
     capacity_fn: Callable[[], dict] | None = None
 
     def jobs(self) -> list[dict]:
-        extra: dict = {}
+        # T920: this agent now uses `claim()`'s response for every job field it acts on
+        # (see `_tick` / `_requeue_rerun`), never the list row — tell the Edge Function so
+        # it can drop `query`/`progress`/other big columns from this call's payload. An
+        # older, un-updated Edge Function ignores an unknown key and just returns `*`.
+        extra: dict = {"slim": True}
         if time.monotonic() - self._checks_sent_at >= self.CHECKS_EVERY_SEC:
             try:
                 from .healthcheck import run_checks
@@ -888,7 +892,12 @@ def _requeue_orphans(store: Store, kind: str, cloud: "Cloud | CrmCloud | None" =
 #: "Re-verify" is watching the screen, so the next look must be almost immediate —
 #: re-runs used to sit at "queued" for up to a full poll interval (15s in the
 #: scheduled task) before anything visibly happened.
-BUSY_POLL_SEC = 1.0
+#: T920: was 1.0 — at ~20k+ `jobs` calls/day across all machines this was the bulk of the
+#: CRM's Supabase egress. 5.0 still feels immediate to a user watching the screen; note
+#: this is also the CRM Stop button's worst-case latency WHILE BUSY (the busy branch of
+#: the loop below is one plain `time.sleep`, unlike `_idle_sleep` which polls commands
+#: every 1s regardless of the interval) — Stop now takes up to ~5s instead of ~1s.
+BUSY_POLL_SEC = 5.0
 
 #: After work stops, stay in the fast lane this long before going back to the
 #: configured interval. Covers the common "finish one job, another is already
@@ -2131,39 +2140,41 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         "SELECT id FROM jobs WHERE cloud_id=? AND cloud_kind=?", (cj["id"], kind)).fetchone()
     if not row:
         return
-    if cloud.claim(cj["id"]) is None:
+    claimed = cloud.claim(cj["id"])
+    if claimed is None:
         return                                   # another agent got there first
     local_id = int(row["id"])
+    # T920: use `claim()`'s full row from here on, never the (possibly slimmed) list row `cj`.
     store.update_job(
         local_id,
         phase="queued", status="running", note=None, finished_at=None,
         stop_requested=0,
-        reenrich_only=int(bool(cj.get("reenrich_only", False))),
-        discovery_pending=int(bool(cj.get("discovery_pending", False))),
-        do_enrich=int(bool(cj.get("do_enrich", True))),
-        do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
-        place_keys=_place_keys_json(cj),
-        enrich_scope=str(cj.get("enrich_scope") or "all"),          # W76
+        reenrich_only=int(bool(claimed.get("reenrich_only", False))),
+        discovery_pending=int(bool(claimed.get("discovery_pending", False))),
+        do_enrich=int(bool(claimed.get("do_enrich", True))),
+        do_wa_verify=int(bool(claimed.get("do_wa_verify", False))),
+        place_keys=_place_keys_json(claimed),
+        enrich_scope=str(claimed.get("enrich_scope") or "all"),          # W76
         # W112 (CRM T608): "Re-run with extended time" sets a new Maps time limit.
-        max_minutes=cj.get("max_minutes"),
+        max_minutes=claimed.get("max_minutes"),
         # Carry the re-run's window choice too. Without this the CRM's "Show window"
         # toggle was dropped on every re-run — the local job kept its original headless
         # value, so a re-enrich asked to run headed still ran hidden.
-        headless=int(bool(cj.get("headless", True))),
-        priority=int(cj.get("priority") or 0),                        # W122
+        headless=int(bool(claimed.get("headless", True))),
+        priority=int(claimed.get("priority") or 0),                        # W122
         message="re-run requested from the CRM",
     )
     # W59: the WhatsApp lane has its own window choice, and it is tri-state — NULL means
     # "use the agent's WA_VERIFY_HEADLESS". create_job takes a fixed column list, so it
     # is written here rather than widening that signature for a nullable extra.
-    if cj.get("wa_headless") is not None:
-        store.update_job(local_id, wa_headless=int(bool(cj["wa_headless"])))
+    if claimed.get("wa_headless") is not None:
+        store.update_job(local_id, wa_headless=int(bool(claimed["wa_headless"])))
     store.log(local_id, "job", f"re-run requested from the CRM (cloud job #{cj['id']})")
     # W71: "Run on" defaults to Auto now (T457), so a re-enrich can land on a machine that
     # never ran the job and holds none of its leads. Pull the scoped rows from the CRM and
     # seed them locally so the enrichment lane has something to crawl — the WhatsApp
     # re-verify path has always done this; enrichment needed the same.
-    if cj.get("reenrich_only"):
+    if claimed.get("reenrich_only"):
         try:
             n = _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
             if n:
@@ -2330,37 +2341,40 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             continue
         if claimed_fresh:
             continue
-        if cloud.claim(cj["id"]) is None:
+        claimed = cloud.claim(cj["id"])
+        if claimed is None:
             continue
         claimed_fresh = True
-        limit = cj.get("limit_places")
+        # T920: use `claim()`'s full row from here on, never the (possibly slimmed) list
+        # row `cj` — `claim` always returns every column, on old and new Edge Functions alike.
+        limit = claimed.get("limit_places")
         local_id = store.create_job(
-            query=cj["query"], location=cj.get("location"),
+            query=claimed["query"], location=claimed.get("location"),
             max_places=100 if limit is None else int(limit),   # 0 = unlimited
-            delay_sec=float(cj.get("delay_sec") or 0),
+            delay_sec=float(claimed.get("delay_sec") or 0),
             phase="queued",
-            do_enrich=bool(cj.get("do_enrich", True)),
-            headless=bool(cj.get("headless", True)),
-            country=cj.get("country"),
-            radius_km=cj.get("radius_km"),
-            center_lat=cj.get("lat"), center_lng=cj.get("lng"),
-            max_minutes=cj.get("max_minutes"),
-            unique_new=bool(cj.get("unique_new", False)),
-            priority=int(cj.get("priority") or 0))
-        if cj.get("wa_headless") is not None:                     # W59 — see above
-            store.update_job(local_id, wa_headless=int(bool(cj["wa_headless"])))
+            do_enrich=bool(claimed.get("do_enrich", True)),
+            headless=bool(claimed.get("headless", True)),
+            country=claimed.get("country"),
+            radius_km=claimed.get("radius_km"),
+            center_lat=claimed.get("lat"), center_lng=claimed.get("lng"),
+            max_minutes=claimed.get("max_minutes"),
+            unique_new=bool(claimed.get("unique_new", False)),
+            priority=int(claimed.get("priority") or 0))
+        if claimed.get("wa_headless") is not None:                # W59 — see above
+            store.update_job(local_id, wa_headless=int(bool(claimed["wa_headless"])))
         import json as _json
-        locs = cj.get("locations")
+        locs = claimed.get("locations")
         store.update_job(local_id, cloud_id=cj["id"], cloud_kind=kind,
-                         do_research=int(bool(cj.get("do_research", False))),
-                         do_wa_verify=int(bool(cj.get("do_wa_verify", False))),
+                         do_research=int(bool(claimed.get("do_research", False))),
+                         do_wa_verify=int(bool(claimed.get("do_wa_verify", False))),
                          # Carried from the very first mirror, not just on a re-run: a job
                          # created as a scoped re-enrich would otherwise start a full Maps
                          # scrape of everything.
-                         reenrich_only=int(bool(cj.get("reenrich_only", False))),
-                         discovery_pending=int(bool(cj.get("discovery_pending", False))),
-                         place_keys=_place_keys_json(cj),
-                         enrich_scope=str(cj.get("enrich_scope") or "all"),   # W76
+                         reenrich_only=int(bool(claimed.get("reenrich_only", False))),
+                         discovery_pending=int(bool(claimed.get("discovery_pending", False))),
+                         place_keys=_place_keys_json(claimed),
+                         enrich_scope=str(claimed.get("enrich_scope") or "all"),   # W76
                          locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
         log.info("cloud job #%s -> local job #%s", cj["id"], local_id)
         # T359 — "resume job on some other system": THIS agent has never mirrored this
@@ -2376,7 +2390,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # Hydration rebuilds `places`, which is what enrichment and WhatsApp need; the
         # stub re-open still needs `job_links`, which only the original machine has, so
         # on a foreign machine that part offers 0 and the rest of the run is real.
-        if kind == "crm" and cj.get("reenrich_only"):
+        if kind == "crm" and claimed.get("reenrich_only"):
             try:
                 _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
             except Exception:                                     # noqa: BLE001
