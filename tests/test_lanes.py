@@ -431,3 +431,152 @@ def test_parallel_whatsapp_slices_never_touch_the_lane_threads_sqlite(db, monkey
     s.close()
     assert done == 2
     assert sum("not on WhatsApp" in m for m in msgs) == 2, msgs
+
+
+def test_enrichment_does_not_wait_for_whatsapp_with_no_accounts_linked(db, monkeypatch):
+    """T928 (W134, 2026-09-24): ASUS, DELL and MI have no linked WhatsApp account. The
+    enrichment lane's "websites wait — WhatsApp is checking the Google Maps numbers first"
+    wait never clears on those machines (the WhatsApp lane just parks waiting for a re-link
+    that never comes), so it used to hold every website crawl hostage for the whole job.
+    With no enabled WhatsApp account at all, enrichment must proceed immediately."""
+    job_id, job = _mk_job(db, do_enrich=1, do_wa_verify=1)
+    s = db()
+    s.conn.execute(
+        "INSERT INTO places(job_id, place_key, name, phone, website, enrich_status, scraped_at) "
+        "VALUES (?,?,?,?,?, 'pending', ?)",
+        (job_id, "p1", "biz p1", "+919999999999", "http://example.com", now_iso()))
+    s.conn.commit()
+    s.close()
+    # No wa_accounts row at all: Store.enabled_wa_accounts() is empty — the exact condition
+    # wa_verify.verify_places raises WaNotLoggedIn("no WhatsApp accounts …") on.
+
+    async def _fast_enrich(store, rows, concurrency, country, on_progress, should_stop, headless=None):
+        for r in rows:
+            store.update_enrichment(job_id, r["place_key"], {"enrich_status": "done"})
+            on_progress(r, "done", {})
+        return {"done": len(rows), "no_website": 0, "failed": 0, "thin": 0}
+
+    import webscraper.enrich as enrich_mod
+    monkeypatch.setattr(enrich_mod, "enrich_places", _fast_enrich)
+    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
+
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
+    pipe.discovery.done.set()          # discovery already finished; WhatsApp lane never started
+    lane = pipe.enrichment
+    lane.store = db()
+    start = time.monotonic()
+    try:
+        reason = lane.work()
+    finally:
+        lane.store.close()
+
+    assert time.monotonic() - start < 2, "enrichment waited on WhatsApp with no account linked"
+    assert reason == L.R_COMPLETED, reason
+    s = db()
+    msgs = [r["message"] for r in s.logs(job_id)]
+    s.close()
+    assert not any("WhatsApp is checking the Google Maps numbers first" in m for m in msgs), msgs
+    assert any("no WhatsApp account linked" in m for m in msgs), msgs
+
+
+def test_whatsapp_lane_finishes_incomplete_instead_of_hanging_with_no_account_ever_linked(db, monkeypatch):
+    """T928: the exact incident — no wa_accounts row at all (not a session that merely
+    dropped mid-run, which still deserves the full W110/T601 relink grace). Once discovery
+    and enrichment are both done, the lane must give up promptly (not sit out the 30-min
+    grace) with the exact log line the CRM operator needs to act on, and R_WA_LOGIN so the
+    job still finishes 'done' — the CRM's own trigger reclassifies it 'incomplete'."""
+    from webscraper import wa_verify
+
+    job_id, job = _mk_job(db, do_enrich=0, do_wa_verify=1)
+    _add_place(db, job_id, "p1", "+919999999999")
+    row = {"place_key": "p1", "name": "biz p1", "number": "919999999999", "source": "maps"}
+    state = {"pending": True}
+
+    monkeypatch.setattr(Store, "pending_wa_verify",
+                        lambda self, jid, limit=25: [row] if state["pending"] else [])
+    monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
+    monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
+
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+        raise wa_verify.WaNotLoggedIn("no WhatsApp accounts - run `python -m webscraper wa-login <name>` first")
+    monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
+    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
+    monkeypatch.setattr(L, "WA_RELINK_POLL_SEC", 0.02)
+    # Left at its real (huge) default on purpose: the assertion below is that the lane does
+    # NOT wait anywhere near WA_RELINK_GRACE_SEC before giving up.
+
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
+    pipe.discovery.done.set()          # discovery + enrichment (disabled) already "done"
+    lane = pipe.whatsapp
+    lane.store = db()
+    start = time.monotonic()
+    try:
+        reason = lane._work()
+    finally:
+        lane.store.close()
+
+    assert time.monotonic() - start < 5, "lane sat out the relink grace with nothing ever coming"
+    assert reason == L.R_WA_LOGIN, reason
+    s = db()
+    msgs = [r["message"] for r in s.logs(job_id)]
+    s.close()
+    assert any('WhatsApp check skipped — no WhatsApp account linked on' in m
+               and 're-run "WhatsApp verify" after linking' in m for m in msgs), msgs
+    # R_WA_LOGIN is one of Store.OK_REASONS' complements handled by the pipeline as a clean
+    # per-lane end (see Pipeline.run/server.py) — the job still finishes 'done'; the CRM's
+    # own trigger (lead_gen_jobs_mark_incomplete) is what turns it into 'incomplete'.
+
+
+def test_whatsapp_relink_wait_heartbeats_so_the_watchdog_does_not_see_a_hang(db, monkeypatch):
+    """T928: with an account that IS enabled (session merely dropped, W110/T601 — not the
+    'no account at all' fast path above), the lane still owes the log something periodically
+    while it waits out the relink grace — agent.py's stall watchdog fails a job after 600s
+    with no new job_logs row, and the old code logged once on entry and then nothing."""
+    from webscraper import wa_verify
+
+    job_id, job = _mk_job(db, do_enrich=0, do_wa_verify=1)
+    _add_place(db, job_id, "p1", "+919999999999")
+    s = db()
+    s.add_wa_account("acc1")
+    s.set_wa_status("acc1", "logged_out")          # enabled, just not linked — T601 shape
+    s.close()
+    row = {"place_key": "p1", "name": "biz p1", "number": "919999999999", "source": "maps"}
+    state = {"pending": True}
+
+    monkeypatch.setattr(Store, "pending_wa_verify",
+                        lambda self, jid, limit=25: [row] if state["pending"] else [])
+    monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
+    monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
+
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+        raise wa_verify.WaNotLoggedIn("session ended mid-run")
+    monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
+    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
+    monkeypatch.setattr(L, "WA_RELINK_POLL_SEC", 0.02)
+    monkeypatch.setattr(L, "WA_RELINK_HEARTBEAT_SEC", 0.1)
+    monkeypatch.setattr(L, "WA_RELINK_GRACE_SEC", 10.0)   # long enough to observe > 1 heartbeat
+
+    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
+    pipe.discovery.done.set()
+    lane = pipe.whatsapp
+    lane.store = db()
+
+    def stop_after_a_couple_heartbeats():
+        time.sleep(0.45)
+        s2 = db()
+        s2.update_job(job_id, stop_requested=1)
+        s2.close()
+    import threading
+    threading.Thread(target=stop_after_a_couple_heartbeats, daemon=True).start()
+
+    try:
+        reason = lane._work()
+    finally:
+        lane.store.close()
+
+    assert reason == L.R_STOPPED, reason
+    s = db()
+    msgs = [r["message"] for r in s.logs(job_id)]
+    s.close()
+    heartbeats = [m for m in msgs if "still waiting for a linked account" in m]
+    assert len(heartbeats) >= 2, msgs

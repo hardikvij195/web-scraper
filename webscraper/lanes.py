@@ -61,13 +61,29 @@ WA_LOGIN_WAIT_SEC = 240.0
 WA_RELINK_POLL_SEC = 15.0
 WA_RELINK_GRACE_SEC = 1800.0
 
+#: T928 (2026-09-24): how often the wait re-announces itself while parked — comfortably
+#: under agent.py's STALL_SEC (600s), so `job_logs` keeps growing and the stall watchdog
+#: reads a known, narrated wait as alive instead of a hang. Before this fix the wait logged
+#: once on entry and then nothing for up to WA_RELINK_GRACE_SEC (30 min): 18 jobs on ASUS,
+#: DELL and MI (no linked WhatsApp account on any of them) were killed by the watchdog at
+#: 607s of silence and reported to the CRM as `error`.
+WA_RELINK_HEARTBEAT_SEC = 120.0
+
+
 def _wait_for_relink(lane, store: Store, err: Exception):
     """W110: park the WhatsApp lane until an account on this machine is seen logged in again.
 
     True = a re-link happened, retry the batch · False = gave up (nothing else is coming and the
-    grace ran out) · R_STOPPED = the job was stopped. A finished login stamps
+    grace ran out, or — T928 — no account was ever linked on this machine and there is nothing
+    left to feed the lane) · R_STOPPED = the job was stopped. A finished login stamps
     `wa_accounts.status_at` (Store.set_wa_status), which is what this polls — never a browser."""
     since = now_iso()
+    # T928: this machine has literally no enabled WhatsApp account (the exact condition
+    # `wa_verify.verify_places` raises "no WhatsApp accounts - run wa-login ..." on) — not an
+    # account whose session merely dropped mid-run (W110/T601, where waiting out the full
+    # grace for a human to re-link is the point). Once nothing else is coming, waiting a
+    # further 30 minutes for a link that nobody is mid-way through making buys nothing.
+    no_accounts_ever = not store.enabled_wa_accounts()
     lane.note(f"WhatsApp lane waiting — {err}. Link a WhatsApp account on this machine from the "
               "CRM and it carries on by itself", "warn")
     # W123: a parked lane must not hold the WhatsApp stage slot (W122) — on a machine with no
@@ -77,6 +93,7 @@ def _wait_for_relink(lane, store: Store, err: Exception):
     if gate is not None:
         gate.release(lane.job_id)
     grace_end = None
+    last_beat = time.monotonic()
     while True:
         if lane.stopped():
             return R_STOPPED
@@ -86,9 +103,26 @@ def _wait_for_relink(lane, store: Store, err: Exception):
                 return R_STOPPED
             return True
         if lane.ctl.enrichment_finished():
+            if no_accounts_ever and not store.enabled_wa_accounts():
+                # T928: discovery + enrichment are done, nothing more will ever feed this
+                # lane a number to skip waiting for, and no account was ever linked here —
+                # finish now instead of sitting out the 30-min grace. The job still ends
+                # 'done'; the CRM's own trigger reclassifies it 'incomplete' because the
+                # numbers this run found still have no wa_verified verdict.
+                try:
+                    from webscraper.agent import DEVICE_NAME as _device
+                except Exception:                                    # noqa: BLE001
+                    _device = "this device"
+                lane.note(f'WhatsApp check skipped — no WhatsApp account linked on {_device}; '
+                          're-run "WhatsApp verify" after linking', "warn")
+                return False
             grace_end = grace_end or time.monotonic() + WA_RELINK_GRACE_SEC
             if time.monotonic() >= grace_end:
                 return False                 # gave up: Lane.run's finally releases again (a no-op now)
+        now = time.monotonic()
+        if now - last_beat >= WA_RELINK_HEARTBEAT_SEC:
+            lane.note("WhatsApp lane still waiting for a linked account — nothing to report yet", "info")
+            last_beat = now
         time.sleep(WA_RELINK_POLL_SEC)
 
 
@@ -469,12 +503,28 @@ class EnrichmentLane(Lane):
         # at once — otherwise a machine with no session would never crawl anything.
         # WhatsApp keeps running afterwards on the numbers the crawl turns up.
         waited = False
+        wa_skip_noted = False
         while not self.stopped():
             wa = self.ctl.whatsapp
-            wa_busy = wa.enabled() and not wa.done.is_set() and store.count_wa_pending(self.job_id) > 0
+            wa_running = wa.enabled() and not wa.done.is_set()
+            # T928 (2026-09-24): a machine with no WhatsApp account linked (ASUS, DELL, MI)
+            # must not have websites held hostage by this wait — the WhatsApp lane just
+            # parks in `_wait_for_relink` for as long as this job runs (that wait is what
+            # lets a human link one mid-run), which used to mean "websites wait — WhatsApp
+            # is checking the Google Maps numbers first" logged once and then nothing moved
+            # for the rest of the job. Treat WA verification as off for THIS run instead.
+            no_wa_accounts = wa_running and not store.enabled_wa_accounts()
+            if no_wa_accounts:
+                wa_busy = False
+                if not wa_skip_noted:
+                    self.note("no WhatsApp account linked on this device — crawling websites "
+                              "without waiting for WhatsApp verification")
+                    wa_skip_noted = True
+            else:
+                wa_busy = wa_running and store.count_wa_pending(self.job_id) > 0
             if self.ctl.discovery_finished() and not wa_busy:
                 break
-            if not waited:
+            if not waited and not wa_skip_noted:
                 self.note("websites wait — WhatsApp is checking the Google Maps numbers first")
                 waited = True
             time.sleep(IDLE_POLL_SEC)

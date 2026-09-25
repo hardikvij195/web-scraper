@@ -234,6 +234,9 @@ def test_w123_parked_wa_lane_gives_back_its_stage_slot(monkeypatch):
         def wa_relinked_since(self, since):
             return relinked["v"]
 
+        def enabled_wa_accounts(self):
+            return ["acct"]           # T928: an account exists, its session just dropped
+
     class _Ctl:
         def enrichment_finished(self):
             return False
