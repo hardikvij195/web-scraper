@@ -91,3 +91,14 @@ Own Supabase `gfgkcnjxvxlusplwmvae` (NOT the CRM's). Admin creates members; RLS 
 service role. Verified lead = enriched AND (phone OR email) — only those debit credits (`debit_credits`
 RPC) and fire the member's HMAC webhook. Pack prices live server-side in `api/_db.PACKS`. Razorpay / PayU
 env not set yet -> payments 503. Deploy: `cd vercel-app && npx vercel deploy --prod --yes`.
+
+## Rolling out a new agent version (T1011, 2026-10-03)
+
+The CRM `update` command is DEFERRED (W100) until the worker is idle (`current_job is None`). With
+`max_inflight__<device>` > 1 and a deep queue the worker never idles — on 2026-10-03 the awaited job on
+DELL had finished and the machine still ran 2.1.8 an hour later. What works, per machine, ~2 min:
+`stop` command + `lead_gen_agents.enabled = false` (the park stops the lanes; re-queue its running rows
+on the same `target_agent`) → the parked loop runs the deferred update and restarts → `start` command +
+`enabled = true`. After the restart the agent may report the parked jobs as `stopped` (CRM row stays
+`running`, no `alive` block) — re-queue those; the CRM auto-heal picks them up anyway after 30 min.
+W136 todo: drain mode (stop claiming while an update is parked) and resume parked jobs after a restart.
