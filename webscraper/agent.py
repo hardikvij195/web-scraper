@@ -542,7 +542,59 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
             out["waiting"] = {**waits, "minute": int(time.time() // 60)}
     except Exception:                                             # noqa: BLE001
         pass
+    # W135 (CRM T1011): liveness. Cloud job #21760 (a reenrich_only run hydrated onto another
+    # machine) sat 25 min at local 'queued' behind the Worker's in-flight cap — no lane thread
+    # existed yet, so there was no gate wait to report, the payload froze, and the CRM's
+    # stuck-job alert fired. Every non-terminal row now carries a minute counter plus the
+    # lane threads actually alive, so the progress JSON changes at least once a minute
+    # whether the job is mid-batch, queued on a gate, or still waiting for the Worker.
+    try:
+        if str(_col(row, "phase", "") or "") not in _TERMINAL_PHASES:
+            from .lanes import alive_lanes
+            out["alive"] = {"minute": int(time.time() // 60), "lanes": alive_lanes(int(row["id"]))}
+    except Exception:                                             # noqa: BLE001
+        pass
     return out
+
+
+_TERMINAL_PHASES = ("done", "stopped", "failed", "error", "cancelled")
+
+
+def _cloud_phase(row: Any) -> str:
+    """W135 (CRM T1011): the phase the CRM should show, from what the lanes are DOING.
+
+    `jobs.phase` is set to 'scraping' when the Worker starts a job and stays there until it
+    ends, so 13 follow-up runs (discovery disabled or done, only enrichment / WhatsApp left)
+    all read "scraping" on the CRM while three of them were merely queued for a slot.
+    Priority: a running discovery lane -> `scraping`; running enrichment -> `enriching`
+    (`researching` once every website is crawled and only the AI pass is left); running
+    WhatsApp -> `verifying_wa`; every live lane queued on a gate -> `waiting`; otherwise the
+    stored phase (`queued` before the Worker picks it up, terminal phases as they are)."""
+    phase = str(_col(row, "phase", "") or "")
+    if phase in _TERMINAL_PHASES or phase in ("queued", "waiting", "draft"):
+        return phase
+    try:
+        from .lanes import lane_states
+        states = lane_states(int(row["id"]))
+    except Exception:                                             # noqa: BLE001
+        return phase
+    if not states:
+        return phase
+    if states.get("discovery") == "running":
+        return "scraping"
+    if states.get("enrichment") == "running":
+        try:
+            if _col(row, "do_research", 0) and int(_col(row, "enrich_total", 0) or 0) > 0 \
+                    and int(_col(row, "enrich_done", 0) or 0) >= int(_col(row, "enrich_total", 0) or 0):
+                return "researching"
+        except (TypeError, ValueError):
+            pass
+        return "enriching"
+    if states.get("whatsapp") == "running":
+        return "verifying_wa"
+    if all(v == "queued" for v in states.values()):
+        return "waiting"
+    return phase
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -747,6 +799,56 @@ def _restart_if_lane_hung(store: Store, srv) -> None:
         os._exit(3)
 
 
+#: W135 (CRM T1011): machine-wide stall. W66 fails ONE job whose own counters/log froze; this
+#: one restarts the AGENT when every job in flight froze together — which is what a wedged
+#: Playwright/sqlite in the shared process looks like (lane threads alive, nothing moving on
+#: any job for 20 min). Not armed while a WhatsApp lane is parked on a relink wait
+#: (`lanes.RELINK_WAITERS`): that wait is legitimate and the W135 `alive` ping covers it.
+GLOBAL_STALL_SEC = 20 * 60.0
+_GLOBAL_STALL: list = [None, 0.0]        # [signature, first seen at]
+
+
+def _restart_if_all_stalled(store: Store, kind: str, now: float | None = None) -> bool:
+    """Returns True when it decided to restart (tests stub `_close_browsers`/`os._exit`)."""
+    from webscraper.lanes import alive_lanes, RELINK_WAITERS
+    now = time.monotonic() if now is None else now
+    try:
+        rows = store.conn.execute(
+            "SELECT id, scraped_count, enrich_done, research_done, wa_verify_done FROM jobs "
+            "WHERE cloud_id IS NOT NULL AND cloud_kind=? AND phase NOT IN "
+            "('done','failed','stopped','error','cancelled','draft')", (kind,)).fetchall()
+    except Exception:                                             # noqa: BLE001
+        return False
+    live = [int(r["id"]) for r in rows if alive_lanes(int(r["id"]))]
+    if not live or RELINK_WAITERS:
+        _GLOBAL_STALL[0] = None
+        return False
+    ids = [int(r["id"]) for r in rows]
+    try:
+        n_logs, top = store.conn.execute(
+            f"SELECT COUNT(*), COALESCE(MAX(rowid),0) FROM job_logs WHERE job_id IN ({','.join('?' * len(ids))})",
+            ids).fetchone()
+    except Exception:                                             # noqa: BLE001
+        n_logs, top = 0, 0
+    sig = "|".join(f"{r['id']}:{r['scraped_count']}:{r['enrich_done']}:{r['research_done']}:{r['wa_verify_done']}"
+                   for r in rows) + f"|{n_logs}|{top}"
+    if _GLOBAL_STALL[0] != sig:
+        _GLOBAL_STALL[0], _GLOBAL_STALL[1] = sig, now
+        return False
+    if now - _GLOBAL_STALL[1] < GLOBAL_STALL_SEC:
+        return False
+    mins = int(GLOBAL_STALL_SEC // 60)
+    log.error("agent restarting: nothing moved on any job for %d min (live lanes on %s)", mins, live)
+    for jid in live:
+        try:
+            store.log(jid, "job", f"agent restarting: nothing moved for {mins} min", "error")
+        except Exception:                                         # noqa: BLE001
+            pass
+    _close_browsers()
+    os._exit(3)
+    return True
+
+
 #: W130: phrases the agent itself writes onto a job when the CRM (not this machine) ended it —
 #: a cancel/pause seen on a progress ping, a park, or a revoked token. A run that ended this way
 #: must not report a verdict: the CRM has already moved the row on (often re-queued it).
@@ -784,6 +886,7 @@ def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> 
     if not rows:
         return
     now = datetime.now(timezone.utc)
+    restart = False
     for r in rows:
         try:
             created = datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00"))
@@ -797,6 +900,7 @@ def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> 
         worker = getattr(srv, "worker", None)
         if worker is not None and not worker.is_alive():
             why = "the agent's worker thread is dead"
+            restart = True
         elif worker is not None and worker.current_job not in (None, int(r["id"])):
             # W74: busy is not broken. Auto routing (T469) can hand a machine two jobs in
             # one poll; the second is simply queued behind the first and starts the moment
@@ -805,14 +909,24 @@ def _fail_unstarted(cloud: "Cloud | CrmCloud", store: Store, kind: str, srv) -> 
             continue
         else:
             why = "the worker never picked it up (browser launch or SQLite lock hung)"
+            # W135: only when the worker is IDLE — busy with this very job (prep before the
+            # first phase write) is slow, not broken.
+            restart = restart or worker is None or worker.current_job is None
         reason = (f"did not start within {START_GRACE_SEC // 60} min — {why}. "
-                  f"Restart the agent on this machine (Update agent / re-run the installer), then Re-run.")
+                  f"The agent restarts itself now; the CRM's auto-heal re-queues the job.")
         store.update_job(int(r["id"]), phase="error", message=reason)
         log.error("job #%s (cloud #%s) %s", r["id"], r["cloud_id"], reason)
         try:
             cloud.done(int(r["cloud_id"]), "error", reason[:300])
         except httpx.HTTPError as e:
             log.warning("could not report the unstarted job to the cloud: %s", e)
+    if restart:
+        # W135 (CRM T1011): a dead worker thread, or an idle worker that never picked the job
+        # up, is this process broken — not this job. Exit 3 so `run-agent-loop` brings a fresh
+        # agent back; the jobs still in sqlite resume by hydration, the failed one by auto-heal.
+        log.error("agent restarting: a queued job never started and the worker is dead or idle")
+        _close_browsers()
+        os._exit(3)
 
 
 def known_profile_dirs() -> list:
@@ -1052,6 +1166,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
                 log.info("config: %s set from cloud", env)
     except httpx.HTTPError as e:
         log.warning("config fetch failed (continuing with local .env): %s", e)
+    _apply_stage_slots()                                          # W135
     log.info("agent up (%s) — polling %s every %ss", kind, base, poll_sec)
     # local job id -> highest places.rowid already streamed up. In memory only: after a
     # restart it starts at 0 and re-sends that job's rows once, which upsert absorbs.
@@ -1132,6 +1247,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         try:
             _fail_stalled(cloud, store, kind)                     # W66
             _restart_if_lane_hung(store, srv)                     # W126
+            _restart_if_all_stalled(store, kind)                  # W135
         except Exception as e:                                    # noqa: BLE001
             log.warning("stall-watchdog: %s", e)
         try:
@@ -1472,7 +1588,9 @@ _CLOUD_ENV: set[str] = set()
 #: Systems tab). Anything else pulled from cloud config still only applies once, at start.
 _CONFIG_REFRESH_PREFIXES = ("MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__",
                             # T793: per-machine memory knobs, same live-refresh path
-                            "WA_RELAUNCH__", "MAPS_RELAUNCH__", "ENRICH_IDLE__")
+                            "WA_RELAUNCH__", "MAPS_RELAUNCH__", "ENRICH_IDLE__",
+                            # W135 (CRM T1011): stage-gate slots per machine
+                            "ENRICH_SLOTS__", "WA_SLOTS__")
 
 #: How often the main loop re-fetches cloud config for the knobs above.
 CONFIG_REFRESH_SEC = 300.0
@@ -1513,6 +1631,17 @@ def _refresh_cloud_config(cloud: "CrmCloud", *, force: bool = False) -> None:
         if os.environ.get(env) != v:
             log.info("config: %s changed by cloud refresh (%r -> %r)", env, os.environ.get(env), v)
             os.environ[env] = v
+    _apply_stage_slots()
+
+
+def _apply_stage_slots() -> None:
+    """W135: resize the live stage gates from `enrich_slots__<device>` / `wa_slots__<device>`
+    (+ `wa_parallel__<device>`) now in the environment. Never raises."""
+    try:
+        from webscraper.lanes import apply_stage_slots
+        apply_stage_slots()
+    except Exception:                                             # noqa: BLE001
+        log.debug("stage slot refresh failed", exc_info=True)
 
 
 def _maybe_self_update(cloud: "CrmCloud", *, force: bool = False) -> None:
@@ -2444,8 +2573,8 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                         # W115: watermark untouched — the whole batch is re-fetched and
                         # re-sent next tick, nothing in it is lost.
                         log.warning("stream to #%s failed (will retry next tick): %s", cid, e)
-            reply = _cloud_retry(lambda: cloud.progress(cid, row["phase"], _local_progress(row, store)),
-                                 f"progress for #{cid}")
+            reply = _cloud_retry(lambda: cloud.progress(cid, _cloud_phase(row), _local_progress(row, store)),
+                                 f"progress for #{cid}")                     # W135: honest phase
             if reply.cancelled:
                 store.update_job(row["id"], stop_requested=1, note="synced")
             elif reply.reassigned:

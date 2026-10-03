@@ -81,8 +81,8 @@ data/           gitignored: leads.db, browser profiles, exports
 | `WA_RELAUNCH__<DEVICE>` / `MAPS_RELAUNCH__<DEVICE>` / `ENRICH_IDLE__<DEVICE>` | — | T793: per-machine overrides of the three knobs above, pushed from the CRM and refreshed live |
 | `MAX_INFLIGHT_JOBS` | `3` | jobs the Worker may run at once (W122); Maps discovery still one job at a time |
 | `MAX_INFLIGHT__<DEVICE>` | — | per-machine override of `MAX_INFLIGHT_JOBS` (W128, CRM `lead_gen_settings`); read live, refreshed from cloud every 300s |
-| `LANE_SLOTS_ENRICHMENT` | `1` | jobs whose enrichment lane may run concurrently (W122 `StageGate`) |
-| `LANE_SLOTS_WHATSAPP` | `1` | jobs whose WhatsApp lane may run concurrently (W122 `StageGate`) |
+| `LANE_SLOTS_ENRICHMENT` | `2` | local override of jobs whose enrichment lane may run concurrently (W122 `StageGate`); W135: CRM `enrich_slots__<device>` (clamp 1..3) is the normal knob, refreshed live |
+| `LANE_SLOTS_WHATSAPP` | `_wa_parallel()` | local override of concurrent WhatsApp lanes; W135: CRM `wa_slots__<device>` (>=1). Lanes yield a slot every 20 businesses / 25 numbers / 5 min when another job waits (round-robin) |
 | `MEMORY_START_MAX_PCT` | `85` | W129: Worker won't start a NEW job at/above this RAM used% (jobs already running keep going) |
 
 ## Lead Finder Cloud (vercel-app)

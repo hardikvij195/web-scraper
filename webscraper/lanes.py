@@ -77,6 +77,20 @@ def _wait_for_relink(lane, store: Store, err: Exception):
     grace ran out, or — T928 — no account was ever linked on this machine and there is nothing
     left to feed the lane) · R_STOPPED = the job was stopped. A finished login stamps
     `wa_accounts.status_at` (Store.set_wa_status), which is what this polls — never a browser."""
+    # W135: while parked here the lane is legitimately idle — the agent's global stall
+    # watchdog (`agent._restart_if_all_stalled`) must not read that as "nothing moves".
+    RELINK_WAITERS.add(lane.job_id)
+    try:
+        return _wait_for_relink_inner(lane, store, err)
+    finally:
+        RELINK_WAITERS.discard(lane.job_id)
+
+
+#: W135: job ids whose WhatsApp lane is parked in `_wait_for_relink` right now.
+RELINK_WAITERS: set[int] = set()
+
+
+def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool | str:
     since = now_iso()
     # T928: this machine has literally no enabled WhatsApp account (the exact condition
     # `wa_verify.verify_places` raises "no WhatsApp accounts - run wa-login ..." on) — not an
@@ -196,6 +210,32 @@ class StageGate:
                 self._queue.remove(job_id)
             self._cond.notify_all()
 
+    def set_slots(self, slots: int) -> None:
+        """W135: resize in place (keeps the queue and the holders) — a CRM setting change
+        must never drop a lane that already holds a slot."""
+        with self._cond:
+            self.slots = max(1, int(slots))
+            self._cond.notify_all()
+
+    def others_waiting(self, job_id: int) -> bool:
+        """W135: is any OTHER job queued for this gate right now?"""
+        with self._cond:
+            return any(j != job_id for j in self._queue)
+
+    def yield_slot(self, job_id: int, stopped: Callable[[], bool], on_wait: Callable[[str], None]) -> bool:
+        """W135 (CRM T1011): give the slot up and re-queue at the BACK, so the jobs that
+        waited get a turn (round-robin across jobs), then wait for it again. A holder that
+        nobody waits on keeps its slot — the caller checks `others_waiting` first, but this
+        is safe to call regardless. Returns False only when `stopped()` fired meanwhile."""
+        with self._cond:
+            if job_id not in self._holders:
+                return True
+            self._holders.discard(job_id)
+            if job_id not in self._queue:
+                self._queue.append(job_id)
+            self._cond.notify_all()
+        return self.acquire(job_id, stopped, on_wait)
+
     def waiting_on(self, job_id: int) -> dict | None:
         """W124: `{"behind": [holders], "position": n}` while `job_id` is queued for this gate,
         else None. Read by the agent's progress builder so a parked job still *changes*."""
@@ -205,31 +245,67 @@ class StageGate:
             return {"behind": sorted(self._holders), "position": self._queue.index(job_id) + 1}
 
 
-def _stage_slots(var: str) -> int:
+def _device_env(name: str) -> str | None:
+    """`<NAME>__<DEVICE>` from the environment (CRM `lead_gen_settings` keys are pushed
+    upper-cased with the device suffix, e.g. `ENRICH_SLOTS__DELL`)."""
     try:
-        return max(1, int(os.getenv(var, "1")))
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    return os.getenv(f"{name}__{DEVICE_NAME.upper()}") if DEVICE_NAME else None
+
+
+def enrich_slots() -> int:
+    """W135: jobs whose enrichment lane may run at once on this machine. CRM setting
+    `enrich_slots__<device>` (default 2, clamped 1..3); `LANE_SLOTS_ENRICHMENT` in .env
+    is the local override."""
+    raw = os.getenv("LANE_SLOTS_ENRICHMENT") or _device_env("ENRICH_SLOTS")
+    try:
+        n = int(raw) if raw else 2
     except ValueError:
-        return 1
+        n = 2
+    return max(1, min(3, n))
+
+
+def wa_slots() -> int:
+    """W135: jobs whose WhatsApp lane may run at once. CRM setting `wa_slots__<device>`
+    (clamped >= 1); default = `_wa_parallel()` (min of `wa_parallel__<device>` and the
+    linked accounts is applied by the lane itself per batch)."""
+    raw = os.getenv("LANE_SLOTS_WHATSAPP") or _device_env("WA_SLOTS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(1, _wa_parallel())
 
 
 def _build_stage_gates() -> dict[str, StageGate]:
     return {
-        "enrichment": StageGate("enrichment", _stage_slots("LANE_SLOTS_ENRICHMENT")),
-        "whatsapp": StageGate("whatsapp", _stage_slots("LANE_SLOTS_WHATSAPP")),
+        "enrichment": StageGate("enrichment", enrich_slots()),
+        "whatsapp": StageGate("whatsapp", wa_slots()),
     }
 
 
-#: One gate per stage, shared by every job's lanes for the life of the process. Discovery
-#: has no entry here — it is serialised by the Worker (one job's Maps tab at a time), not
-#: by this gate.
-STAGE_GATES: dict[str, StageGate] = _build_stage_gates()
+def apply_stage_slots() -> dict[str, int]:
+    """W135: re-read the slot settings and resize the LIVE gates in place. Called by the
+    agent after the one-time cloud config apply and after every W128 config refresh."""
+    want = {"enrichment": enrich_slots(), "whatsapp": wa_slots()}
+    for k, n in want.items():
+        g = STAGE_GATES.get(k)
+        if g is not None and g.slots != n:
+            log.info("stage gate %s: %d -> %d slot(s) (W135)", k, g.slots, n)
+            g.set_slots(n)
+    return want
 
 
-def reset_stage_gates() -> None:
-    """Test hook: rebuild the module-level stage gates — fresh queues, and re-reads the
-    env vars (so a test's `monkeypatch.setenv` before calling this takes effect)."""
-    STAGE_GATES.clear()
-    STAGE_GATES.update(_build_stage_gates())
+#: W135 time-slicing: a lane gives its stage slot back after this many units (businesses
+#: enriched / numbers checked) or after YIELD_AFTER_SEC, whichever first — but only when
+#: another job is actually queued for that gate.
+YIELD_UNITS = {"enrichment": 20, "whatsapp": 25}
+YIELD_AFTER_SEC = 300.0
+
+
 
 
 #: enrich_error token -> (what it means, whether re-enriching could ever help). User
@@ -357,6 +433,37 @@ class Lane(threading.Thread):
 
     def stopped(self) -> bool:
         return bool(self.store and self.store.stop_requested(self.job_id))
+
+    def _slice_done(self, n: int) -> bool:
+        """W135 (CRM T1011): fair interleaving. Count `n` units into the current slice; once
+        the slice is full (`YIELD_UNITS` / `YIELD_AFTER_SEC`) and another job is queued for
+        this stage, give the slot back and re-queue at the back. Counters and ETA live in
+        `jobs` and keep accumulating across slices. Returns False if the job was stopped
+        while waiting for the slot again."""
+        self._slice_n = getattr(self, "_slice_n", 0) + n
+        t0 = getattr(self, "_slice_t0", None)
+        if t0 is None:
+            t0 = self._slice_t0 = time.monotonic()
+        gate = STAGE_GATES.get(self.key)
+        if gate is None:
+            return True
+        if self._slice_n < YIELD_UNITS.get(self.key, 20) and time.monotonic() - t0 < YIELD_AFTER_SEC:
+            return True
+        done_in_turn = self._slice_n
+        self._slice_n = 0
+        self._slice_t0 = time.monotonic()
+        if not gate.others_waiting(self.job_id):
+            return True                                  # lone job: keep the slot
+
+        def _note_limited(m: str) -> None:
+            now = time.monotonic()
+            if now - getattr(self, "_yield_note_at", 0.0) >= StageGate.NOTE_EVERY_SEC:
+                self._yield_note_at = now
+                self.note(m)
+
+        _note_limited(f"handing the {self.key} slot to the next job in line after {done_in_turn} "
+                      f"in this turn — back in the queue")
+        return gate.yield_slot(self.job_id, self.stopped, _note_limited)
 
     # -- thread body -----------------------------------------------------------------
     def run(self) -> None:
@@ -656,6 +763,8 @@ class EnrichmentLane(Lane):
 
             if self.job.get("do_research"):
                 self._research(batch)
+            if not self._slice_done(len(batch)):            # W135: round-robin across jobs
+                return R_STOPPED
 
     def _research(self, batch: list[dict[str, Any]]) -> None:
         """AI summary for the leads in this batch that ended up with a website."""
@@ -884,6 +993,8 @@ class WhatsAppLane(Lane):
                       f"{res['unknown']} unknown ({checked} numbers checked)")
             if res.get("capped"):
                 return R_WA_CAP
+            if not self._slice_done(len(batch)):            # W135: round-robin across jobs
+                return R_STOPPED
 
 
 def _wa_parallel() -> int:
@@ -906,6 +1017,29 @@ def _wa_parallel() -> int:
         return max(1, min(4, int(str(raw).strip())))
     except ValueError:
         return 1
+
+
+#: W135: local job id -> its running Pipeline, for the agent's liveness ping / watchdog.
+_PIPELINES: dict[int, "Pipeline"] = {}
+
+
+def alive_lanes(job_id: int) -> list[str]:
+    """W135: keys of the lane threads still alive for `job_id` ([] when the Worker has
+    not started it, or it has finished)."""
+    p = _PIPELINES.get(job_id)
+    if p is None:
+        return []
+    return [l.key for l in p.lanes if l.is_alive()]
+
+
+def lane_states(job_id: int) -> dict[str, str]:
+    """W135: per live lane: `running` (holds its stage slot / no gate), `queued` (waiting
+    for a slot — including a W135 yield) — read by `agent._cloud_phase`."""
+    out: dict[str, str] = {}
+    for key in alive_lanes(job_id):
+        g = STAGE_GATES.get(key)
+        out[key] = "queued" if (g is not None and g.waiting_on(job_id)) else "running"
+    return out
 
 
 class Pipeline:
@@ -951,14 +1085,32 @@ class Pipeline:
         return self.enrichment.done.is_set()
 
     def run(self) -> dict[str, str | None]:
-        for lane in self.lanes:
-            lane.start()
-        for lane in self.lanes:
-            lane.join()
-        return {lane.key: lane.reason for lane in self.lanes}
+        _PIPELINES[self.job_id] = self                       # W135: liveness registry
+        try:
+            for lane in self.lanes:
+                lane.start()
+            for lane in self.lanes:
+                lane.join()
+            return {lane.key: lane.reason for lane in self.lanes}
+        finally:
+            _PIPELINES.pop(self.job_id, None)
 
     def summary(self) -> str:
         """One line for jobs.message once everything has stopped."""
         bits = [f"{lane.key}: {lane.reason}" for lane in self.lanes
                 if lane.reason and lane.reason != R_DISABLED]
         return " · ".join(bits) or "nothing to do"
+
+
+#: One gate per stage, shared by every job's lanes for the life of the process. Built at
+#: the END of the module (W135: `wa_slots()` needs `_wa_parallel`, defined above). Discovery
+#: has no entry here — it is serialised by the Worker (one job's Maps tab at a time), not
+#: by this gate.
+STAGE_GATES: dict[str, StageGate] = _build_stage_gates()
+
+
+def reset_stage_gates() -> None:
+    """Test hook: rebuild the module-level stage gates — fresh queues, and re-reads the
+    env vars (so a test's `monkeypatch.setenv` before calling this takes effect)."""
+    STAGE_GATES.clear()
+    STAGE_GATES.update(_build_stage_gates())

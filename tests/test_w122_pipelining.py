@@ -266,11 +266,12 @@ def test_w123_parked_wa_lane_gives_back_its_stage_slot(monkeypatch):
     gate.release(1)
 
 
-def test_w124_progress_reports_gate_waits():
+def test_w124_progress_reports_gate_waits(monkeypatch):
     """W124: a job queued behind another on a stage gate shows up in `waiting_on` (what the
     agent's progress builder ships so the CRM's stuck-job cron sees the row changing)."""
     from webscraper import lanes
 
+    monkeypatch.setenv("LANE_SLOTS_ENRICHMENT", "1")   # W135: the default is 2 now
     lanes.reset_stage_gates()
     gate = lanes.STAGE_GATES["enrichment"]
     assert gate.waiting_on(7) is None
