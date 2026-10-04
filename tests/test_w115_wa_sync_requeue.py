@@ -77,9 +77,9 @@ def wa(monkeypatch):
 
 
 def test_still_syncing_is_requeued_not_recorded_unknown(wa, monkeypatch):
-    """The client never comes back this run — every attempt (the first check plus every
-    re-queue) sees 'syncing', so the number is eventually recorded 'unknown' only after
-    WA_REQUEUE_MAX re-queues, never on the first pass."""
+    """The client never comes back this run — every attempt sees 'syncing'. W115 re-queued
+    the number (bounded) and recorded 'unknown' in the end; W137 benches the account first and
+    never records a verdict a splash screen produced."""
     calls = {"decide": 0}
 
     def decide(page):
@@ -92,10 +92,13 @@ def test_still_syncing_is_requeued_not_recorded_unknown(wa, monkeypatch):
 
     res = wv.verify_places(_Store(), _rows(1))
 
-    assert res["checked"] == 1
-    assert res["unknown"] == 1
-    # 1 initial attempt + WA_REQUEUE_MAX re-queued attempts, never unbounded.
-    assert calls["decide"] == 1 + wv.WA_REQUEUE_MAX
+    # W137 (CRM T1016): a session that never leaves its sync splash is benched after
+    # WA_SYNC_STRIKES non-answers and the number is NOT recorded 'unknown' at all (MAC burned
+    # 34 real numbers that way) — the lane parks and the number stays queued. Still bounded.
+    assert res["checked"] == 0
+    assert res["unknown"] == 0
+    assert res["sync_blocked"] is True
+    assert calls["decide"] == wv.WA_SYNC_STRIKES
 
 
 def test_still_syncing_recovers_once_the_client_settles(wa, monkeypatch):

@@ -110,3 +110,6 @@ W137 todo: drain mode (stop claiming while an update is parked) and resume parke
 queue with the feeder still running, enrichment's "WhatsApp first" wait, WhatsApp login / relink waits)
 call `_slot_idle()` and the lane re-queues with `_slot_resume()` when work shows up (W136, T1015 — DELL
 deadlocked 21 h on two idle holders). Never add a wait inside `work()` that keeps the slot.
+W137: a WhatsApp Web session stuck on its sync splash benches the account after 3 non-answers (nothing
+recorded), the lane parks 5 min at a time and gives up after 30 min with a readable error. The CRM judges a
+machine by WORK done (`lead_gen_frozen_machines`: counters + useful output), never by log/row activity.

@@ -1404,8 +1404,15 @@ _EXIT_COMMANDS = ("update", "restart")
 
 
 def _should_defer(cmd: dict, current_job: int | None) -> bool:
-    """W100: decide whether `cmd` waits for the job in flight instead of running now."""
-    return str(cmd.get("command") or "") in _EXIT_COMMANDS and current_job is not None
+    """W100: decide whether `cmd` waits for the job in flight instead of running now.
+
+    W137 (CRM T1016): `restart` with arg `now` never waits — it is what the CRM's frozen-machine
+    backstop (`lead_gen_restart_frozen_agents`) sends, and a wedged job is the whole reason for
+    it. `_requeue_orphans` resumes the in-flight jobs after the relaunch (W46)."""
+    name = str(cmd.get("command") or "")
+    if name == "restart" and str(cmd.get("arg") or "").strip().lower() == "now":
+        return False
+    return name in _EXIT_COMMANDS and current_job is not None
 
 
 def _cloud_job_id(local_id: int) -> int | None:

@@ -13,6 +13,16 @@
 
 ---
 
+- [x] **W137** `wa_verify.py` + `lanes.py` + `agent.py` (CRM T1016, 2026-10-04) — MAC "produced nothing" for an hour
+  and nothing noticed: WhatsApp Web landed on "messages are downloading" on EVERY send-URL load, each number waited
+  90-300 s and was recorded 'could not decide' (34 unknowns, 0 verdicts), the websites lane waited behind it (W76),
+  and every counter still moved. Now: `WA_SYNC_STRIKES` = 3 sync non-answers in a row bench the account for the
+  slice (still linked, browser closed for a clean boot), nothing is recorded, `verify_places` returns
+  `sync_blocked`; a re-check straight off the splash that still cannot decide is a non-answer too. The lane parks
+  (`WA_SYNC_PARK_SEC` 5 min, slot released) and after `WA_SYNC_GIVE_UP` = 6 parks ends `error:WhatsApp Web keeps
+  re-syncing — relink on this machine` so websites proceed and the CRM shows the cause. `restart` with arg `now`
+  (the CRM frozen-machine backstop) is never deferred. 2.2.2, 333 tests.
+
 - [x] **W136** `lanes.py` + `agent.py` (CRM T1015, 2026-10-04) — DELL did nothing for 21 h (2026-10-03 16:53 UTC ->):
   a slot DEADLOCK. #21540's enrichment lane held the enrichment slot while parked on "websites wait — WhatsApp
   first"; its WhatsApp lane queued for the WhatsApp slot, held by #21543's WhatsApp lane, which sat idle waiting

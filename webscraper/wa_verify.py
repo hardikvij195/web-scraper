@@ -100,6 +100,13 @@ WA_BATCH_PAUSE_MAX_SEC = 300.0
 _STILL_SYNCING = "__still_syncing__"
 WA_REQUEUE_MAX = 2
 
+#: W137 (CRM T1016, MAC 2026-10-04): consecutive sync-related non-answers on ONE account before it
+#: is benched for the rest of the slice. WhatsApp Web that lands on "messages are downloading" on
+#: every send-URL load never answers; each attempt cost 90-300 s and recorded 'unknown' against a
+#: real number (34 unknowns, 0 verdicts in an hour, and the websites lane waited behind it).
+#: Benched = skipped this slice, still linked, its Chrome closed so the next slice boots clean.
+WA_SYNC_STRIKES = 3
+
 
 def wa_sync_max_sec() -> float:
     """How long a sync splash may run before we give up on it for THIS open (env WA_SYNC_MAX_SEC)."""
@@ -645,6 +652,16 @@ def verify_places(
         open_ctx[name] = rl.current
         return True
 
+    def _close_account(name: str) -> None:
+        """W137: drop `name`'s browser so its next open is a clean WhatsApp Web boot."""
+        pair = open_ctx.pop(name, None)
+        ctx = pair[0] if isinstance(pair, tuple) else pair
+        try:
+            if ctx is not None:
+                ctx.close()
+        except Exception:                                         # noqa: BLE001
+            pass
+
     def _check(name: str, num: str) -> str:
         """One number on one account, retried on a fresh browser if Chrome dies.
 
@@ -674,6 +691,11 @@ def verify_places(
                     page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
                     st = _decide(page)
                     log.info("[%s] number %s: WhatsApp Web was still syncing — re-checked (%s)", name, num, st)
+                    if st == "unknown":
+                        # W137: a re-check straight off the sync splash that still cannot decide
+                        # is not an answer either — the caller re-queues it (bounded) or benches
+                        # the account; it is never recorded 'unknown' here.
+                        return _STILL_SYNCING
                 _dismiss_popup(page)
                 return st
             except PWTimeout:                 # subclass of PWError - must stay above it
@@ -726,6 +748,8 @@ def verify_places(
 
     unavailable: set[str] = set()          # W93: accounts whose client never rendered this run
     requeue_tries: dict[tuple[str, str], int] = {}   # W115: (place_key, num) -> re-queues so far
+    sync_strikes: dict[str, int] = {}      # W137: account -> consecutive sync non-answers
+    sync_benched: set[str] = set()         # W137: accounts benched this slice for re-syncing
     try:
         if targets:
             pw = sync_playwright().start()
@@ -811,6 +835,24 @@ def verify_places(
                 continue
 
             if status == _STILL_SYNCING:
+                # W137: three sync non-answers in a row = this account's WhatsApp Web is not
+                # going to answer this slice. Bench it (still linked), close its browser, put
+                # the number back untouched — never burn a real number's checks on a splash.
+                strikes = sync_strikes.get(name, 0) + 1
+                sync_strikes[name] = strikes
+                if strikes >= WA_SYNC_STRIKES:
+                    unavailable.add(name)
+                    sync_benched.add(name)
+                    _close_account(name)
+                    msg = (f"{name}: WhatsApp Web keeps re-syncing (messages downloading) on every load — "
+                           f"{strikes} numbers in a row got no answer; account skipped for this slice, still "
+                           f"linked; its browser was closed to force a clean boot")
+                    log.warning("[%s] %s", name, msg)
+                    if job_id is not None:
+                        store.log(job_id, "whatsapp", msg, "warn")
+                    if account:
+                        break         # a pinned slice has no other account to move to
+                    continue
                 # W115 (CRM T646): checked into a sync that never finished — this was not a
                 # real answer, so put the number back on the queue (bounded) instead of
                 # recording it 'unknown' and never revisiting it this batch. Does not touch
@@ -837,6 +879,8 @@ def verify_places(
                 log.warning("%s: could not bump daily count (db busy) — continuing", name)
             counts[status] += 1
             counts["checked"] += 1
+            if status in ("yes", "no"):
+                sync_strikes[name] = 0                             # W137: a real answer clears the strikes
             # W131 (2026-09-19): recycle this account's Chrome every `WA_RELAUNCH_EVERY`
             # checks. Each verdict is a full `page.goto` of a wa.me send URL, so the WhatsApp
             # tab grows exactly the way W120 measured on the Maps tab (0.5 -> 1.45 GB over ~40
@@ -903,6 +947,9 @@ def verify_places(
                 log.warning("[%s] Playwright did not stop cleanly", account or "wa", exc_info=True)
         from webscraper.fdcount import fd_status
         log.info("[%s] verify slice done: %d checked, %s", account or "wa", counts["checked"], fd_status())
+    # W137: tell the lane when NOTHING was decided because WhatsApp Web never left its sync
+    # splash (every account used got benched) — it parks instead of asking again right away.
+    counts["sync_blocked"] = bool(sync_benched) and counts["yes"] + counts["no"] == 0
     return counts
 
 

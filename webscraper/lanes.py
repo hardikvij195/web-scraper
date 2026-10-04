@@ -74,6 +74,14 @@ WA_RELINK_GRACE_SEC = 1800.0
 #: 607s of silence and reported to the CRM as `error`.
 WA_RELINK_HEARTBEAT_SEC = 120.0
 
+#: W137 (CRM T1016): WhatsApp Web stuck on "messages are downloading" on every load (MAC,
+#: 2026-10-04: 34 'could not decide', 0 verdicts in an hour, websites waiting behind it). When a
+#: slice decides nothing for that reason the lane parks (slot released) for WA_SYNC_PARK_SEC and
+#: retries; after WA_SYNC_GIVE_UP parks in a row it ends with a readable error so the websites
+#: lane stops waiting (W76) and the CRM shows the real problem.
+WA_SYNC_PARK_SEC = 300.0
+WA_SYNC_GIVE_UP = 6
+
 
 def _wait_for_relink(lane, store: Store, err: Exception):
     """W110: park the WhatsApp lane until an account on this machine is seen logged in again.
@@ -1052,6 +1060,28 @@ class WhatsAppLane(Lane):
                 except Exception:                                 # noqa: BLE001
                     pass
                 return R_WA_LOGIN
+            if res.get("sync_blocked"):
+                # W137: nothing decided — WhatsApp Web on this machine never left its sync
+                # splash; the numbers went back on the queue untouched.
+                parks = getattr(self, "_sync_parks", 0) + 1
+                self._sync_parks = parks
+                if parks >= WA_SYNC_GIVE_UP:
+                    self.note(f"WhatsApp Web on this machine kept re-syncing for "
+                              f"{int(WA_SYNC_PARK_SEC * WA_SYNC_GIVE_UP / 60)} min — WhatsApp verification "
+                              "stopped for this run; open WhatsApp on the phone / relink the account "
+                              "in Lead Finder > Systems", "error")
+                    return "error:WhatsApp Web keeps re-syncing — relink on this machine"
+                self.note(f"WhatsApp Web keeps re-syncing — pausing WhatsApp checks "
+                          f"{int(WA_SYNC_PARK_SEC / 60)} min (pause {parks}/{WA_SYNC_GIVE_UP}); "
+                          "the numbers stay queued", "warn")
+                self._slot_idle("WhatsApp Web is re-syncing", force=True)
+                deadline = time.monotonic() + WA_SYNC_PARK_SEC
+                while time.monotonic() < deadline:
+                    if self.stopped():
+                        return R_STOPPED
+                    time.sleep(1.0)
+                continue
+            self._sync_parks = 0
             store.record_phase_rate(self.job_id, "verifying_wa", checked,
                                     time.monotonic() - t0)
             store.update_job(self.job_id, wa_verify_done=checked,
