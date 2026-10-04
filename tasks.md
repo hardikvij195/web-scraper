@@ -13,6 +13,13 @@
 
 ---
 
+- [ ] **W140** `wa_verify.py` / `agent.py` — after a CRM `restart now` (T1016, 21:19 IST) three WhatsApp lanes on ASUS/DELL
+  died at `launch_persistent_context`: "Opening in existing browser session … profile is already in use" / "Target page,
+  context or browser has been closed" — the relaunched agent opened the WhatsApp profile while the old process's Chrome
+  still held it. Todo: `_do_restart` waits for `_close_browsers()` to finish (poll the profile lock / pids) before
+  `os._exit`, and `_ensure_session` evicts the holder (`browser_recovery`) + retries once on that error instead of
+  failing the lane. Jobs #21552 #21554 #21558 ran websites only; auto-heal queues their WhatsApp follow-up.
+
 - [x] **W139** `server.py` (CRM T1016, 2026-10-04) — over-claim: `capacity().inflight` counted only STARTED jobs, so
   one poll per 5 s claimed one more job each time until the local queue held 5 for `max_inflight` 3 (ASUS / DELL
   21:20 IST) — jobs other machines could have run. Claimed-but-unstarted cloud jobs (mirrored `jobs` rows with a
