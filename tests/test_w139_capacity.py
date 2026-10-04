@@ -13,9 +13,9 @@ def test_claimed_but_unstarted_cloud_jobs_count_as_inflight(tmp_path, monkeypatc
     monkeypatch.setattr(server_mod, "max_inflight_jobs", lambda: 3)
     monkeypatch.setattr(server_mod, "memory_blocked", lambda: False)
     s = Store(db_path)
-    a = s.create_job(query="a", location="x", max_places=5, delay_sec=0)
-    b = s.create_job(query="b", location="x", max_places=5, delay_sec=0)
-    c = s.create_job(query="c", location="x", max_places=5, delay_sec=0)      # local, not from the CRM
+    a = s.create_job(query="a", location="x", max_places=5, delay_sec=0, phase="queued")
+    b = s.create_job(query="b", location="x", max_places=5, delay_sec=0, phase="queued")
+    c = s.create_job(query="c", location="x", max_places=5, delay_sec=0, phase="queued")      # local, not from the CRM
     s.update_job(a, cloud_id=101, cloud_kind="crm")
     s.update_job(b, cloud_id=102, cloud_kind="crm")
     s.close()
@@ -33,7 +33,7 @@ def test_claimed_but_unstarted_cloud_jobs_count_as_inflight(tmp_path, monkeypatc
     assert cap["discovery_free"] is False
 
     s = Store(db_path)
-    d = s.create_job(query="d", location="x", max_places=5, delay_sec=0)
+    d = s.create_job(query="d", location="x", max_places=5, delay_sec=0, phase="queued")
     s.update_job(d, cloud_id=103, cloud_kind="crm")
     s.close()
     cap = w.capacity()

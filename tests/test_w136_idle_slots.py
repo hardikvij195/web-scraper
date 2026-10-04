@@ -112,11 +112,12 @@ def test_dell_deadlock_two_jobs_cross_holding_idle_slots(db, monkeypatch):
         assert calls == [(b_id, "b1")]
         assert pb.enrichment.reason in (L.R_COMPLETED, L.R_NO_TARGETS)
         assert pa.whatsapp.reason == L.R_NO_TARGETS
-        # Either idle holder may be the one to let go first (A's WhatsApp lane for B's
-        # WhatsApp lane, or B's enrichment lane for A's) — both orders end the deadlock.
+        # Either idle holder lets go first (W136), or — W138 — B never waits at all because
+        # nobody else was queued for the websites slot at that instant. All three end the deadlock.
         logs = [r["message"] for r in db().conn.execute(
             "SELECT message FROM job_logs WHERE job_id IN (?, ?)", (a_id, b_id))]
-        assert any("slot to the next job in line meanwhile" in m for m in logs), logs
+        assert any("slot to the next job in line meanwhile" in m or "crawling websites alongside" in m
+                   for m in logs), logs
     finally:
         L._PIPELINES.pop(a_id, None); L._PIPELINES.pop(b_id, None)
         s = db()
