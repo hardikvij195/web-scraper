@@ -13,6 +13,11 @@
 
 ---
 
+- [x] **W139** `server.py` (CRM T1016, 2026-10-04) — over-claim: `capacity().inflight` counted only STARTED jobs, so
+  one poll per 5 s claimed one more job each time until the local queue held 5 for `max_inflight` 3 (ASUS / DELL
+  21:20 IST) — jobs other machines could have run. Claimed-but-unstarted cloud jobs (mirrored `jobs` rows with a
+  `cloud_id`, phase queued/waiting) now count; `started` is reported separately. 2.2.4, 337 tests.
+
 - [x] **W138** `server.py` + `lanes.py` + CRM `lead-finder-agent` (T1016, 2026-10-04, owner: "different lanes of
   different jobs together to maximise productivity") — two idle-capacity bugs. (1) A machine whose Maps tab was busy
   claimed NOTHING, even re-enrich / WhatsApp-only jobs that never touch Maps: `capacity()` now sends `lanes_free`

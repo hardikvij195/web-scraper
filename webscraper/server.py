@@ -358,11 +358,28 @@ class Worker(threading.Thread):
         the websites / WhatsApp slots never sit idle behind one discovery."""
         mem = _cached_memory()
         blocked = memory_blocked()
+        # W139 (CRM T1016): jobs already CLAIMED from the CRM but not started yet (mirrored into the
+        # local queue) count as in flight — otherwise one poll per 5 s claimed one more job each
+        # time until the local queue held 5 for a max_inflight of 3 (ASUS/DELL, 2026-10-04 21:20
+        # IST), jobs other machines could have run.
+        pending = 0
+        try:
+            s = Store()
+            try:
+                with self._lock:
+                    started = set(self._inflight)
+                pending = sum(1 for r in s.queued_jobs()
+                              if r["cloud_id"] is not None and int(r["id"]) not in started)
+            finally:
+                s.close()
+        except Exception:                                         # noqa: BLE001
+            pending = 0
         with self._lock:
+            inflight = len(self._inflight) + pending
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,
-                    "lanes_free": (not blocked) and len(self._inflight) < max_inflight_jobs(),
-                    "inflight": len(self._inflight), "max_inflight": max_inflight_jobs(),
+                    "lanes_free": (not blocked) and inflight < max_inflight_jobs(),
+                    "inflight": inflight, "started": len(self._inflight), "max_inflight": max_inflight_jobs(),
                     "memory_pct": mem.get("used_pct")}
 
     def run(self) -> None:  # noqa: C901 — linear orchestration, fine
