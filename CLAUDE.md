@@ -82,7 +82,7 @@ data/           gitignored: leads.db, browser profiles, exports
 | `MAX_INFLIGHT_JOBS` | `3` | jobs the Worker may run at once (W122); Maps discovery still one job at a time |
 | `MAX_INFLIGHT__<DEVICE>` | — | per-machine override of `MAX_INFLIGHT_JOBS` (W128, CRM `lead_gen_settings`); read live, refreshed from cloud every 300s |
 | `LANE_SLOTS_ENRICHMENT` | `2` | local override of jobs whose enrichment lane may run concurrently (W122 `StageGate`); W135: CRM `enrich_slots__<device>` (clamp 1..3) is the normal knob, refreshed live |
-| `LANE_SLOTS_WHATSAPP` | `_wa_parallel()` | local override of concurrent WhatsApp lanes; W135: CRM `wa_slots__<device>` (>=1). Lanes yield a slot every 20 businesses / 25 numbers / 5 min when another job waits (round-robin) |
+| `LANE_SLOTS_WHATSAPP` | `_wa_parallel()` | local override of concurrent WhatsApp lanes; W135: CRM `wa_slots__<device>` (>=1). Lanes yield a slot every 20 businesses / 25 numbers / 5 min when another job waits (round-robin); W136: an idle lane releases its slot |
 | `MEMORY_START_MAX_PCT` | `85` | W129: Worker won't start a NEW job at/above this RAM used% (jobs already running keep going) |
 
 ## Lead Finder Cloud (vercel-app)
@@ -101,4 +101,12 @@ DELL had finished and the machine still ran 2.1.8 an hour later. What works, per
 on the same `target_agent`) → the parked loop runs the deferred update and restarts → `start` command +
 `enabled = true`. After the restart the agent may report the parked jobs as `stopped` (CRM row stays
 `running`, no `alive` block) — re-queue those; the CRM auto-heal picks them up anyway after 30 min.
-W136 todo: drain mode (stop claiming while an update is parked) and resume parked jobs after a restart.
+W137 todo: drain mode (stop claiming while an update is parked) and resume parked jobs after a restart.
+
+## Stage slots (W122 / W135 / W136)
+
+`enrichment` and `whatsapp` are `StageGate`s shared by every job in the process (slots from the CRM
+`enrich_slots__` / `wa_slots__`). A lane holds a slot ONLY while it has a batch in hand: idle waits (empty
+queue with the feeder still running, enrichment's "WhatsApp first" wait, WhatsApp login / relink waits)
+call `_slot_idle()` and the lane re-queues with `_slot_resume()` when work shows up (W136, T1015 — DELL
+deadlocked 21 h on two idle holders). Never add a wait inside `work()` that keeps the slot.

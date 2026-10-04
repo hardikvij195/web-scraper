@@ -592,7 +592,7 @@ def _cloud_phase(row: Any) -> str:
         return "enriching"
     if states.get("whatsapp") == "running":
         return "verifying_wa"
-    if all(v == "queued" for v in states.values()):
+    if all(v in ("queued", "idle") for v in states.values()):
         return "waiting"
     return phase
 
@@ -804,6 +804,7 @@ def _restart_if_lane_hung(store: Store, srv) -> None:
 #: Playwright/sqlite in the shared process looks like (lane threads alive, nothing moving on
 #: any job for 20 min). Not armed while a WhatsApp lane is parked on a relink wait
 #: (`lanes.RELINK_WAITERS`): that wait is legitimate and the W135 `alive` ping covers it.
+#: W136: slot-wait log lines do not count as movement (a deadlock narrates itself forever).
 GLOBAL_STALL_SEC = 20 * 60.0
 _GLOBAL_STALL: list = [None, 0.0]        # [signature, first seen at]
 
@@ -825,8 +826,12 @@ def _restart_if_all_stalled(store: Store, kind: str, now: float | None = None) -
         return False
     ids = [int(r["id"]) for r in rows]
     try:
+        # W136 (CRM T1015): the 90-s "waiting for the … slot — held by job #N" lines are NOT
+        # movement. DELL's three jobs deadlocked on each other's slots for 21 h and those
+        # lines alone kept this signature changing, so the restart never came.
         n_logs, top = store.conn.execute(
-            f"SELECT COUNT(*), COALESCE(MAX(rowid),0) FROM job_logs WHERE job_id IN ({','.join('?' * len(ids))})",
+            f"SELECT COUNT(*), COALESCE(MAX(rowid),0) FROM job_logs WHERE job_id IN ({','.join('?' * len(ids))}) "
+            "AND message NOT LIKE 'waiting for the % slot%' AND message NOT LIKE '%handing the % slot%'",
             ids).fetchone()
     except Exception:                                             # noqa: BLE001
         n_logs, top = 0, 0

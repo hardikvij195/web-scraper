@@ -51,6 +51,11 @@ log = logging.getLogger("webscraper.lanes")
 #: lane feeding it is still running. Two seconds is invisible next to a ~3.5 s/place scrape
 #: and keeps the polling cost to nothing.
 IDLE_POLL_SEC = 2.0
+
+#: W136 (CRM T1015): a lane that holds a stage slot but has nothing to do (feeder still
+#: running, nothing pending) gives the slot up at once when another job waits for it, and
+#: after this long even when nobody does — so a lane between two batches does not churn.
+IDLE_SLOT_SEC = 60.0
 # W77: how long the WhatsApp lane waits for an open wa-login window before giving up —
 # the QR window itself times out after 2 min, so this only ever waits out a real scan.
 WA_LOGIN_WAIT_SEC = 240.0
@@ -216,6 +221,11 @@ class StageGate:
         with self._cond:
             self.slots = max(1, int(slots))
             self._cond.notify_all()
+
+    def holds(self, job_id: int) -> bool:
+        """W136: does `job_id` hold one of this gate's slots right now?"""
+        with self._cond:
+            return job_id in self._holders
 
     def others_waiting(self, job_id: int) -> bool:
         """W135: is any OTHER job queued for this gate right now?"""
@@ -465,6 +475,54 @@ class Lane(threading.Thread):
                       f"in this turn — back in the queue")
         return gate.yield_slot(self.job_id, self.stopped, _note_limited)
 
+    # -- W136 (CRM T1015): a slot is held only while there is work ----------------------
+    #
+    # DELL, 2026-10-03 16:53 UTC -> 2026-10-04: job #21540's enrichment lane held the
+    # enrichment slot while parked on the "websites wait — WhatsApp first" loop; its
+    # WhatsApp lane queued for the WhatsApp slot, held by job #21543's WhatsApp lane, which
+    # sat idle (nothing pending) waiting for its enrichment feeder — queued behind #21540.
+    # A four-way circular wait: nobody worked for 21 h, every lane kept logging a
+    # healthy-looking "waiting for the … slot — held by job #N" line every 90 s, and both
+    # watchdogs (`agent._fail_stalled`, `agent._restart_if_all_stalled`) counted those
+    # lines as progress. The rule now: an idle lane does not own a slot. It releases it
+    # (`_slot_idle`) and queues again like any other waiter the moment a batch shows up
+    # (`_slot_resume`). This is also what lets one job's WhatsApp lane run while another
+    # job's WhatsApp lane is merely waiting for numbers.
+    _slot_parked: bool = False
+    _idle_since: float | None = None
+
+    def _slot_idle(self, why: str, force: bool = False) -> None:
+        """Call on every poll of an idle loop. Releases the stage slot at once when another
+        job is queued for it (or `force`), otherwise after IDLE_SLOT_SEC of idling."""
+        gate = STAGE_GATES.get(self.key)
+        if gate is None or not gate.holds(self.job_id):
+            return
+        now = time.monotonic()
+        if self._idle_since is None:
+            self._idle_since = now
+        if not (force or gate.others_waiting(self.job_id) or now - self._idle_since >= IDLE_SLOT_SEC):
+            return
+        gate.release(self.job_id)
+        self._slot_parked = True
+        self._slice_n = 0
+        self._slice_t0 = None
+        self.note(f"{why} — handing the {self.key} slot to the next job in line meanwhile")
+
+    def _slot_resume(self) -> bool:
+        """Call once a batch is in hand. Takes a slot back if `_slot_idle` gave it up
+        (FIFO behind whoever asked earlier). False only when the job was stopped meanwhile."""
+        self._idle_since = None
+        gate = STAGE_GATES.get(self.key)
+        if gate is None or not self._slot_parked:
+            return True
+        if not gate.acquire(self.job_id, self.stopped, lambda m: self.note(m)):
+            return False
+        self._slot_parked = False
+        self._slice_n = 0
+        self._slice_t0 = time.monotonic()
+        self.note(f"work arrived — {self.key} slot taken back")
+        return True
+
     # -- thread body -----------------------------------------------------------------
     def run(self) -> None:
         # Built through the pipeline's factory rather than `Store()` directly so a test can
@@ -634,6 +692,7 @@ class EnrichmentLane(Lane):
             if not waited and not wa_skip_noted:
                 self.note("websites wait — WhatsApp is checking the Google Maps numbers first")
                 waited = True
+            self._slot_idle("websites are waiting for WhatsApp")      # W136
             time.sleep(IDLE_POLL_SEC)
         if self.stopped():
             return R_STOPPED
@@ -672,8 +731,11 @@ class EnrichmentLane(Lane):
                     if seen and self.research_error:
                         return f"error:AI research: {self.research_error}"[:200]
                     return R_COMPLETED if seen else R_NO_TARGETS
+                self._slot_idle("nothing to crawl yet")                 # W136
                 time.sleep(IDLE_POLL_SEC)
                 continue
+            if not self._slot_resume():                                 # W136
+                return R_STOPPED
 
             # The queue is the `places` table, so a row that comes back 'pending' after
             # being processed would be handed to us again forever. enrich_places writes an
@@ -838,8 +900,11 @@ class WhatsAppLane(Lane):
             if not batch:
                 if self.ctl.enrichment_finished():
                     return R_COMPLETED if checked else R_NO_TARGETS
+                self._slot_idle("no numbers to check yet")             # W136
                 time.sleep(IDLE_POLL_SEC)
                 continue
+            if not self._slot_resume():                                 # W136
+                return R_STOPPED
 
             # Units are NUMBERS (W26): a business with a Maps phone, a wa.me link and two
             # numbers on its site is four checks, and the bar counts all four.
@@ -949,6 +1014,7 @@ class WhatsAppLane(Lane):
                 if wa_verify.login_in_progress():
                     self.note("WhatsApp lane paused — a WhatsApp login is open on this "
                               "machine; resuming when it closes", "info")
+                    self._slot_idle("a WhatsApp login is open", force=True)   # W136
                     deadline = time.monotonic() + WA_LOGIN_WAIT_SEC
                     while wa_verify.login_in_progress() and time.monotonic() < deadline:
                         if self.stopped():
@@ -960,6 +1026,7 @@ class WhatsAppLane(Lane):
                 # 1 - PC ended this lane at 11:26 IST because hvt_wa_bus_2 had dropped; the
                 # user re-linked it at 14:24 while discovery was still adding numbers, and
                 # 1,189 of them sat unchecked because nothing ever looked again.
+                self._slot_idle("no WhatsApp session right now", force=True)  # W136
                 waited = _wait_for_relink(self, store, e)
                 if waited == R_STOPPED:
                     return R_STOPPED
@@ -1034,11 +1101,19 @@ def alive_lanes(job_id: int) -> list[str]:
 
 def lane_states(job_id: int) -> dict[str, str]:
     """W135: per live lane: `running` (holds its stage slot / no gate), `queued` (waiting
-    for a slot — including a W135 yield) — read by `agent._cloud_phase`."""
+    for a slot — including a W135 yield), `idle` (W136: gave its slot up while it has
+    nothing to do) — read by `agent._cloud_phase`."""
     out: dict[str, str] = {}
+    p = _PIPELINES.get(job_id)
+    lanes_by_key = {l.key: l for l in p.lanes} if p is not None else {}
     for key in alive_lanes(job_id):
         g = STAGE_GATES.get(key)
-        out[key] = "queued" if (g is not None and g.waiting_on(job_id)) else "running"
+        if g is not None and g.waiting_on(job_id):
+            out[key] = "queued"
+        elif g is not None and getattr(lanes_by_key.get(key), "_slot_parked", False):
+            out[key] = "idle"
+        else:
+            out[key] = "running"
     return out
 
 

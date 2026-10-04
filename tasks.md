@@ -13,6 +13,17 @@
 
 ---
 
+- [x] **W136** `lanes.py` + `agent.py` (CRM T1015, 2026-10-04) — DELL did nothing for 21 h (2026-10-03 16:53 UTC ->):
+  a slot DEADLOCK. #21540's enrichment lane held the enrichment slot while parked on "websites wait — WhatsApp
+  first"; its WhatsApp lane queued for the WhatsApp slot, held by #21543's WhatsApp lane, which sat idle waiting
+  for numbers from #21543's enrichment lane — queued behind #21540. Every lane logged "waiting for the … slot —
+  held by job #N" every 90 s and BOTH watchdogs counted those lines as progress. Fix: an idle lane does not own a
+  slot — `Lane._slot_idle()` releases it at once when another job waits (or after `IDLE_SLOT_SEC` = 60 s), and
+  `_slot_resume()` queues again the moment a batch is in hand (enrichment: the WhatsApp-first wait + empty
+  queue; WhatsApp: empty queue, login wait, relink wait). `lane_states` reports `idle`; `_restart_if_all_stalled`
+  ignores slot-wait lines. This is also what lets job A's WhatsApp lane run while job B's merely waits for
+  numbers. 2.2.1, 328 tests.
+
 - [x] **W133** `agent.py` (CRM T788, 2026-09-20) — a leads re-verify waiting for the machine's WhatsApp slot
   (W127) logged only to the agent log: its job row never changed, so the CRM's `lead_gen_stop_stuck_jobs(30)`
   marked #21476 incomplete after 31 min of a perfectly correct wait. The wait now pings `progress` with a
