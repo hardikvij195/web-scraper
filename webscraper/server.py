@@ -276,6 +276,20 @@ def memory_blocked() -> bool:
     return used >= limit
 
 
+def job_needs_discovery(row: Any) -> bool:
+    """W138: mirrors `lanes.DiscoveryLane.enabled` for a local jobs row — a re-enrich pass
+    (`reenrich_only`) needs no Maps tab unless it is a `discovery_pending` resume."""
+    try:
+        reenrich = bool(row["reenrich_only"])
+    except (KeyError, IndexError, TypeError):
+        reenrich = False
+    try:
+        pending = bool(row["discovery_pending"])
+    except (KeyError, IndexError, TypeError):
+        pending = False
+    return (not reenrich) or pending
+
+
 class Worker(threading.Thread):
     """Runs up to `max_inflight_jobs()` jobs at once, each on its own thread (`_run_job`).
 
@@ -337,12 +351,17 @@ class Worker(threading.Thread):
 
     def capacity(self) -> dict[str, Any]:
         """Sent to the CRM (`agent.py` CrmCloud `jobs`/`claim` payloads) so the Edge
-        Function can decide whether to offer this machine another job."""
+        Function can decide whether to offer this machine another job.
+
+        W138 (CRM T1016): `lanes_free` — memory allows a new job even while the Maps tab is
+        busy, so the CRM may offer a job that needs no Maps (re-enrich / WhatsApp-only) and
+        the websites / WhatsApp slots never sit idle behind one discovery."""
         mem = _cached_memory()
         blocked = memory_blocked()
         with self._lock:
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,
+                    "lanes_free": (not blocked) and len(self._inflight) < max_inflight_jobs(),
                     "inflight": len(self._inflight), "max_inflight": max_inflight_jobs(),
                     "memory_pct": mem.get("used_pct")}
 
@@ -365,11 +384,16 @@ class Worker(threading.Thread):
                     if self._disc_job == disc_job:
                         self._disc_job = None
 
-            # 3. start the next job's discovery if there is room for it and memory allows.
+            # 3. start the next job if there is room for it and memory allows. W138 (CRM
+            # T1016): the Maps tab being busy only blocks jobs that NEED Maps — a re-enrich /
+            # WhatsApp pass starts alongside the running discovery (its lanes queue on the
+            # W122/W136 stage gates like any other), so no slot idles behind one discovery.
             mem_blocked = memory_blocked()
             with self._lock:
-                slot_free = self._disc_job is None and len(self._inflight) < max_inflight_jobs()
-                can_start = slot_free and not mem_blocked
+                room = len(self._inflight) < max_inflight_jobs()
+                disc_free = self._disc_job is None
+                slot_free = room
+                can_start = room and not mem_blocked
             if slot_free and mem_blocked:
                 now = time.monotonic()
                 if now - self._last_mem_note >= 300:
@@ -384,18 +408,25 @@ class Worker(threading.Thread):
                 # 'waiting'. The CRM returns/queues jobs highest-priority-first (W122).
                 job = None
                 for cand in store.queued_jobs():
-                    if in_window(cand["window_start"], cand["window_end"]):
-                        job = cand
-                        break
-                    if cand["phase"] != "waiting":
-                        store.update_job(int(cand["id"]), phase="waiting",
-                                         message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
+                    if not in_window(cand["window_start"], cand["window_end"]):
+                        if cand["phase"] != "waiting":
+                            store.update_job(int(cand["id"]), phase="waiting",
+                                             message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
+                        continue
+                    if not disc_free and job_needs_discovery(cand):
+                        continue                  # W138: Maps busy — look for a lane-only job
+                    job = cand
+                    break
                 store.close()
                 if job is not None:
                     job_id = int(job["id"])
+                    needs_maps = job_needs_discovery(job)
                     with self._lock:
-                        self._disc_job = job_id
+                        if needs_maps:
+                            self._disc_job = job_id
                         self._inflight[job_id] = None
+                    if not needs_maps and not disc_free:
+                        log.info("job #%s needs no Maps — starting it alongside the running discovery (W138)", job_id)
                     th = threading.Thread(target=self._run_job, args=(job,), name=f"job-{job_id}", daemon=True)
                     self._threads[job_id] = th
                     th.start()

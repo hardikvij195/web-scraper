@@ -13,6 +13,16 @@
 
 ---
 
+- [x] **W138** `server.py` + `lanes.py` + CRM `lead-finder-agent` (T1016, 2026-10-04, owner: "different lanes of
+  different jobs together to maximise productivity") — two idle-capacity bugs. (1) A machine whose Maps tab was busy
+  claimed NOTHING, even re-enrich / WhatsApp-only jobs that never touch Maps: `capacity()` now sends `lanes_free`
+  (room + memory), the Edge Function offers lane-only jobs (`reenrich_only` without `discovery_pending`,
+  `wa_verify_only`) while discovery is busy, and the Worker starts them without taking the Maps slot
+  (`job_needs_discovery`). (2) W76 "websites wait until WhatsApp clears the Maps numbers" idled the websites slot
+  for the whole WhatsApp pass (MAC: hours at 60 s/number) — it is a PRIORITY now: crawl alongside Maps / WhatsApp
+  when no other job is queued for the websites slot, hand the slot over (W136) when one is. CRM
+  `max_inflight__MAC/ASUS` 1 -> 3. 2.2.3, 336 tests.
+
 - [x] **W137** `wa_verify.py` + `lanes.py` + `agent.py` (CRM T1016, 2026-10-04) — MAC "produced nothing" for an hour
   and nothing noticed: WhatsApp Web landed on "messages are downloading" on EVERY send-URL load, each number waited
   90-300 s and was recorded 'could not decide' (34 unknowns, 0 verdicts), the websites lane waited behind it (W76),

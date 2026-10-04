@@ -677,6 +677,8 @@ class EnrichmentLane(Lane):
         # WhatsApp keeps running afterwards on the numbers the crawl turns up.
         waited = False
         wa_skip_noted = False
+        alongside = False
+        wa = self.ctl.whatsapp
         while not self.stopped():
             wa = self.ctl.whatsapp
             wa_running = wa.enabled() and not wa.done.is_set()
@@ -697,14 +699,27 @@ class EnrichmentLane(Lane):
                 wa_busy = wa_running and store.count_wa_pending(self.job_id) > 0
             if self.ctl.discovery_finished() and not wa_busy:
                 break
+            # W138 (CRM T1016, owner: "different lanes of different jobs together to maximise
+            # productivity"): the W76 order is a PRIORITY, not a block. An enrichment slot that
+            # nobody else is queued for would sit idle for the whole WhatsApp pass (MAC: hours
+            # at 60 s/number) — crawl alongside Maps / WhatsApp instead. When another job IS
+            # waiting for the slot, keep W76: hand the slot over (W136) and crawl later.
+            gate = STAGE_GATES.get(self.key)
+            if gate is None or not gate.others_waiting(self.job_id):
+                alongside = True
+                break
             if not waited and not wa_skip_noted:
-                self.note("websites wait — WhatsApp is checking the Google Maps numbers first")
+                self.note("websites wait — WhatsApp is checking the Google Maps numbers first "
+                          "(another job is using the websites slot meanwhile)")
                 waited = True
             self._slot_idle("websites are waiting for WhatsApp")      # W136
             time.sleep(IDLE_POLL_SEC)
         if self.stopped():
             return R_STOPPED
-        if waited:
+        if alongside and (not self.ctl.discovery_finished() or
+                          (wa.enabled() and not wa.done.is_set() and store.count_wa_pending(self.job_id) > 0)):
+            self.note("crawling websites alongside Maps / WhatsApp — the websites slot was free (W138)")
+        elif waited:
             self.note("WhatsApp has cleared the Maps numbers — crawling websites now")
 
         # Set the total BEFORE the first lead is touched, not just after the first batch

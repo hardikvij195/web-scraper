@@ -66,14 +66,17 @@ def _join_all(pipes, timeout=8.0):
     deadline = time.monotonic() + timeout
     for p in pipes:
         for lane in p.lanes:
+            if lane.ident is None:
+                continue                                   # never started
             lane.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def test_dell_deadlock_two_jobs_cross_holding_idle_slots(db, monkeypatch):
-    """The exact DELL shape. Job A's WhatsApp lane holds the WhatsApp slot with nothing to
-    check (its enrichment feeder is queued for the enrichment slot). Job B's enrichment lane
-    holds the enrichment slot while it waits for B's WhatsApp lane to clear B's Maps number —
-    and B's WhatsApp lane is queued behind A. Before W136 this never ended."""
+    """The DELL shape. Job A's WhatsApp lane holds the WhatsApp slot with nothing to check
+    (its enrichment feeder is queued for the enrichment slot). Job B's enrichment lane takes
+    the enrichment slot while B's WhatsApp lane — queued behind A — still has B's Maps number
+    to clear. Before W136 this never ended (and W138 lets B crawl alongside instead of
+    waiting at all unless another job is queued for the slot)."""
     _one_slot_each(monkeypatch)
     calls: list = []
     _fake_wa(monkeypatch, calls)
@@ -99,14 +102,9 @@ def test_dell_deadlock_two_jobs_cross_holding_idle_slots(db, monkeypatch):
                 break
             time.sleep(0.005)
         assert wa_gate.holds(a_id)
-        pb.enrichment.start()                                    # B takes the enrichment slot, waits on WA
-        for _ in range(400):
-            if en_gate.holds(b_id):
-                break
-            time.sleep(0.005)
-        assert en_gate.holds(b_id)
+        pb.enrichment.start()                                    # B takes the enrichment slot
+        pa.enrichment.start()                                    # queued behind B (W138: B keeps W76 only while A waits)
         pb.whatsapp.start()                                      # queued behind A
-        pa.enrichment.start()                                    # queued behind B
 
         _join_all([pa, pb], timeout=8.0)
         alive = [f"{p.job_id}:{l.key}" for p in (pa, pb) for l in p.lanes if l.is_alive()]
