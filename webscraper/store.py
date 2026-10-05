@@ -395,7 +395,8 @@ class Store:
             # ownership is what makes three threads sharing this DB safe, so keep it that
             # way when adding counters. `*_ok` is 1 only for a lane that genuinely ran out
             # of work; `*_reason` is a token (completed | maps_cap | stopped | wa_daily_cap
-            # | wa_not_logged_in | no_targets | error:<detail>) the UI renders as prose.
+            # | wa_not_logged_in | wa_no_session (W144) | no_targets | error:<detail>) the UI
+            # renders as prose.
             # Lane starts reuse scrape_started_at / enrich_started_at / wa_started_at.
             ("disc_ended_at", "TEXT"), ("disc_ok", "INTEGER"), ("disc_reason", "TEXT"),
             ("enr_ended_at", "TEXT"), ("enr_ok", "INTEGER"), ("enr_reason", "TEXT"),

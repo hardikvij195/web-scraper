@@ -79,8 +79,9 @@ data/           gitignored: leads.db, browser profiles, exports
 | `ENRICH_BROWSER_IDLE_SEC` | `300` | close idle fallback Chrome (W120, `browser_fetch.py`) |
 | `MAPS_RELAUNCH_EVERY_PLACES` / `_TILES` | `40` / `20` | planned Maps context relaunch (W120); 0 = off |
 | `WA_RELAUNCH__<DEVICE>` / `MAPS_RELAUNCH__<DEVICE>` / `ENRICH_IDLE__<DEVICE>` | — | T793: per-machine overrides of the three knobs above, pushed from the CRM and refreshed live |
-| `MAX_INFLIGHT_JOBS` | `3` | jobs the Worker may run at once (W122); Maps discovery still one job at a time |
-| `MAX_INFLIGHT__<DEVICE>` | — | per-machine override of `MAX_INFLIGHT_JOBS` (W128, CRM `lead_gen_settings`); read live, refreshed from cloud every 300s |
+| `MAX_INFLIGHT_JOBS` | `8` | W144: CRASH GUARD only (clamp 1..12) — never a scheduling knob. Jobs start per LANE: Maps = 1 tab, enrichment = `enrich_slots()`, WhatsApp = `wa_slots()` + a usable account (`server.may_start_job` / `job_next_lane`) |
+| `MAX_INFLIGHT__<DEVICE>` | — | per-machine override of `MAX_INFLIGHT_JOBS` (W128, CRM `lead_gen_settings` Systems setting); read live, refreshed from cloud every 300s |
+| `WA_NO_SESSION_GIVE_UP_SEC` | `900` | W144 (CRM T1024): a WhatsApp lane with no linked account waits this long for a relink (W110), then ends `wa_no_session` so the job ends `incomplete` and the CRM moves its WhatsApp pass to a machine with a session; 0 = wait for ever |
 | `LANE_SLOTS_ENRICHMENT` | `2` | local override of jobs whose enrichment lane may run concurrently (W122 `StageGate`); W135: CRM `enrich_slots__<device>` (clamp 1..3) is the normal knob, refreshed live |
 | `LANE_SLOTS_WHATSAPP` | `_wa_parallel()` | local override of concurrent WhatsApp lanes; W135: CRM `wa_slots__<device>` (>=1). Lanes yield a slot every 20 businesses / 25 numbers / 5 min when another job waits (round-robin); W136: an idle lane releases its slot |
 | `MEMORY_START_MAX_PCT` | `85` | W129: Worker won't start a NEW job at/above this RAM used% (jobs already running keep going) |
@@ -106,7 +107,13 @@ on the same `target_agent`) → the parked loop runs the deferred update and res
 `running`, no `alive` block) — re-queue those; the CRM auto-heal picks them up anyway after 30 min.
 W137 todo: drain mode (stop claiming while an update is parked) and resume parked jobs after a restart.
 
-## Stage slots (W122 / W135 / W136)
+## Stage slots (W122 / W135 / W136 / W144)
+
+W144: there is NO job cap. The Worker starts a queued job when the lane it needs FIRST (`job_next_lane`:
+discovery > enrichment with websites pending > WhatsApp with numbers pending) has a free slot right now
+(`StageGate.free()` minus promised starts; WhatsApp also needs a usable account). `capacity()` reports
+`maps_free` / `enrich_free` / `wa_free` + `lane_slots` and the CRM offers one job per idle lane.
+`max_inflight_jobs()` (default 8) is only the crash guard.
 
 `enrichment` and `whatsapp` are `StageGate`s shared by every job in the process (slots from the CRM
 `enrich_slots__` / `wa_slots__`). A lane holds a slot ONLY while it has a batch in hand: idle waits (empty

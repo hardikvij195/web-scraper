@@ -13,6 +13,34 @@
 
 ---
 
+- [x] **W144** `server.py` / `lanes.py` / `store.py` / `eta.py` (CRM T1022 + T1024, 2026-10-05, owner: "maps should work
+  24x7, whatsapp should work 24x7, website should also work 24x7 — multiple jobs work together with different lanes
+  active"; "remove the jobs cap => add lanes cap logic, so that each lane is busy always"; "if a system has wa logged
+  out and there is an incomplete job whose wa is pending, move that job to another system that has a wa session") —
+  **No job cap.** `max_inflight_jobs()` is a crash guard only (default 8, clamp 1..12, same `MAX_INFLIGHT__<DEVICE>` /
+  `MAX_INFLIGHT_JOBS` knobs). `job_next_lane(job, enrich_pending, wa_pending)` -> discovery | enrichment | whatsapp |
+  None; `may_start_job(lane, ...)` starts a queued job only when THAT lane has a free slot now (Maps: `_disc_job is
+  None`; gates: `StageGate.free()`/`busy()` = holders + queue, minus starts promised via `Worker._start_lane`; WhatsApp
+  also `wa_account_usable` = enabled, not needs_relink, not W142-paused), plus memory (W129) and the crash guard.
+  `capacity()` -> `maps_free` / `enrich_free` / `wa_free` (mirrored-unstarted jobs counted against their next lane),
+  `lanes_free` = any, `max_inflight` = `hard_max` = guard, `lane_slots: {discovery: {busy, cap: 1}, enrichment: {busy,
+  cap}, whatsapp: {busy, cap, account}}`. **WA give-up (T1024):** the W110 relink wait is bounded by
+  `WA_NO_SESSION_GIVE_UP_SEC` (900, 0 = for ever); then the lane ends `wa_no_session` (new `R_WA_NO_SESSION`, eta label
+  "no WhatsApp session on this machine"), logs `WhatsApp lane gave up after 15 min without a linked account — the CRM
+  moves this job's WhatsApp pass to a machine with a session`, writes `wa_verify_total = done + pending` (same shape as
+  `wa_daily_cap`), the job ends `done` locally and the CRM trigger reclassifies it `incomplete` with the WhatsApp leftover
+  — the CRM auto-heal re-runs it on a WA-capable machine. 2.2.8, `tests/test_w144_lane_caps.py`.
+  **Lane situation matrix** (situation -> handler):
+  Maps idle + queued discovery job -> start it (W141/W144) · enrichment slot idle + enrichment-next job -> start it ·
+  WhatsApp slot idle + usable account + WA-next job -> start it · WhatsApp idle, no account -> never take WA-next jobs
+  (`wa_free` false), in-flight WA lanes give up after 15 min (`wa_no_session`, CRM moves the pass) · WA re-sync loop ->
+  W143 per-account ladder (park, recovery, needs_relink) · WA daily cap -> lane ends `wa_daily_cap`, CRM moves/defers ·
+  Maps `max_minutes` cap -> lane ends `maps_cap`, next discovery job starts at once, leftover resumes as a continuation ·
+  profile lock -> W142 eviction · agent hang -> W142 loop watchdog (`os._exit(3)`, supervisor relaunch) · slot deadlock
+  (idle holders) -> W136 `_slot_idle` / `_slot_resume` · memory >= `MEMORY_START_MAX_PCT` -> no new jobs, lanes continue
+  (W129) · crash guard -> `max_inflight_jobs()` · AI research providers down -> enrichment continues without research ·
+  browser fetch worker died -> `Relauncher` / eviction (W120 / T397).
+
 - [x] **W143** `wa_verify.py` / `lanes.py` / `store.py` / `healthcheck.py` / `agent.py` (CRM T1021, 2026-10-05, owner: "add some
   logic of failsafe so that we do not face this issue again on mac") — the Mac 09:29-15:05: WhatsApp Web showed "messages are
   downloading" on every load, W137 benched `main`, the lane parked 5 min, next job's lane started its park count from zero —

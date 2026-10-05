@@ -106,6 +106,19 @@ def _wait_for_relink(lane, store: Store, err: Exception):
 #: W135: job ids whose WhatsApp lane is parked in `_wait_for_relink` right now.
 RELINK_WAITERS: set[int] = set()
 
+#: W144 (CRM T1024): the relink wait is bounded. Tests swap the clock.
+_relink_now = time.monotonic
+
+
+def wa_no_session_give_up_sec() -> float:
+    """W144: how long a WhatsApp lane waits for a linked account before it ends `wa_no_session`
+    and lets the CRM move the job's WhatsApp pass to a machine that has one. Env
+    `WA_NO_SESSION_GIVE_UP_SEC`, default 900; 0 = wait for ever (the pre-W144 W110 behaviour)."""
+    try:
+        return max(0.0, float(os.getenv("WA_NO_SESSION_GIVE_UP_SEC", "900") or "900"))
+    except ValueError:
+        return 900.0
+
 
 def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool | str:
     since = now_iso()
@@ -125,6 +138,8 @@ def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool |
         gate.release(lane.job_id)
     grace_end = None
     last_beat = time.monotonic()
+    give_up = wa_no_session_give_up_sec()
+    wait_t0 = _relink_now()
     while True:
         if lane.stopped():
             return R_STOPPED
@@ -133,6 +148,12 @@ def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool |
             if gate is not None and not gate.acquire(lane.job_id, lane.stopped, lambda m: lane.note(m)):
                 return R_STOPPED
             return True
+        if give_up > 0 and _relink_now() - wait_t0 >= give_up:
+            # W144 (CRM T1024): nobody linked an account here within the window — stop holding
+            # the job's WhatsApp pass hostage to this machine. The lane ends `wa_no_session`,
+            # the job ends `incomplete` with its WhatsApp leftover and the CRM auto-heal re-runs
+            # that pass on a machine with a session.
+            return R_WA_NO_SESSION
         if lane.ctl.enrichment_finished():
             if no_accounts_ever and not store.enabled_wa_accounts():
                 # T928: discovery + enrichment are done, nothing more will ever feed this
@@ -168,6 +189,7 @@ R_MAPS_CAP = "maps_cap"            # discovery hit max_minutes
 R_STOPPED = "stopped"              # user pressed Stop
 R_WA_CAP = "wa_daily_cap"          # per-account WhatsApp cap reached
 R_WA_LOGIN = "wa_not_logged_in"    # no live WhatsApp Web session
+R_WA_NO_SESSION = "wa_no_session"  # W144: waited WA_NO_SESSION_GIVE_UP_SEC for a session — the CRM moves the WA pass
 R_DISABLED = "disabled"            # the job did not ask for this lane
 
 
@@ -219,6 +241,17 @@ class StageGate:
                 on_wait(f"waiting for the {self.key} slot — held by job #{holder}")
                 noted_at = now
             time.sleep(self.POLL_SEC)
+
+    def busy(self) -> int:
+        """W144: jobs whose lane is active on this gate or queued for it (holders + queue). A lane
+        that gave its slot back while idle (W136 `_slot_idle`) is in neither — it is not busy."""
+        with self._cond:
+            return len(self._holders) + len(self._queue)
+
+    def free(self) -> int:
+        """W144: slots a NEW job's lane could take right now."""
+        with self._cond:
+            return max(0, self.slots - len(self._holders) - len(self._queue))
 
     def release(self, job_id: int) -> None:
         with self._cond:
@@ -1065,6 +1098,17 @@ class WhatsAppLane(Lane):
                 waited = _wait_for_relink(self, store, e)
                 if waited == R_STOPPED:
                     return R_STOPPED
+                if waited == R_WA_NO_SESSION:
+                    # W144 (CRM T1024): same end shape as a `wa_daily_cap` stop — the WhatsApp
+                    # total/done counters carry the leftover (numbers still pending), the job ends
+                    # with this lane's reason and the CRM moves its WhatsApp pass elsewhere.
+                    mins = int(wa_no_session_give_up_sec() // 60)
+                    self.note(f"WhatsApp lane gave up after {mins} min without a linked account — the CRM "
+                              "moves this job's WhatsApp pass to a machine with a session", "warn")
+                    done_n = store.count_wa_done(self.job_id)
+                    store.update_job(self.job_id, wa_verify_done=done_n,
+                                     wa_verify_total=done_n + store.count_wa_pending(self.job_id))
+                    return R_WA_NO_SESSION
                 if waited:
                     continue
                 self.note(f"WhatsApp verification skipped — {e}", "warn")

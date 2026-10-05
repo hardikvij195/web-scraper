@@ -1,28 +1,35 @@
-"""W141 (CRM T1019, owner: "a google maps lane for any job running 24x7"): one overflow slot above
-max_inflight is reserved for a job that needs Maps, so the Maps tab never idles behind jobs that
-hold every slot in enrichment / WhatsApp."""
-from __future__ import annotations
+"""W141 (CRM T1019) -> W144: the Maps tab never idles behind jobs sitting in enrichment / WhatsApp.
 
-from webscraper.server import may_start_job
+W141 gave a discovery job ONE overflow slot above the job cap. W144 removed the job cap: a discovery
+job starts whenever the Maps tab is free, however many jobs are draining their other lanes, bounded
+only by the crash guard (`max_inflight_jobs()`). The intent these tests keep: Maps never idles, a busy
+Maps tab blocks any discovery job, and never two discovery jobs at once."""
+from webscraper.server import LANE_DISCOVERY, LANE_ENRICHMENT, may_start_job
 
-MAX = 3
-
-
-def test_discovery_job_takes_the_overflow_slot_at_max():
-    assert may_start_job(True, MAX, MAX, disc_free=True) is True
+GUARD = 8
 
 
-def test_non_discovery_job_still_obeys_max_inflight():
-    assert may_start_job(False, MAX, MAX, disc_free=True) is False
-    assert may_start_job(False, MAX - 1, MAX, disc_free=False) is True      # W138 unchanged
+def _args(**kw):
+    base = dict(disc_free=True, enrich_free=0, wa_free=0, wa_account=False, n_inflight=0, max_inflight=GUARD)
+    base.update(kw)
+    return base
 
 
-def test_second_discovery_job_does_not_start_while_the_overflow_runs():
-    # overflow job running: 4 in flight, Maps busy -> no second one, whichever way it is judged
-    assert may_start_job(True, MAX + 1, MAX, disc_free=False) is False
-    # its discovery done (slot free again) but still 4 in flight -> still no second overflow
-    assert may_start_job(True, MAX + 1, MAX, disc_free=True) is False
+def test_discovery_job_starts_whenever_the_maps_tab_is_free_even_with_many_jobs_in_flight():
+    for n in range(GUARD):
+        assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=n)) is True, n
 
 
-def test_busy_maps_tab_blocks_a_discovery_job_below_max_too():
-    assert may_start_job(True, 1, MAX, disc_free=False) is False
+def test_full_enrichment_and_whatsapp_lanes_do_not_hold_a_discovery_job():
+    assert may_start_job(LANE_DISCOVERY, **_args(enrich_free=0, wa_free=0, n_inflight=5)) is True
+    assert may_start_job(LANE_ENRICHMENT, **_args(enrich_free=0, n_inflight=5)) is False   # its own lane is full
+
+
+def test_busy_maps_tab_blocks_a_discovery_job():
+    assert may_start_job(LANE_DISCOVERY, **_args(disc_free=False, n_inflight=1)) is False
+    assert may_start_job(LANE_DISCOVERY, **_args(disc_free=False, n_inflight=0)) is False
+
+
+def test_crash_guard_is_the_only_job_count_that_matters():
+    assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD)) is False
+    assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD - 1)) is True

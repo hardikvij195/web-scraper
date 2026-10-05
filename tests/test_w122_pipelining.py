@@ -82,7 +82,7 @@ def _wait_until(cond, timeout=5.0) -> bool:
 def _patched_worker(tmp_path, monkeypatch):
     db_path = tmp_path / "sched.db"
     monkeypatch.setattr(server_mod, "Store", lambda *a, **kw: Store(db_path))
-    monkeypatch.setattr(server_mod, "max_inflight_jobs", lambda: 3)  # W128: now a function
+    monkeypatch.setattr(server_mod, "max_inflight_jobs", lambda: 8)  # W144: crash guard only
 
     pipes: dict[int, _FakePipe] = {}
     finish_events: dict[int, threading.Event] = {}
@@ -144,14 +144,14 @@ def test_worker_pipelines_discovery_across_jobs_within_inflight_cap(_patched_wor
     assert _wait_until(lambda: w._disc_job == j2)
     assert j1 in w.inflight_jobs(), "job 1 must keep running after its discovery ends"
 
-    # Free job 2's discovery -> job 3 starts (now 3 in flight: the MAX_INFLIGHT_JOBS cap).
+    # Free job 2's discovery -> job 3 starts (3 in flight; W144: no job cap, only the lane).
     pipes[j2].discovery_done.set()
     w.wake.set()
     assert _wait_until(lambda: w._disc_job == j3)
     assert sorted(w.inflight_jobs()) == [j1, j2, j3]
 
-    # Free job 3's discovery too -> the Maps slot is free and job 4 needs Maps: W141 lets it
-    # start as the ONE overflow job above the cap (3 in flight -> 4).
+    # Free job 3's discovery too -> the Maps slot is free and job 4 needs Maps: W141/W144 — the
+    # Maps tab never idles while a discovery job is queued (4 in flight, under the crash guard).
     pipes[j3].discovery_done.set()
     w.wake.set()
     assert _wait_until(lambda: w._disc_job == j4)

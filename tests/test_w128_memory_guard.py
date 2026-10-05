@@ -29,7 +29,7 @@ def test_max_inflight_jobs_precedence_and_clamp(monkeypatch):
     monkeypatch.delenv("MAX_INFLIGHT_JOBS", raising=False)
 
     # default
-    assert server_mod.max_inflight_jobs() == 3
+    assert server_mod.max_inflight_jobs() == 8
 
     # MAX_INFLIGHT_JOBS alone
     monkeypatch.setenv("MAX_INFLIGHT_JOBS", "5")
@@ -43,11 +43,11 @@ def test_max_inflight_jobs_precedence_and_clamp(monkeypatch):
     monkeypatch.setenv("MAX_INFLIGHT__ASUS-1", "0")
     assert server_mod.max_inflight_jobs() == 1
     monkeypatch.setenv("MAX_INFLIGHT__ASUS-1", "99")
-    assert server_mod.max_inflight_jobs() == 6
+    assert server_mod.max_inflight_jobs() == 12
 
     # garbage falls back to 3
     monkeypatch.setenv("MAX_INFLIGHT__ASUS-1", "nope")
-    assert server_mod.max_inflight_jobs() == 3
+    assert server_mod.max_inflight_jobs() == 8
 
 
 # ── (b) memory_blocked() gates starting a new job ───────────────────────────────────

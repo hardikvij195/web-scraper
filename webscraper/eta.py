@@ -145,6 +145,7 @@ REASON_TEXT = {
     "stopped": "stopped by you",
     "wa_daily_cap": "daily WhatsApp cap reached",
     "wa_not_logged_in": "WhatsApp Web not logged in",
+    "wa_no_session": "no WhatsApp session on this machine",
     "disabled": "not requested",
 }
 

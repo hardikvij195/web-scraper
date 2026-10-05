@@ -218,36 +218,52 @@ def fetch_known_cloud_keys(unique_new: bool, fetcher: Callable[[str | None], set
         return set()
 
 
-def may_start_job(needs_maps: bool, n_inflight: int, max_inflight: int, disc_free: bool) -> bool:
-    """W141 (CRM T1019): start rule for a queued local job. Non-Maps jobs obey max_inflight; a job
-    that NEEDS Maps may take ONE overflow slot (n_inflight == max_inflight) when the Maps tab is
-    free, so the tab never idles behind jobs sitting in enrichment / WhatsApp. Never two overflows:
-    at max+1 nothing starts, and a busy Maps tab blocks any discovery job."""
-    if needs_maps:
-        return disc_free and n_inflight < max_inflight + 1
-    return n_inflight < max_inflight
+LANE_DISCOVERY, LANE_ENRICHMENT, LANE_WHATSAPP = "discovery", "enrichment", "whatsapp"
+
+
+def may_start_job(lane: str | None, *, disc_free: bool, enrich_free: int, wa_free: int,
+                  wa_account: bool, n_inflight: int, max_inflight: int,
+                  mem_blocked: bool = False) -> bool:
+    """W144 (CRM T1022/T1024, owner: "remove the jobs cap — add lanes cap logic, so that each
+    lane is busy always"): a queued local job may start when the lane it would occupy FIRST
+    (`job_next_lane`) has a free slot RIGHT NOW — Maps: the `_disc_job` tab is free;
+    enrichment / WhatsApp: that StageGate has capacity left after the lanes already holding
+    or queued on it (`enrich_free` / `wa_free` are those free counts, promised starts already
+    subtracted). WhatsApp additionally needs a usable account (linked, enabled, not paused, not
+    `needs_relink`). A job whose next lane is full does NOT start even if other lanes idle —
+    it would only queue on the gate and look stuck. `max_inflight` is a crash guard only
+    (`max_inflight_jobs()`), never a scheduling knob; `mem_blocked` is W129. A job with no
+    lane work left (`lane is None`) just needs the guards: it ends in seconds."""
+    if mem_blocked or n_inflight >= max_inflight:
+        return False
+    if lane == LANE_DISCOVERY:
+        return disc_free
+    if lane == LANE_ENRICHMENT:
+        return enrich_free > 0
+    if lane == LANE_WHATSAPP:
+        return wa_free > 0 and wa_account
+    return True
 
 
 def max_inflight_jobs() -> int:
-    """W122/W128: how many jobs may be in flight (any lane running) at once. Google Maps
-    discovery is still ONE job at a time (`_disc_job`, exactly two Chrome tabs total —
-    CLAUDE.md); this caps how many jobs' enrichment/WhatsApp lanes may be draining
-    concurrently alongside it. Evaluated fresh on every scheduling decision (not read
-    once at import) so a live change — a local `.env` edit, or `agent.py`'s periodic
-    cloud-config refresh — takes effect without a restart. Order: env
+    """W144: a CRASH GUARD only — the most jobs this process will hold in flight at once, so a
+    runaway queue can never open fifty Chromes. Scheduling is by LANE (`may_start_job`: Maps =
+    1 tab, enrichment = `lanes.enrich_slots()`, WhatsApp = `lanes.wa_slots()`); this never
+    throttles a lane that has a free slot unless the machine is already running this many
+    jobs. Same knobs as W122/W128 so the CRM Systems setting keeps working: env
     `MAX_INFLIGHT__<DEVICE>` (device upper-cased, same lookup as `lanes._wa_parallel()`)
-    > env `MAX_INFLIGHT_JOBS` > default 3; clamped 1..6.
+    > env `MAX_INFLIGHT_JOBS` > default 8; clamped 1..12. Evaluated fresh on every decision.
     """
     try:
         from webscraper.agent import DEVICE_NAME
     except Exception:                                             # noqa: BLE001
         DEVICE_NAME = ""
     raw = (os.getenv(f"MAX_INFLIGHT__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
-        or os.getenv("MAX_INFLIGHT_JOBS") or "3"
+        or os.getenv("MAX_INFLIGHT_JOBS") or "8"
     try:
-        return max(1, min(6, int(str(raw).strip())))
+        return max(1, min(12, int(str(raw).strip())))
     except ValueError:
-        return 3
+        return 8
 
 
 #: W129: cache for `healthcheck._memory()` (it shells out to sysctl/vm_stat/WMI) — good
@@ -300,8 +316,52 @@ def job_needs_discovery(row: Any) -> bool:
     return (not reenrich) or pending
 
 
+def _rowget(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        v = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if v is None else v
+
+
+def job_next_lane(row: Any, enrich_pending: int | None = None, wa_pending: int | None = None) -> str | None:
+    """W144: the lane a queued job would occupy FIRST — what the Worker must find a free slot
+    for before starting it. `discovery` when the job needs Maps (`job_needs_discovery`); else
+    `enrichment` when the job asks for it (`do_enrich`, not `wa_verify_only`, mirrors
+    `EnrichmentLane.enabled`) and has websites left to crawl (`enrich_pending`, None = unknown
+    = assume yes); else `whatsapp` when it asks for WhatsApp (`do_wa_verify` / `wa_verify_only`,
+    mirrors `WhatsAppLane.enabled`) and numbers are left (`wa_pending`); else None — nothing
+    to do, the job only needs to run its lanes to record `no_targets`. Pure: no DB."""
+    if job_needs_discovery(row):
+        return LANE_DISCOVERY
+    wa_only = bool(_rowget(row, "wa_verify_only", 0))
+    if (not wa_only and bool(_rowget(row, "do_enrich", 1))
+            and (enrich_pending is None or enrich_pending > 0)):
+        return LANE_ENRICHMENT
+    if (wa_only or bool(_rowget(row, "do_wa_verify", 0))) and (wa_pending is None or wa_pending > 0):
+        return LANE_WHATSAPP
+    return None
+
+
+def wa_account_usable(store: Store) -> bool:
+    """W144: can a WhatsApp lane start on this machine right now? An account that is linked,
+    enabled, not `needs_relink` (W143, `enabled_wa_accounts`) and not paused by a CRM command
+    (W142 `_PAUSED`)."""
+    try:
+        from webscraper import wa_verify
+        paused = wa_verify._PAUSED
+    except Exception:                                             # noqa: BLE001
+        paused = set()
+    try:
+        return any(a not in paused for a in store.enabled_wa_accounts())
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
 class Worker(threading.Thread):
-    """Runs up to `max_inflight_jobs()` jobs at once, each on its own thread (`_run_job`).
+    """Runs jobs concurrently, each on its own thread (`_run_job`); W144: one job starts whenever
+    the lane it needs first has a free slot (`may_start_job`), `max_inflight_jobs()` is only
+    the crash guard.
 
     Owner directive 2026-09-19: "if maps lane is completed for a job and its enrichment is
     going on then start the maps lane for the next job so that it never stops" — so Google
@@ -325,6 +385,10 @@ class Worker(threading.Thread):
         self._threads: dict[int, threading.Thread] = {}
         #: The job whose discovery slot is in use, or None when free. Guarded by `_lock`.
         self._disc_job: int | None = None
+        #: W144: job_id -> the lane it was started FOR (`job_next_lane` at start time). Counted
+        #: as a promised slot on that lane's gate until `_run_job` has built the Pipeline (its
+        #: lanes then sit on the gates themselves). Guarded by `_lock`.
+        self._start_lane: dict[int, str | None] = {}
         #: W129: monotonic time of the last "not starting a new job — memory" log line,
         #: so it prints at most once per 5 minutes instead of every 2s poll.
         self._last_mem_note = 0.0
@@ -351,6 +415,7 @@ class Worker(threading.Thread):
             if value is None:
                 self._disc_job = None
                 self._inflight.clear()
+                self._start_lane.clear()
             else:
                 self._disc_job = int(value)
                 self._inflight.setdefault(int(value), None)
@@ -359,21 +424,61 @@ class Worker(threading.Thread):
         with self._lock:
             return sorted(self._inflight)
 
+    # -- W144: per-lane bookkeeping ----------------------------------------------------
+    def _promised(self, lane: str) -> int:
+        """Jobs started FOR `lane` whose Pipeline is not built yet (their lanes are not on the
+        gates yet) — counted as busy so two polls never hand out the same slot. Caller holds
+        `_lock`."""
+        return sum(1 for jid, ln in self._start_lane.items()
+                   if ln == lane and self._inflight.get(jid) is None)
+
+    def _lane_busy(self, lane: str) -> int:
+        """In-flight jobs whose `lane` is active or queued on its StageGate (holders + queue),
+        plus promised starts. `discovery` = the Maps tab (0/1)."""
+        with self._lock:
+            if lane == LANE_DISCOVERY:
+                return 1 if self._disc_job is not None else 0
+            gate = lanes_mod.STAGE_GATES.get(lane)
+            return (gate.busy() if gate is not None else 0) + self._promised(lane)
+
+    def _lane_cap(self, lane: str) -> int:
+        if lane == LANE_DISCOVERY:
+            return 1
+        return lanes_mod.enrich_slots() if lane == LANE_ENRICHMENT else lanes_mod.wa_slots()
+
+    def _lane_free(self, lane: str) -> int:
+        return max(0, self._lane_cap(lane) - self._lane_busy(lane))
+
+    @staticmethod
+    def _next_lane(store: Store, row: Any) -> str | None:
+        """`job_next_lane` for a local jobs row, with the pending counts it needs."""
+        if job_needs_discovery(row):
+            return LANE_DISCOVERY
+        jid = int(row["id"])
+        try:
+            enr = store.count_pending_enrichment(jid)
+            wa = store.count_wa_pending(jid)
+        except Exception:                                         # noqa: BLE001
+            enr = wa = None
+        return job_next_lane(row, enr, wa)
+
     def capacity(self) -> dict[str, Any]:
         """Sent to the CRM (`agent.py` CrmCloud `jobs`/`claim` payloads) so the Edge
-        Function can decide whether to offer this machine another job.
+        Function can decide whether to offer this machine another job — W144: one flag PER
+        LANE (`maps_free` / `enrich_free` / `wa_free`), the CRM offers a job of that kind
+        (needs-Maps / enrichment-only / WhatsApp-only) for every idle lane and treats the
+        machine as not busy while any of the three is true. `lanes_free` = any of them
+        (back-compat), `discovery_free` unchanged, `max_inflight` / `hard_max` = the crash
+        guard, `lane_slots` = busy/cap per lane for the CRM agents table.
 
-        W138 (CRM T1016): `lanes_free` — memory allows a new job even while the Maps tab is
-        busy, so the CRM may offer a job that needs no Maps (re-enrich / WhatsApp-only) and
-        the websites / WhatsApp slots never sit idle behind one discovery."""
+        W139 (CRM T1016): jobs already CLAIMED from the CRM but not started yet (mirrored into
+        the local queue) count against the lane they will take — otherwise one poll per 5 s
+        claimed one more job each time (ASUS/DELL, 2026-10-04 21:20 IST)."""
         mem = _cached_memory()
         blocked = memory_blocked()
-        # W139 (CRM T1016): jobs already CLAIMED from the CRM but not started yet (mirrored into the
-        # local queue) count as in flight — otherwise one poll per 5 s claimed one more job each
-        # time until the local queue held 5 for a max_inflight of 3 (ASUS/DELL, 2026-10-04 21:20
-        # IST), jobs other machines could have run.
         pending = 0
-        pending_maps = 0
+        pending_by = {LANE_DISCOVERY: 0, LANE_ENRICHMENT: 0, LANE_WHATSAPP: 0}
+        account = False
         try:
             s = Store()
             try:
@@ -382,21 +487,36 @@ class Worker(threading.Thread):
                 mirrored = [r for r in s.queued_jobs()
                             if r["cloud_id"] is not None and int(r["id"]) not in started]
                 pending = len(mirrored)
-                pending_maps = sum(1 for r in mirrored if job_needs_discovery(r))
+                for r in mirrored:
+                    ln = self._next_lane(s, r)
+                    if ln in pending_by:
+                        pending_by[ln] += 1
+                account = wa_account_usable(s)
             finally:
                 s.close()
         except Exception:                                         # noqa: BLE001
             pending = 0
+        busy = {ln: self._lane_busy(ln) for ln in pending_by}
+        cap = {ln: self._lane_cap(ln) for ln in pending_by}
         with self._lock:
             inflight = len(self._inflight) + pending
+            guard = max_inflight_jobs()
+            ok = (not blocked) and inflight < guard
+            maps_free = ok and busy[LANE_DISCOVERY] == 0 and pending_by[LANE_DISCOVERY] == 0
+            enrich_free = ok and cap[LANE_ENRICHMENT] - busy[LANE_ENRICHMENT] - pending_by[LANE_ENRICHMENT] > 0
+            wa_free = (ok and account
+                       and cap[LANE_WHATSAPP] - busy[LANE_WHATSAPP] - pending_by[LANE_WHATSAPP] > 0)
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,
-                    "lanes_free": (not blocked) and inflight < max_inflight_jobs(),
-                    # W141 (CRM T1019): the Maps tab must never idle while a discovery job exists —
-                    # one overflow slot above max_inflight, reserved for a job that needs Maps.
-                    "maps_free": (self._disc_job is None) and not blocked and pending_maps == 0
-                                 and inflight < max_inflight_jobs() + 1,
-                    "inflight": inflight, "started": len(self._inflight), "max_inflight": max_inflight_jobs(),
+                    "maps_free": maps_free, "enrich_free": enrich_free, "wa_free": wa_free,
+                    "lanes_free": maps_free or enrich_free or wa_free,
+                    "lane_slots": {
+                        LANE_DISCOVERY: {"busy": busy[LANE_DISCOVERY], "cap": 1},
+                        LANE_ENRICHMENT: {"busy": busy[LANE_ENRICHMENT], "cap": cap[LANE_ENRICHMENT]},
+                        LANE_WHATSAPP: {"busy": busy[LANE_WHATSAPP], "cap": cap[LANE_WHATSAPP],
+                                        "account": account}},
+                    "inflight": inflight, "started": len(self._inflight),
+                    "max_inflight": guard, "hard_max": guard,
                     "memory_pct": mem.get("used_pct")}
 
     def run(self) -> None:  # noqa: C901 — linear orchestration, fine
@@ -406,6 +526,7 @@ class Worker(threading.Thread):
                 del self._threads[jid]
                 with self._lock:
                     self._inflight.pop(jid, None)
+                    self._start_lane.pop(jid, None)
                     if self._disc_job == jid:
                         self._disc_job = None
 
@@ -418,20 +539,19 @@ class Worker(threading.Thread):
                     if self._disc_job == disc_job:
                         self._disc_job = None
 
-            # 3. start the next job if there is room for it and memory allows. W138 (CRM
-            # T1016): the Maps tab being busy only blocks jobs that NEED Maps — a re-enrich /
-            # WhatsApp pass starts alongside the running discovery (its lanes queue on the
-            # W122/W136 stage gates like any other), so no slot idles behind one discovery.
+            # 3. W144: start the next queued job whose FIRST lane has a free slot right now —
+            # Maps tab free for a discovery job, an enrichment / WhatsApp gate slot (minus lanes
+            # already on the gate and starts already promised) for a lane-only job, plus a usable
+            # account for WhatsApp. Lanes of a started job queue on the gates as before (W122/
+            # W136), so a start never blocks a running job's lane. `max_inflight_jobs()` is only
+            # the crash guard; W129 memory still holds every new start.
             mem_blocked = memory_blocked()
             with self._lock:
                 n_inflight = len(self._inflight)
                 max_inf = max_inflight_jobs()
                 disc_free = self._disc_job is None
-                # W141: one overflow slot above max_inflight, only for a job that needs Maps.
-                room = n_inflight < max_inf + 1
-                slot_free = room
-                can_start = room and not mem_blocked
-            if slot_free and mem_blocked:
+            room = n_inflight < max_inf
+            if room and mem_blocked:
                 now = time.monotonic()
                 if now - self._last_mem_note >= 300:
                     self._last_mem_note = now
@@ -439,31 +559,40 @@ class Worker(threading.Thread):
                     limit = os.getenv("MEMORY_START_MAX_PCT", "85") or "85"
                     log.warning("not starting a new job — memory %s%% used (limit %s%%)",
                                 mem.get("used_pct"), limit)
-            if can_start:
+            if room and not mem_blocked:
                 store = Store()
-                # First queued job whose window is open; jobs outside their window show
-                # 'waiting'. The CRM returns/queues jobs highest-priority-first (W122).
                 job = None
-                for cand in store.queued_jobs():
-                    if not in_window(cand["window_start"], cand["window_end"]):
-                        if cand["phase"] != "waiting":
-                            store.update_job(int(cand["id"]), phase="waiting",
-                                             message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
-                        continue
-                    if not may_start_job(job_needs_discovery(cand), n_inflight, max_inf, disc_free):
-                        continue                  # W138: Maps busy — lane-only job; W141: at max only a Maps job
-                    job = cand
-                    break
-                store.close()
+                lane: str | None = None
+                try:
+                    wa_account = wa_account_usable(store)
+                    enr_free = self._lane_free(LANE_ENRICHMENT)
+                    wa_free = self._lane_free(LANE_WHATSAPP)
+                    # First queued job whose window is open and whose next lane has room; jobs
+                    # outside their window show 'waiting'. The CRM queues highest-priority-first.
+                    for cand in store.queued_jobs():
+                        if not in_window(cand["window_start"], cand["window_end"]):
+                            if cand["phase"] != "waiting":
+                                store.update_job(int(cand["id"]), phase="waiting",
+                                                 message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
+                            continue
+                        nl = self._next_lane(store, cand)
+                        if not may_start_job(nl, disc_free=disc_free, enrich_free=enr_free, wa_free=wa_free,
+                                             wa_account=wa_account, n_inflight=n_inflight, max_inflight=max_inf):
+                            continue                  # its lane is full (or no WA account) — leave it queued
+                        job, lane = cand, nl
+                        break
+                finally:
+                    store.close()
                 if job is not None:
                     job_id = int(job["id"])
-                    needs_maps = job_needs_discovery(job)
                     with self._lock:
-                        if needs_maps:
+                        if lane == LANE_DISCOVERY:
                             self._disc_job = job_id
                         self._inflight[job_id] = None
-                    if not needs_maps and not disc_free:
-                        log.info("job #%s needs no Maps — starting it alongside the running discovery (W138)", job_id)
+                        self._start_lane[job_id] = lane
+                    if lane != LANE_DISCOVERY:
+                        log.info("job #%s needs no Maps — starting it for its %s lane alongside the running "
+                                 "jobs (W138/W144)", job_id, lane or "closing")
                     th = threading.Thread(target=self._run_job, args=(job,), name=f"job-{job_id}", daemon=True)
                     self._threads[job_id] = th
                     th.start()
@@ -885,6 +1014,7 @@ class Worker(threading.Thread):
             # otherwise a job that dies early would wedge the discovery slot forever.
             with self._lock:
                 self._inflight.pop(job_id, None)
+                self._start_lane.pop(job_id, None)
                 if self._disc_job == job_id:
                     self._disc_job = None
             store.close()
