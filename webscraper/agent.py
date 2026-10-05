@@ -1122,6 +1122,13 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         logging.getLogger().addHandler(crm_log)
         _CRM_LOG[:] = [crm_log]
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
+    # W142 (CRM T1020): the Mac stopped heartbeating at 15:11 with the process still alive, so
+    # launchd never restarted it and every CRM command sat at "requested". A daemon thread
+    # watches the loop's own clock and exits non-zero (the supervisor relaunches) when it goes
+    # silent without the network being the reason.
+    _LOOP_WD.update(cloud=cloud, ok=time.monotonic())
+    if kind == "crm":
+        _start_loop_watchdog()
     # W102 (CRM T545): macOS starts a process with 256 open files. Six Chromes' worth of
     # Playwright drivers, three sqlite lanes, httpx and the log fit — until anything leaks,
     # and job #6619's WhatsApp lane died of `[Errno 24] Too many open files` after ~2 h.
@@ -1234,8 +1241,11 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
             # it comes back empty, so calling it here keeps the machine visible (and
             # startable) without offering to do any work.
             try:
+                _loop_wd_mark("attempt")
                 cloud.jobs()
+                _loop_wd_mark("ok")                               # W142
             except httpx.HTTPError as e:
+                _loop_wd_mark("err")
                 log.debug("standby heartbeat failed: %s", e)
             # W100: a Stop that parked us also stopped the job the update was waiting
             # for — a parked machine takes its update now, like an idle one would.
@@ -1256,8 +1266,11 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
         except Exception as e:                                    # noqa: BLE001
             log.warning("stall-watchdog: %s", e)
         try:
+            _loop_wd_mark("attempt")
             _tick(cloud, store, kind, synced_upto)
+            _loop_wd_mark("ok")                                   # W142: `_tick` carries the heartbeat
         except httpx.HTTPError as e:
+            _loop_wd_mark("err")
             log.warning("cloud unreachable: %s", e)
         # W100: the job boundary. `_tick` above has just mirrored a finished job's final
         # status and leads up, so an update/restart parked behind it can run now.
@@ -1292,6 +1305,86 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
 #: Standby lives in this process only. A reboot (or anything that restarts the
 #: supervisor) comes back up running — "stopped" is not meant to outlive the machine.
 _STANDBY = [False]
+
+
+# -- W142 (CRM T1020): main-loop watchdog ----------------------------------------------------
+#: The loop's own clock, monotonic(): the last heartbeat that succeeded (`ok`), the last one
+#: that was started (`attempt`), the last one that failed on the network (`err`); `cloud` is
+#: the CrmCloud the restart line is shipped through. Written only by the main loop.
+_LOOP_WD: dict = {"ok": time.monotonic(), "attempt": 0.0, "err": 0.0, "cloud": None}
+LOOP_WATCHDOG_POLL_SEC = 30.0
+
+
+def _loop_wd_mark(key: str) -> None:
+    _LOOP_WD[key] = time.monotonic()
+
+
+def _watchdog_should_restart(now: float, last_ok: float, last_attempt: float, last_err: float,
+                             limit: float) -> bool:
+    """Pure decision. Restart only when the loop stopped RUNNING — never because the network is
+    down (an offline machine must not restart-loop):
+      * `limit` <= 0 disables; a heartbeat within `limit` is fine;
+      * a FAILED attempt within `limit` means the loop is alive and the CRM is unreachable: no;
+      * except when an attempt started after the last answer (ok or err) and has not come
+        back in `limit` — that call is hung: yes;
+      * no attempt and no error for `limit` while the last success is older: the loop is
+        simply not running (the Mac, 2026-10-05 15:11): yes."""
+    if limit <= 0 or now - last_ok <= limit:
+        return False
+    hung = last_attempt > max(last_ok, last_err) and now - last_attempt > limit
+    offline = now - last_err <= limit
+    return hung or not offline
+
+
+def _watchdog_restart(silent_sec: int) -> None:
+    """Flag the in-flight jobs (like the token-revoked path: the lanes poll `stop_requested`),
+    kill our Chromes so the next agent's launches are not swallowed, exit 3 — the supervisor
+    (`run-agent-loop.sh` / `.bat`) relaunches in 15 s."""
+    log.error("watchdog: CRM loop silent for %ds — restarting the agent", silent_sec)
+    cloud = _LOOP_WD.get("cloud")
+    if cloud is not None and _CRM_LOG:
+        try:
+            _ship_agent_logs(cloud, _CRM_LOG[0])
+        except Exception:                                         # noqa: BLE001
+            pass
+    try:
+        # W101: this thread has no Store — sqlite connections are thread-bound; open one here.
+        for cur in getattr(srv.worker, "inflight_jobs", lambda: [])():
+            _st = Store()
+            try:
+                _st.update_job(int(cur), stop_requested=1,
+                               message="stopped — the agent restarted itself (CRM loop hung)")
+                _st.log(int(cur), "job", "stopped: the agent's CRM loop hung for "
+                                         f"{silent_sec}s and the watchdog restarted it", level="warn")
+            finally:
+                _st.close()
+    except Exception:                                             # noqa: BLE001
+        log.debug("watchdog could not flag the running jobs", exc_info=True)
+    _close_browsers("watchdog restart")
+    os._exit(3)
+
+
+def _start_loop_watchdog() -> threading.Thread | None:
+    """Daemon thread, every LOOP_WATCHDOG_POLL_SEC. `AGENT_LOOP_WATCHDOG_SEC` (default 300, 0 = off)."""
+    try:
+        limit = float(os.environ.get("AGENT_LOOP_WATCHDOG_SEC", "300") or 0)
+    except ValueError:
+        limit = 300.0
+    if limit <= 0:
+        log.info("loop watchdog disabled (AGENT_LOOP_WATCHDOG_SEC=0)")
+        return None
+
+    def _run() -> None:
+        while True:
+            time.sleep(LOOP_WATCHDOG_POLL_SEC)
+            now = time.monotonic()
+            if _watchdog_should_restart(now, _LOOP_WD["ok"], _LOOP_WD["attempt"], _LOOP_WD["err"], limit):
+                _watchdog_restart(int(now - _LOOP_WD["ok"]))
+
+    t = threading.Thread(target=_run, name="agent-loop-watchdog", daemon=True)
+    t.start()
+    log.info("loop watchdog armed: restart after %ds without a heartbeat", int(limit))
+    return t
 
 #: The one command thread allowed at a time (a second QR window would only confuse).
 _cmd_thread = None
@@ -1779,7 +1872,8 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 from webscraper import wa_verify
                 label = (cmd.get("arg") or "main").strip() or "main"
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
-                ok = wa_verify.login(label)
+                # W142: a running job no longer blocks the login — the lane pauses this account.
+                ok = wa_verify.login(label, busy=getattr(srv.worker, "current_job", None) is not None)
                 result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
             elif cmd["command"] == "wa_reset":
                 # W91: wipe one account's profile + row so the next login is a clean QR.

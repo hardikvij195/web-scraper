@@ -33,6 +33,7 @@ from typing import Any, Callable
 
 from playwright.sync_api import Error as PWError, Page, TimeoutError as PWTimeout, sync_playwright
 
+from webscraper import browser_recovery as _br
 from webscraper.browser_recovery import (MAX_RELAUNCH, RESTORE_BUBBLE_ARGS, Relauncher,
                                          is_closed, mark_profile_clean)
 from webscraper.config import settings
@@ -240,6 +241,75 @@ def login_in_progress(name: str | None = None) -> bool:
     return bool(_LOGIN_ACTIVE) if name is None else name in _LOGIN_ACTIVE
 
 
+# -- W142 (CRM T1020): CRM WhatsApp commands while a job runs -----------------------------
+#: Accounts a CRM command (wa_login / wa_unlink / wa_delete / wa_reset) has taken out of the
+#: lanes' rotation for the moment. In memory on purpose: the lanes run in this same process,
+#: and `disabled` in the store means "logged out", which a paused account is not.
+_PAUSED: set[str] = set()
+WA_PAUSE_WAIT_SEC = 90.0          #: a command waits this long for the lane to let the profile go
+WA_PAUSED_LANE_WAIT_SEC = 240.0   #: a lane with no other account waits this long for the pause to lift
+
+
+def account_paused(name: str) -> bool:
+    return name in _PAUSED
+
+
+def with_lane_paused(name: str, fn: Callable[[], Any], *, wait_sec: float = WA_PAUSE_WAIT_SEC,
+                     in_use: Callable[[str], bool] | None = None,
+                     evict: Callable[[str], Any] | None = None,
+                     sleep: Callable[[float], None] = time.sleep,
+                     now: Callable[[], float] = time.monotonic) -> Any:
+    """Run `fn` on `name`'s profile while a job's WhatsApp lane may be using it. The Mac
+    (2026-10-05 15:09) refused `wa_delete main` with "a job is running — stop it, then delete"
+    and the owner had no terminal to stop anything from. Now: take the account out of the
+    rotation (`_PAUSED` — `verify_places` closes its Chrome at the next number and picks
+    another account, or waits if there is none), wait ≤`wait_sec` for that Chrome to be gone,
+    evict it if it is not, run the command, then put the account back. A login that succeeded
+    is linked again; delete / reset removed the row; unlink marks the row disabled."""
+    raw = settings.wa_profiles_dir / name          # raw path: profile_dir() would create it
+    in_use = in_use or (lambda n: _br.profile_in_use(raw))
+    evict = evict or (lambda n: _br.kill_profile_holder(raw, "wa command while a lane held it"))
+    _PAUSED.add(name)
+    try:
+        deadline = now() + wait_sec
+        waited = False
+        while in_use(name) and now() < deadline:
+            if not waited:
+                log.info("[%s] paused for a CRM WhatsApp command — waiting for the lane to release it", name)
+            waited = True
+            sleep(2.0)
+        if in_use(name):
+            log.warning("[%s] the WhatsApp lane did not release this profile in %ds — evicting its Chrome",
+                        name, int(wait_sec))
+            evict(name)
+        elif waited:
+            log.info("[%s] lane released the profile — running the command", name)
+        return fn()
+    finally:
+        _PAUSED.discard(name)
+
+
+def _wait_while_paused(should_stop: Callable[[], bool], name: str | None = None, *,
+                       max_sec: float = WA_PAUSED_LANE_WAIT_SEC,
+                       sleep: Callable[[float], None] = time.sleep,
+                       now: Callable[[], float] = time.monotonic) -> bool:
+    """W142, lane side: block (≤`max_sec`, stop-aware) while `name` — or, None, any account at
+    all — is paused for a CRM command, instead of ending the slice as "no enabled account
+    left". True when the pause lifted, False on stop / timeout."""
+    def paused() -> bool:
+        return name in _PAUSED if name else bool(_PAUSED)
+    deadline = now() + max_sec
+    logged = False
+    while paused() and now() < deadline:
+        if should_stop():
+            return False
+        if not logged:
+            log.info("WhatsApp lane waiting: %s paused for a CRM command", name or "every account is")
+            logged = True
+        sleep(2.0)
+    return not paused()
+
+
 _ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,29}$")
 
 
@@ -295,7 +365,8 @@ def reset_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     if not name or not _ACCOUNT_RE.match(name):
         return False, f"bad name {name!r}"
     if busy:
-        return False, "a job is running on this machine — stop it, then reset"
+        # W142: pause the lane for this account and run, instead of refusing.
+        return with_lane_paused(name, lambda: reset_account(name))
     if login_in_progress(name):
         return False, "a login window is open for this account — close it first"
     import shutil
@@ -331,13 +402,12 @@ _PHONE_HINT = "unlink it from the phone: WhatsApp → Settings → Linked device
 
 
 def _account_guard(name: str, busy: bool, verb: str) -> tuple[str, str | None]:
-    """The refusals unlink / delete share with reset: bad label, a job in flight, or a
-    login window holding the profile."""
+    """The refusals unlink / delete share with reset: bad label, or a login window holding
+    the profile. W142: a job in flight (`busy`) no longer refuses — the caller runs under
+    `with_lane_paused` instead (the Mac, 2026-10-05: "stop it, then delete" with no terminal)."""
     name = (name or "").strip()
     if not name or not _ACCOUNT_RE.match(name):
         return name, f"bad name {name!r}"
-    if busy:
-        return name, f"a job is running on this machine — stop it, then {verb}"
     if login_in_progress(name):
         return name, "a login window is open for this account — close it first"
     return name, None
@@ -365,8 +435,8 @@ def _log_out_of_whatsapp(name: str) -> tuple[bool, str]:
         pass
     mark_profile_clean(d)
     with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(d), locale="en", **_launch_kwargs(wa_window_mode(), name))
+        ctx = _br.launch_evicting(lambda: pw.chromium.launch_persistent_context(
+            user_data_dir=str(d), locale="en", **_launch_kwargs(wa_window_mode(), name)), d, "wa unlink")
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto("https://web.whatsapp.com/", timeout=60_000, wait_until="domcontentloaded")
@@ -401,10 +471,20 @@ def unlink_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     name, err = _account_guard(name, busy, "unlink")
     if err:
         return False, err
+    if busy:
+        return with_lane_paused(name, lambda: unlink_account(name))
     try:
         ok, msg = _log_out_of_whatsapp(name)
     except Exception as e:                                        # noqa: BLE001
         ok, msg = False, f"could not open WhatsApp Web: {str(e).splitlines()[0][:120]} — {_PHONE_HINT}"
+    if ok:
+        # W142: an unlinked account stays out of the lanes' rotation (the next login re-enables it).
+        try:
+            st = Store()
+            st.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
+            st.conn.commit()
+        except Exception:                                         # noqa: BLE001
+            log.debug("[%s] could not mark disabled after unlink", name, exc_info=True)
     return ok, (f"{name}: {msg}" if ok else msg)
 
 
@@ -415,11 +495,13 @@ def delete_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     name, err = _account_guard(name, busy, "delete")
     if err:
         return False, err
+    if busy:
+        return with_lane_paused(name, lambda: delete_account(name))
     try:
         logged_out, msg = _log_out_of_whatsapp(name)
     except Exception as e:                                        # noqa: BLE001
         logged_out, msg = False, f"could not open WhatsApp Web: {str(e).splitlines()[0][:120]} — {_PHONE_HINT}"
-    wiped, wmsg = reset_account(name, busy=busy)
+    wiped, wmsg = reset_account(name)
     if not wiped:
         return False, wmsg
     log.info("[%s] WhatsApp account deleted (%s)", name, "logged out first" if logged_out else "logout failed")
@@ -428,8 +510,10 @@ def delete_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     return True, f"deleted {name} from this machine, but WhatsApp was NOT logged out: {msg}"
 
 
-def login(name: str) -> bool:
+def login(name: str, *, busy: bool = False) -> bool:
     """Open WhatsApp Web headed; wait for the QR to be scanned. Returns True on success.
+    W142: `busy` (a job runs on this machine) pauses the lane for this account instead of
+    colliding with its Chrome — see `with_lane_paused`.
 
     W70: a profile whose WhatsApp Web client never gets past the splash is wiped and
     relaunched once. The ASUS spent two whole windows on that screen (2026-09-08) and
@@ -438,6 +522,8 @@ def login(name: str) -> bool:
     within the boot window is treated as broken — and nothing linked ever looks like
     that.
     """
+    if busy:
+        return with_lane_paused(name, lambda: login(name))
     Store().add_wa_account(name)
     _LOGIN_ACTIVE.add(name)
     ok = False
@@ -490,14 +576,17 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
     None = the client never rendered anything at all (the profile is the problem).
     `browser` = "chrome" | "chromium" (W91/W93); default = the profile's own (`browser_for`)."""
     mark_profile_clean(profile_dir(name))
-    ctx = pw.chromium.launch_persistent_context(
+    # W142: a stale Chrome on this profile (the Mac, 2026-10-05 15:05) is evicted and the
+    # launch retried once instead of failing the command.
+    ctx = _br.launch_evicting(lambda: pw.chromium.launch_persistent_context(
         user_data_dir=str(profile_dir(name)), headless=False, locale="en",
         **_channel_of(browser or browser_for(name)),
         viewport={"width": 1100, "height": 820},
         # W116 (CRM T648): Chrome reopens a profile at the window position it last had. A profile
         # that ever ran "hidden" was parked at -32000,-32000, so the QR window came up off-screen on
         # 5 - MI (only a sliver at the left edge, QR unscannable). Pin it on screen explicitly.
-        args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS, *ON_SCREEN_ARGS])
+        args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS, *ON_SCREEN_ARGS]),
+        profile_dir(name), "wa-login")
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         # W92: domcontentloaded, not the full load — WhatsApp Web keeps loading assets
@@ -556,9 +645,9 @@ def account_status(name: str) -> str:
         # WhatsApp Web on these profiles, so this probe answered "unknown" after a 40 s
         # wait on every job boundary (the T499 gap). Same launch the headless verify mode
         # uses, which answered in ~5 s.
-        ctx = pw.chromium.launch_persistent_context(
+        ctx = _br.launch_evicting(lambda: pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir(name)), locale="en",
-            **_launch_kwargs("headless", name))
+            **_launch_kwargs("headless", name)), profile_dir(name), "wa status probe")
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.goto("https://web.whatsapp.com/", timeout=60_000, wait_until="domcontentloaded")
@@ -758,7 +847,17 @@ def verify_places(
                 break
             pk = r["place_key"]
 
-            name = account if account else store.pick_wa_account(cap, today, exclude=unavailable)
+            # W142: a CRM command asked for one of our accounts — drop its Chrome now and keep off
+            # it until the command is done (`with_lane_paused`); a pinned slice waits for it.
+            for _p in [p for p in _PAUSED if p in open_ctx]:
+                log.info("[%s] paused for a CRM WhatsApp command — closing its browser", _p)
+                _close_account(_p)
+                relaunchers.pop(_p, None)
+            if account and account in _PAUSED and not _wait_while_paused(should_stop, account):
+                break
+            name = account if account else store.pick_wa_account(cap, today, exclude=unavailable | _PAUSED)
+            if name is None and not account and _PAUSED and _wait_while_paused(should_stop):
+                name = store.pick_wa_account(cap, today, exclude=unavailable | _PAUSED)
             if name is None or name in unavailable:
                 if name in unavailable:
                     break                       # this slice's own account cannot render — done here

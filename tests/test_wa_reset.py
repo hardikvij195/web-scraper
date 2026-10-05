@@ -13,7 +13,11 @@ def test_reset_account(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(wa_verify, "Store", lambda: st)
     (profiles / "main" / "Default").mkdir(parents=True)
     st.add_wa_account("main")
-    assert wa_verify.reset_account("main", busy=True)[0] is False
+    # W142: a job in flight PAUSES the lane for this account and runs, instead of refusing
+    paused = []
+    monkeypatch.setattr(wa_verify, "with_lane_paused",
+                        lambda name, fn, **kw: (paused.append(name), (True, "ran under pause"))[1])
+    assert wa_verify.reset_account("main", busy=True) == (True, "ran under pause") and paused == ["main"]
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: True)
     assert wa_verify.reset_account("main")[0] is False
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)

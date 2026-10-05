@@ -13,6 +13,21 @@
 
 ---
 
+- [x] **W142** `agent.py` / `wa_verify.py` / `browser_recovery.py` (CRM T1020, 2026-10-05, owner: "can u add this in agent on
+  ur own") — the Mac at 15:05-15:11: `wa_login main` died on "Opening in existing browser session … profile is already in
+  use" (an older Chrome held the profile), `wa_delete main` was refused with "a job is running — stop it, then delete", then
+  the loop hung without exiting so launchd never restarted it and every command sat at "requested". Three self-heals:
+  (1) **loop watchdog** — `_LOOP_WD` records each heartbeat attempt / ok / network error; a daemon thread trips
+  `_watchdog_should_restart` (pure) when no heartbeat for `AGENT_LOOP_WATCHDOG_SEC` (300, 0 = off) and the cause is not
+  the network (hung call, or no attempt at all), ships the error line, flags in-flight jobs `stop_requested`, kills our
+  Chromes, `os._exit(3)` — `run-agent-loop.sh` and `.bat` both relaunch after 15 s on any exit code. (2) **profile-lock
+  eviction** — `browser_recovery.launch_evicting` (kill holder by lock pid + by command line via `profile_holder_pids`,
+  wait ≤5 s, retry once) wraps `Relauncher.open`, `_login_attempt`, the unlink launch and the status probe. (3) **WA
+  commands pause the lane** — `with_lane_paused`: `_PAUSED` takes the account out of `verify_places`' rotation (its Chrome
+  is closed at the next number; a lane with nothing else waits ≤240 s instead of "no enabled account left"), the command
+  waits ≤90 s for the profile to be free, evicts otherwise, runs, resumes; unlink leaves the row `disabled`. 2.2.6,
+  `tests/test_w142_self_heal.py`.
+
 - [x] **W141** `server.py` (CRM T1019, 2026-10-05, owner: "a google maps lane for any job running 24x7") — MI / ASUS /
   DELL had every `max_inflight` slot held by jobs in enrichment / WhatsApp, so the Maps tab idled for hours with 100+
   discovery jobs queued. One overflow slot above `max_inflight` is now reserved for a job that needs Maps:

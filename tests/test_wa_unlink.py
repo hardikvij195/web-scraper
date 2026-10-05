@@ -22,7 +22,9 @@ def test_unlink_and_delete_refuse_like_reset(tmp_path: Path, monkeypatch):
     profiles, st = _setup(tmp_path, monkeypatch)
     for fn in (wa_verify.unlink_account, wa_verify.delete_account):
         assert fn("Bad Name")[0] is False
-        assert fn("main", busy=True)[0] is False
+        # W142: a job in flight pauses the lane and runs — no refusal (stub keeps the profile untouched)
+        monkeypatch.setattr(wa_verify, "with_lane_paused", lambda name, fn, **kw: (True, f"paused {name}"))
+        assert fn("main", busy=True) == (True, "paused main")
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: True)
     assert wa_verify.unlink_account("main")[0] is False
     assert wa_verify.delete_account("main")[0] is False

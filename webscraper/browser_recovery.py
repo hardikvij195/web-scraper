@@ -38,6 +38,8 @@ log = logging.getLogger("webscraper.browser_recovery")
 MAX_RELAUNCH = 3
 #: Seconds to wait between closing the dead context and launching a fresh one.
 RELAUNCH_SETTLE_SEC = 2.0
+#: W142: how long an evicted profile gets to drop its lock before the one retry.
+EVICT_WAIT_SEC = 5.0
 
 #: T397 (2026-09-06, the Mac's dozen `about:blank` tabs + "Restore pages?"). Chrome flags
 #: that stop a persistent profile from ever offering session restore. The old
@@ -167,6 +169,99 @@ def _remove_lock_files(profile_dir: Path) -> None:
             pass
 
 
+def profile_holder_pids(profile_dir: Path, procs: Iterable[tuple[int, str]]) -> list[int]:
+    """W142 (CRM T1020): the pids among `procs` (pid, command line) whose Chrome runs ON
+    `profile_dir` — `--user-data-dir=<dir>` bare or quoted, anchored on the dir's END so
+    `main` never matches `main-2` or `main/Default`. Pure: `_list_processes()` is the OS
+    side (no psutil in this project); tests feed fakes. Case-insensitive, both slashes."""
+    d = str(Path(profile_dir)).lower()
+    alts = {d, d.replace("\\", "/"), d.replace("/", "\\")}
+    forms = [f"--user-data-dir={a}" for a in alts] + [f'--user-data-dir="{a}"' for a in alts]
+    out: list[int] = []
+    for pid, cmd in procs:
+        c = (cmd or "").lower()
+        if "--user-data-dir=" not in c:
+            continue
+        hit = False
+        for f in forms:
+            i = c.find(f)
+            while i >= 0 and not hit:
+                end = i + len(f)
+                if end == len(c) or c[end] in " \t\"'":
+                    hit = True
+                i = c.find(f, i + 1)
+            if hit:
+                break
+        if hit:
+            out.append(int(pid))
+    return out
+
+
+def _list_processes() -> list[tuple[int, str]]:
+    """W142: (pid, command line) of every process — `ps` on POSIX, PowerShell/CIM on Windows
+    (wmic is gone from Windows 11 24H2). Best effort: [] when the listing fails."""
+    try:
+        out: list[tuple[int, str]] = []
+        if sys.platform == "win32":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"],
+                capture_output=True, text=True, timeout=20)
+            for line in r.stdout.splitlines():
+                pid, _, cmd = line.partition("\t")
+                if pid.strip().isdigit():
+                    out.append((int(pid), cmd.strip()))
+            return out
+        r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if parts and parts[0].isdigit():
+                out.append((int(parts[0]), parts[1] if len(parts) > 1 else ""))
+        return out
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def profile_in_use(profile_dir: Path) -> bool:
+    """W142: is some Chrome on `profile_dir` right now — a live lock holder, or any process
+    whose command line names the directory (Windows has no SingletonLock symlink)?"""
+    pid = lock_holder_pid(profile_dir)
+    if pid and pid_alive(pid):
+        return True
+    return bool(profile_holder_pids(profile_dir, _list_processes()))
+
+
+def wait_profile_free(profile_dir: Path, max_sec: float = EVICT_WAIT_SEC) -> bool:
+    """W142: poll ≤`max_sec` for `profile_dir` to have no Chrome on it. True when it is free."""
+    deadline = time.monotonic() + max_sec
+    while time.monotonic() < deadline:
+        if not profile_in_use(profile_dir):
+            return True
+        time.sleep(0.5)
+    return not profile_in_use(profile_dir)
+
+
+def launch_evicting(open_fn: Callable[[], Any], profile_dir: Path, what: str = "", *,
+                    evict: Callable[[Path, str], Any] | None = None,
+                    settle: Callable[[Path, float], Any] | None = None) -> Any:
+    """W142 (CRM T1020; the Mac's `wa_login main` died at 15:05 on "Opening in existing browser
+    session … the profile is already in use" because an older Chrome still held the profile):
+    run `open_fn()`; when Chrome refuses because another Chrome owns `profile_dir`, kill that
+    holder, wait ≤EVICT_WAIT_SEC for the lock to go, and try ONCE more. Any other error, and a
+    second refusal, propagate. Only OUR profiles are ever passed here. `Relauncher.open()` and
+    every WhatsApp launch go through this."""
+    try:
+        return open_fn()
+    except Exception as e:                                        # noqa: BLE001
+        if not is_profile_busy(e):
+            raise
+        log.warning("profile %s is held by another Chrome — evicting it and relaunching%s",
+                    Path(profile_dir).name, f" ({what})" if what else "")
+        (evict or kill_profile_holder)(Path(profile_dir), "profile busy on launch")
+        (settle or wait_profile_free)(Path(profile_dir), EVICT_WAIT_SEC)
+        return open_fn()
+
+
 def kill_profile_holder(profile_dir: Path, reason: str = "") -> bool:
     """Kill whatever Chrome owns `profile_dir` and clear its lock. Only OUR profiles are
     ever passed here, so the user's own Chrome (its default profile) is never touched.
@@ -188,6 +283,19 @@ def kill_profile_holder(profile_dir: Path, reason: str = "") -> bool:
             killed = True
         except OSError as e:
             log.debug("kill %d failed: %s", pid, e)
+    # W142: by command line, pid by pid — Windows has no lock symlink, so this is the only
+    # path that finds the holder there; on the Mac it catches a Chrome whose lock file is gone.
+    for p in profile_holder_pids(profile_dir, _list_processes()):
+        if p in (pid, os.getpid()):
+            continue
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/PID", str(p)], capture_output=True, timeout=10)
+            else:
+                os.kill(p, signal.SIGKILL)
+            killed = True
+        except (OSError, subprocess.SubprocessError):
+            pass
     # Children and helpers do not hold the lock; sweep by command line (best effort).
     # Anchored on the dir's END: `browser-profile` must never match `browser-profile-open`.
     try:
@@ -272,18 +380,13 @@ class Relauncher:
         return self.ctx, self.page
 
     def open(self) -> tuple[Any, Any]:
-        try:
+        # T397: "Opening in existing browser session" = an orphan Chrome owns our profile and
+        # just swallowed this launch as a blank tab. Kill it, try once more (W142: shared
+        # `launch_evicting`, the same path every WhatsApp launch takes).
+        if self._profile_dir is None:
             self.ctx, self.page = self._open_fn()
-        except Exception as e:                                    # noqa: BLE001
-            # T397: "Opening in existing browser session" = an orphan Chrome owns our
-            # profile and just swallowed this launch as a blank tab. Kill it, try once more.
-            if self._profile_dir is None or not is_profile_busy(e):
-                raise
-            log.warning("profile %s is held by another Chrome — evicting it and relaunching",
-                         self._profile_dir.name)
-            kill_profile_holder(self._profile_dir, "profile busy on launch")
-            time.sleep(RELAUNCH_SETTLE_SEC)
-            self.ctx, self.page = self._open_fn()
+        else:
+            self.ctx, self.page = launch_evicting(self._open_fn, self._profile_dir, "relaunch")
         close_blank_pages(self.ctx, keep=self.page)
         return self.current
 
