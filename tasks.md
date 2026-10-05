@@ -13,6 +13,7 @@
 
 ---
 
+- [x] **W142b** `agent.py` (2026-10-05 17:27-17:35, VERSION 2.2.9) — the W142 watchdog restarted MI/ASUS/DELL/MAC every ~6 min right after the fleet start: `_tick` hydrated the 14 re-queued resumes (thousands of saved places, page by page) for > 300 s, so one `attempt` with no `ok` read as hung. Now every successful CRM call from the main thread stamps `ok` (lane/command threads do not, so a dead loop with live lanes still trips), the limit is re-read every poll (cloud-refreshable `AGENT_LOOP_WATCHDOG_SEC`, default 600). The real W145 question (why the loop was silent after `start` on ASUS at 17:22) is folded into this: it was the same hydration, not a hang.
 - [ ] **W145** `agent.py` — the CRM loop went silent right after a CRM `start` command on an agent that was already running (ASUS 2026-10-05 17:22:48 "start requested by the CRM: agent was already running" → no heartbeat until the W142 watchdog restarted it at 17:27:57, 315 s; the MAC 15:11 hang had the same silence after a `wa_login`). Find what blocks the loop after `_poll_command` handles start/wa_login (command thread join? `_run_deferred`? a lock held by the stopped worker?) and fix the cause; the watchdog is the safety net, not the fix.
 - [x] **W144** `server.py` / `lanes.py` / `store.py` / `eta.py` (CRM T1022 + T1024, 2026-10-05, owner: "maps should work
   24x7, whatsapp should work 24x7, website should also work 24x7 — multiple jobs work together with different lanes

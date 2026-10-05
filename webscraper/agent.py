@@ -287,6 +287,14 @@ class CrmCloud:
                           "token, or delete data/agent.stop and re-register.", r.status_code)
         elif r.status_code < 400:
             CrmCloud._denied = 0
+            # W142b (2026-10-05 17:27): every successful CRM call made from the loop's own
+            # thread is a heartbeat. `_tick` can legitimately run for many minutes (hydrating
+            # a re-queued job with thousands of saved places page by page), and the watchdog
+            # saw one "attempt" with no "ok" for 300 s and restarted MI/ASUS/DELL/MAC every
+            # 6 min — each restart re-hydrated from scratch. Lane/command threads do NOT
+            # stamp it, so a dead main loop with live lanes (the Mac, 15:11) still trips.
+            if threading.current_thread() is threading.main_thread():
+                _loop_wd_mark("ok")
         return r
 
     @classmethod
@@ -1374,10 +1382,15 @@ def _watchdog_restart(silent_sec: int) -> None:
 
 def _start_loop_watchdog() -> threading.Thread | None:
     """Daemon thread, every LOOP_WATCHDOG_POLL_SEC. `AGENT_LOOP_WATCHDOG_SEC` (default 300, 0 = off)."""
-    try:
-        limit = float(os.environ.get("AGENT_LOOP_WATCHDOG_SEC", "300") or 0)
-    except ValueError:
-        limit = 300.0
+    def _limit() -> float:
+        # W142b: re-read every poll so the cloud-refreshed knob (`agent_loop_watchdog_sec`
+        # in lead_gen_settings) applies without a restart. Default 600, 0 = off.
+        try:
+            return float(os.environ.get("AGENT_LOOP_WATCHDOG_SEC", "600") or 0)
+        except ValueError:
+            return 600.0
+
+    limit = _limit()
     if limit <= 0:
         log.info("loop watchdog disabled (AGENT_LOOP_WATCHDOG_SEC=0)")
         return None
@@ -1386,7 +1399,8 @@ def _start_loop_watchdog() -> threading.Thread | None:
         while True:
             time.sleep(LOOP_WATCHDOG_POLL_SEC)
             now = time.monotonic()
-            if _watchdog_should_restart(now, _LOOP_WD["ok"], _LOOP_WD["attempt"], _LOOP_WD["err"], limit):
+            lim = _limit()
+            if _watchdog_should_restart(now, _LOOP_WD["ok"], _LOOP_WD["attempt"], _LOOP_WD["err"], lim):
                 _watchdog_restart(int(now - _LOOP_WD["ok"]))
 
     t = threading.Thread(target=_run, name="agent-loop-watchdog", daemon=True)
@@ -1699,7 +1713,7 @@ _CLOUD_ENV: set[str] = set()
 #: W128: per-machine tuning knobs the periodic refresh is allowed to update live (a
 #: restart-free way to pick up a lowered `MAX_INFLIGHT__<DEVICE>` etc. from the CRM
 #: Systems tab). Anything else pulled from cloud config still only applies once, at start.
-_CONFIG_REFRESH_PREFIXES = ("MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__",
+_CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__",
                             # T793: per-machine memory knobs, same live-refresh path
                             "WA_RELAUNCH__", "MAPS_RELAUNCH__", "ENRICH_IDLE__",
                             # W135 (CRM T1011): stage-gate slots per machine
