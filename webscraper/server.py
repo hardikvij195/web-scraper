@@ -755,6 +755,10 @@ class Worker(threading.Thread):
                         tile = f" · tile {data['tile']}/{data['tiles']}" if data.get("tiles", 1) > 1 else ""
                         store.update_job(job_id, links_found=agg["links_total"] + data["count"],
                                          message=f"{pfx}collecting places from the results list{tile}…")
+                    elif kind == "cap_reached":
+                        store.log(job_id, "discovery",
+                                  f"Maps cap reached: {data['count']} places (job limit {data['limit']}) — "
+                                  f"discovery done, remaining {data['skipped_keywords']} keyword(s) skipped")
                     elif kind == "links_done":
                         store.log(job_id, "discovery",
                                   f"Google Maps offered {data['count']} places — opening each one"

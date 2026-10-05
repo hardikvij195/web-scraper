@@ -370,6 +370,9 @@ def lanes(row: Any, store: Any = None, now: Optional[datetime] = None) -> list[d
             done, active, pending = lv
             if key == "discovery":
                 total = max(total or 0, done + pending) or None
+                cap = int(_get(row, "max_places", 0) or 0)       # W147: a job-wide cap bounds the total
+                if cap > 0 and total is not None and done <= cap:
+                    total = min(total, cap)
             else:
                 total = done + active + pending
         total_is_min = False

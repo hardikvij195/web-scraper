@@ -614,6 +614,27 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
     skipped_far = skipped_known = 0
     merged: set[str] = set()
     budget_hit = False
+    cap_logged = {"v": False}
+
+    def budget_left() -> int:
+        """W147 (CRM T1027): `max_places` is a JOB-WIDE cap on unique places saved (all keywords,
+        tiles, areas, earlier runs). Remaining budget; a huge number when unlimited."""
+        if unlimited:
+            return 10**9
+        try:
+            return max(0, max_places - cstore.count_places_capped(job_id))
+        except Exception:                                         # noqa: BLE001 - fall back to the per-run set
+            return max(0, limit - len(merged))
+
+    def cap_reached(rest: list) -> bool:
+        if unlimited or budget_left() > 0:
+            return False
+        if not cap_logged["v"]:
+            cap_logged["v"] = True
+            skipped_kw = len({st[0] for st in rest if step_key(*st) not in done_steps})
+            result["cap_reached"] = True
+            emit("cap_reached", {"count": max_places, "limit": max_places, "skipped_keywords": skipped_kw})
+        return True
 
     def pause_gate() -> None:
         while pause_ev.is_set() and not stop_ev.is_set():
@@ -726,6 +747,8 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                     if key in done_steps:
                         continue                                  # W112: searched in an earlier run
                     tile_zoom = zoom_for_radius_km(tk) if tiling else zoom
+                    if cap_reached(steps[s_i - 1:]):      # before the stop check: the opener sets stop_ev at the cap
+                        break
                     if stop_ev.is_set() or len(merged) >= limit:
                         break
                     # Stop collecting while there is still time left to actually open the
@@ -751,7 +774,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                             ctx, page = rl.current
                         emit("browser_recycled", {"where": "collector", "count": tiles_run - 1})
                     pause_gate()
-                    want = 10**6 if (tiling or unlimited or (center and radius_km)) else max_places
+                    want = 10**6 if (tiling or unlimited or (center and radius_km)) else min(max_places, budget_left())
                     # Retry this tile through the relauncher until it reads or the relaunch
                     # cap is spent. Everything already persisted survives a crash.
                     # W111 (CRM T606): a slow Google Maps page (goto 60 s, or the results feed not
@@ -816,6 +839,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                         continue                          # W111: this tile skipped, the rest carry on
                     fail_streak = 0
                     fresh: list[FeedCard] = []
+                    remaining = budget_left()          # W147: a pass cannot overshoot the job cap
                     for card in cards:
                         if card.key in merged:
                             continue
@@ -830,7 +854,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                 continue
                         merged.add(card.key)
                         fresh.append(card)
-                        if len(merged) >= limit:
+                        if len(merged) >= limit or len(fresh) >= remaining:
                             break
                     # Persist THIS tile now: the opener takes links from job_links, and the
                     # stub rows are what the CRM shows before the panel has been read.
@@ -884,6 +908,8 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                                     "to_km": round(half, 2), "children": len(kids), "tiles": len(tiles_seen)})
                     if len(steps) > 1:
                         time.sleep(random.uniform(1.5, 3.5))
+                else:
+                    cap_reached([])                       # the last step may have filled the cap
             finally:
                 rl.close()
     except Exception as e:                                        # noqa: BLE001 — reported, then re-raised by the caller
@@ -1005,7 +1031,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                         emit_direct("abort", {"reason": "stopped by user"})
                         store.finish_job(job_id, "stopped", "stopped by user")
                         return saved
-                    if saved >= limit:
+                    if saved >= limit or (not unlimited and store.count_places_detailed(job_id) >= limit):
                         stop_ev.set()
                         break
                     pause_ev.set()

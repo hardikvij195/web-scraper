@@ -971,6 +971,15 @@ class Store:
         r = self.conn.execute("SELECT COUNT(*) FROM places WHERE job_id=?", (job_id,)).fetchone()
         return int(r[0] or 0)
 
+    def count_places_capped(self, job_id: int) -> int:
+        """W147 (CRM T1027): places that count toward the job-wide `max_places` cap - every row
+        saved for this job (stubs included: they are about to be opened) except `far` ones,
+        which sit outside the radius and are never leads."""
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM places WHERE job_id=? AND COALESCE(detail_status,'done')<>'far'",
+            (job_id,)).fetchone()
+        return int(r[0] or 0)
+
     def count_pending_enrichment(self, job_id: int) -> int:
         """How many leads still await enrichment — respecting the job's place_keys scope, so
         a scoped re-enrich counts only its subset. This is what the enrichment lane's `total`
