@@ -12,6 +12,12 @@ mkdir -p data
 # "[Errno 24] Too many open files"). Raise it here so the agent and everything it spawns
 # inherit it; the agent raises its own limit too, and the launchd job grants 4096.
 ulimit -n 4096 2>/dev/null || ulimit -n 2048 2>/dev/null || true
+# W146 (2026-10-05): the Mac agent went silent twice (15:11, 17:44) mid-job with no error and no
+# watchdog line — the machine slept. While this loop runs, hold macOS awake (idle + system sleep;
+# the display may still sleep). `-w $$` ends the assertion with this supervisor.
+if [ "$(uname -s)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -s -w $$ >/dev/null 2>&1 &
+fi
 # Friendly machine name shown in the CRM "Run on" picker. `.env` (written by the
 # installer's --device) wins; otherwise the Mac's ComputerName. Never export the bare
 # hostname: under launchd `scutil` can return nothing and the agent then registered as

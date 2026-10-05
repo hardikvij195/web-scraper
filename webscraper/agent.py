@@ -1396,9 +1396,20 @@ def _start_loop_watchdog() -> threading.Thread | None:
         return None
 
     def _run() -> None:
+        wall = time.time()
         while True:
             time.sleep(LOOP_WATCHDOG_POLL_SEC)
             now = time.monotonic()
+            # W146: a wall-clock jump far beyond the poll interval means the machine was
+            # suspended (the Mac slept twice on 2026-10-05) — say so, and do not count the
+            # gap as loop silence.
+            gap = time.time() - wall - LOOP_WATCHDOG_POLL_SEC
+            wall = time.time()
+            if gap > 2 * LOOP_WATCHDOG_POLL_SEC:
+                log.warning("watchdog: this machine was asleep/suspended for ~%ds — keep it "
+                            "awake (plugged in, lid open; the Mac loop now runs caffeinate)", int(gap))
+                _loop_wd_mark("ok")
+                continue
             lim = _limit()
             if _watchdog_should_restart(now, _LOOP_WD["ok"], _LOOP_WD["attempt"], _LOOP_WD["err"], lim):
                 _watchdog_restart(int(now - _LOOP_WD["ok"]))
