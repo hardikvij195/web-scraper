@@ -204,7 +204,7 @@ def test_recycle_backoff_after_a_slow_sync(wa, monkeypatch):
     assert wv._RECYCLE_HOLD["acc1"] == 0 and wv._CHECKS_SINCE_RECYCLE["acc1"] == 3
     wv.verify_places(_Store(), _rows(1))                          # hold spent: the recycle fires now
     assert wv._CHECKS_SINCE_RECYCLE["acc1"] == 0
-    assert closed["n"] == 3                                       # recycle close + end-of-slice close
+    assert closed["n"] == 2                                       # the W131c recycle close; the context is gone before the slice-end close
 
 
 def test_lane_parks_twice_then_takes_the_relink_wait(monkeypatch, tmp_path):
