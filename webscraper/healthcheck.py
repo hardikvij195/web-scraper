@@ -115,25 +115,42 @@ def _wa_session() -> dict:
     # file it ever had, so this check used to pass while the WhatsApp lane died on
     # `wa_not_logged_in` in every job. Report what was last actually SEEN.
     seen: dict[str, tuple[str, str]] = {}
+    relink: dict[str, str] = {}          # W143: account -> since when it needs a QR relink
     try:
         from webscraper.store import Store
         for row in Store().list_wa_accounts():
             if row.get("status"):
                 seen[str(row["name"])] = (str(row["status"]), str(row.get("status_at") or ""))
+            if row.get("needs_relink"):
+                relink[str(row["name"])] = str(row.get("needs_relink_at") or "")
     except Exception:                                             # noqa: BLE001 — no store yet
         pass
 
     def _label(a: str) -> str:
+        if a in relink:                                           # W143: read by the CRM agents table
+            return f"{a}: NEEDS RELINK (sync never finished, since {_hhmm(relink[a])})"
         st, at = seen.get(a, ("unknown", ""))
         when = f" {_ago(at)}" if at else ""
         return f"{a}: {'linked' if st == 'logged_in' else 'NOT linked' if st == 'logged_out' else 'unchecked'}{when}"
 
-    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in"]
+    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in" and a not in relink]
     detail = "WhatsApp accounts — " + ("; ".join(_label(a) for a in live) if live else "none")
     # Only a profile we have SEEN logged in counts as ok; unchecked stays a warning
     # rather than a green tick, because "we never looked" is not "it works".
     return _check(bool(linked), detail,
                   "python -m webscraper wa-login <label>  (scan the QR once on this machine)", optional=True)
+
+
+def _hhmm(iso: str) -> str:
+    """W143: local `HH:MM` of an ISO timestamp this module wrote; `?` if it cannot be read."""
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%H:%M")
+    except Exception:                                             # noqa: BLE001
+        return "?"
 
 
 def _ago(iso: str) -> str:

@@ -13,6 +13,23 @@
 
 ---
 
+- [x] **W143** `wa_verify.py` / `lanes.py` / `store.py` / `healthcheck.py` / `agent.py` (CRM T1021, 2026-10-05, owner: "add some
+  logic of failsafe so that we do not face this issue again on mac") — the Mac 09:29-15:05: WhatsApp Web showed "messages are
+  downloading" on every load, W137 benched `main`, the lane parked 5 min, next job's lane started its park count from zero —
+  92 pauses, 0 verdicts, no alert; the W131 recycle re-triggered the sync on a heavy-history profile. (1) **Per-account
+  re-sync ladder** (`_RESYNC_EPISODES`, module-level): a slice that benched the account with zero yes/no = one episode;
+  1-2 park as before; 3 = `_resync_recover` (close its Chrome, `kill_profile_holder` incl. SingletonLock/Socket/Cookie/
+  lockfile, relaunch with ONE long sync window `WA_RESYNC_LONG_WAIT_SEC` 900 via `_SYNC_MAX_OVERRIDE`; synced = the lane
+  goes straight on); 4 = `store.set_wa_needs_relink` (new `wa_accounts.needs_relink[_at]`, out of `pick_wa_account` /
+  `enabled_wa_accounts`), one error line `WhatsApp [main] needs a fresh QR relink — WhatsApp Web never finished syncing
+  (N episodes, X min)`, no more parks — `verify_places` then raises WaNotLoggedIn naming it and the lane takes the W110
+  relink wait. A decided verdict resets the ladder; a finished `wa_login` clears the flag; the profile is never wiped.
+  `WA_SYNC_GIVE_UP` 6 -> 12 is only a backstop now. (2) Self-check `wa_session.detail`: `main: NEEDS RELINK (sync never
+  finished, since HH:MM)` (CRM agents table reads it verbatim). (3) **Honest work counter**: new `jobs.wa_decided` (yes/no
+  only) reported as progress `wa_decided` + `lanes[whatsapp].useful`; `wa_verify_done` / `lanes[whatsapp].done` still count
+  every attempt for the bar + ETA. (4) **Recycle guard**: a boot whose sync took > 60 s holds the W131 recycle for
+  `WA_RECYCLE_BACKOFF_CHECKS` (400) checks. 2.2.7, `tests/test_w143_resync_failsafe.py`.
+
 - [x] **W142** `agent.py` / `wa_verify.py` / `browser_recovery.py` (CRM T1020, 2026-10-05, owner: "can u add this in agent on
   ur own") — the Mac at 15:05-15:11: `wa_login main` died on "Opening in existing browser session … profile is already in
   use" (an older Chrome held the profile), `wa_delete main` was refused with "a job is running — stop it, then delete", then

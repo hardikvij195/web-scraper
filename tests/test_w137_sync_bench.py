@@ -4,8 +4,8 @@ not burn real numbers as 'unknown' (MAC, 2026-10-04: 34 undecided, 0 verdicts in
   * verify_places benches the account after WA_SYNC_STRIKES sync non-answers, records nothing,
     closes its browser and reports `sync_blocked`
   * a re-check straight off the sync splash that still cannot decide is a sync non-answer too
-  * the WhatsApp lane parks (slot released) on `sync_blocked`, and gives up with a readable
-    error after WA_SYNC_GIVE_UP parks so the websites lane stops waiting behind it
+  * the WhatsApp lane parks (slot released) on `sync_blocked`; W143 moved the escalation to a
+    per-account ladder (tests/test_w143_resync_failsafe.py)
   * `restart` with arg `now` is never deferred (the CRM's frozen-machine backstop)
 
 Fakes only: no Playwright, no Chrome, no `data/leads.db`.
@@ -81,54 +81,7 @@ def test_a_real_verdict_clears_the_strikes(wa, monkeypatch):
     assert res["yes"] == 2 and res["unknown"] == 0
 
 
-def test_lane_parks_on_sync_blocked_then_gives_up(monkeypatch, tmp_path):
-    from webscraper.store import Store, now_iso
-    path = tmp_path / "t.db"
-    db = lambda: Store(path)                                           # noqa: E731
-    s = db()
-    job_id = s.create_job(query="q", location="here", max_places=10, delay_sec=0)
-    s.conn.execute("INSERT INTO places(job_id, place_key, name, phone, enrich_status, scraped_at) VALUES (?,?,?,?,'done',?)",
-                   (job_id, "p1", "biz", "+919999999999", now_iso()))
-    s.conn.commit()
-    s.add_wa_account("acc1")
-    s.set_wa_status("acc1", "logged_in")
-    s.close()
-    job = {"do_enrich": 0, "do_research": 0, "do_wa_verify": 1, "country": "IN", "reenrich_only": 1}
-    L.reset_stage_gates()
-    monkeypatch.setattr(L, "WA_SYNC_PARK_SEC", 0.05)
-    monkeypatch.setattr(L, "WA_SYNC_GIVE_UP", 3)
-    monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
-    monkeypatch.setattr(wv, "login_in_progress", lambda name=None: False)
-    calls = {"n": 0}
-
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
-        calls["n"] += 1
-        return {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0, "sync_blocked": True}
-    monkeypatch.setattr(wv, "verify_places", fake_verify)
-
-    pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=db)
-    pipe.discovery.start(); pipe.discovery.join(2)
-    pipe.enrichment.start(); pipe.enrichment.join(2)              # disabled -> done at once
-    gate = L.STAGE_GATES["whatsapp"]
-    released = {"seen": False}
-    lane = pipe.whatsapp
-    orig = lane._slot_idle
-
-    def spy(why, force=False):
-        orig(why, force=force)
-        released["seen"] = released["seen"] or not gate.holds(job_id)
-    lane._slot_idle = spy
-    lane.start()
-    lane.join(5)
-    assert not lane.is_alive()
-    assert calls["n"] == 3
-    assert released["seen"], "the WhatsApp slot must be released while parked"
-    assert lane.reason.startswith("error:WhatsApp Web keeps re-syncing")
-    logs = [r["message"] for r in db().conn.execute("SELECT message FROM job_logs WHERE job_id=?", (job_id,))]
-    assert any("pausing WhatsApp checks" in m for m in logs)
-    assert any("WhatsApp verification stopped for this run" in m for m in logs)
-    # the number was never recorded
-    assert db().conn.execute("SELECT COUNT(*) FROM wa_checks WHERE job_id=?", (job_id,)).fetchone()[0] == 0
+# W143: the lane-park give-up test moved to tests/test_w143_resync_failsafe.py (per-account ladder).
 
 
 def test_restart_now_is_never_deferred():

@@ -84,6 +84,8 @@ data/           gitignored: leads.db, browser profiles, exports
 | `LANE_SLOTS_ENRICHMENT` | `2` | local override of jobs whose enrichment lane may run concurrently (W122 `StageGate`); W135: CRM `enrich_slots__<device>` (clamp 1..3) is the normal knob, refreshed live |
 | `LANE_SLOTS_WHATSAPP` | `_wa_parallel()` | local override of concurrent WhatsApp lanes; W135: CRM `wa_slots__<device>` (>=1). Lanes yield a slot every 20 businesses / 25 numbers / 5 min when another job waits (round-robin); W136: an idle lane releases its slot |
 | `MEMORY_START_MAX_PCT` | `85` | W129: Worker won't start a NEW job at/above this RAM used% (jobs already running keep going) |
+| `WA_RESYNC_LONG_WAIT_SEC` | `900` | W143: episode-3 re-sync recovery — kill the profile's Chrome + lock files, relaunch, wait ONE sync this long; episode 4 flags the account `needs_relink` |
+| `WA_RECYCLE_BACKOFF_CHECKS` | `400` | W143: after a boot whose sync took > 60 s, hold the W131 recycle for this many checks (heavy-history account); 0 = off |
 | `AGENT_LOOP_WATCHDOG_SEC` | `300` | W142: no CRM heartbeat for this long (and not just offline) -> flag jobs, kill our Chromes, `os._exit(3)`; the supervisor loop relaunches. 0 = off |
 
 ## Lead Finder Cloud (vercel-app)
@@ -112,7 +114,8 @@ queue with the feeder still running, enrichment's "WhatsApp first" wait, WhatsAp
 call `_slot_idle()` and the lane re-queues with `_slot_resume()` when work shows up (W136, T1015 — DELL
 deadlocked 21 h on two idle holders). Never add a wait inside `work()` that keeps the slot.
 W137: a WhatsApp Web session stuck on its sync splash benches the account after 3 non-answers (nothing
-recorded), the lane parks 5 min at a time and gives up after 30 min with a readable error. The CRM judges a
+recorded), the lane parks 5 min at a time; W143: per-ACCOUNT ladder — episode 3 browser recovery + one long
+sync wait, episode 4 `needs_relink` (self-check shows NEEDS RELINK, `wa_login` clears it). The CRM judges a
 machine by WORK done (`lead_gen_frozen_machines`: counters + useful output), never by log/row activity.
 W138: lanes of different jobs run together — the Worker starts a lane-only job (re-enrich / WhatsApp-only)
 while another job's Maps runs (`job_needs_discovery`, `capacity().lanes_free`, Edge Function offers only

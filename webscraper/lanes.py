@@ -79,8 +79,12 @@ WA_RELINK_HEARTBEAT_SEC = 120.0
 #: slice decides nothing for that reason the lane parks (slot released) for WA_SYNC_PARK_SEC and
 #: retries; after WA_SYNC_GIVE_UP parks in a row it ends with a readable error so the websites
 #: lane stops waiting (W76) and the CRM shows the real problem.
+#: W143 (CRM T1021): the per-ACCOUNT ladder in `wa_verify` (`WA_RESYNC_*`) now ends a re-sync loop —
+#: episode 3 = browser recovery + one long wait, episode 4 = `needs_relink` — so this give-up is only
+#: a backstop for a lane whose accounts keep alternating; it was the whole mechanism before (and reset
+#: per job, which is how the Mac paused 92 times in a day).
 WA_SYNC_PARK_SEC = 300.0
-WA_SYNC_GIVE_UP = 6
+WA_SYNC_GIVE_UP = 12
 
 
 def _wait_for_relink(lane, store: Store, err: Exception):
@@ -915,6 +919,7 @@ class WhatsAppLane(Lane):
         store = self.store
         assert store is not None
         checked = 0
+        decided = 0                                                 # W143: yes/no only
         t0 = time.monotonic()
         while True:
             if self.stopped():
@@ -961,11 +966,14 @@ class WhatsAppLane(Lane):
 
             def make_on_wa(st: Store):
                 def on_wa(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
-                    nonlocal checked
+                    nonlocal checked, decided
                     with counter_lock:
                         checked += 1
                         done_now = checked
-                    st.update_job(self.job_id, wa_verify_done=done_now)
+                        if status in ("yes", "no"):
+                            decided += 1                            # W143: the honest "useful output"
+                        dec_now = decided
+                    st.update_job(self.job_id, wa_verify_done=done_now, wa_decided=dec_now)
                     try:
                         r = by_pk.get(pk, {})
                         st.log(self.job_id, "whatsapp",
@@ -1024,6 +1032,10 @@ class WhatsAppLane(Lane):
                     res = {k: sum(int(r.get(k, 0) or 0) for r in results)
                            for k in ("yes", "no", "unknown", "no_number")}
                     res["capped"] = any(bool(r.get("capped")) for r in results)
+                    # W143: the W137/W143 signals were dropped by this merge in parallel mode.
+                    res["sync_blocked"] = (any(bool(r.get("sync_blocked")) for r in results)
+                                           and res["yes"] + res["no"] == 0)
+                    res["needs_relink"] = sum(int(r.get("needs_relink", 0) or 0) for r in results)
                 else:
                     res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
                                                   job_id=self.job_id, headless=hl)
@@ -1075,9 +1087,17 @@ class WhatsAppLane(Lane):
                 except Exception:                                 # noqa: BLE001
                     pass
                 return R_WA_LOGIN
+            if res.get("needs_relink"):
+                # W143: the ladder flagged the account(s) — no park. The next batch finds no enabled
+                # account and takes the W110 relink wait; the CRM shows NEEDS RELINK in the self-check.
+                self._sync_parks = 0
+                self.note(f"{res['needs_relink']} WhatsApp account(s) flagged NEEDS RELINK — WhatsApp Web never "
+                          "finished syncing; open Lead Finder > Systems > WhatsApp login and scan the QR", "error")
+                continue
             if res.get("sync_blocked"):
                 # W137: nothing decided — WhatsApp Web on this machine never left its sync
-                # splash; the numbers went back on the queue untouched.
+                # splash; the numbers went back on the queue untouched. W143: the account's own
+                # ladder escalates (recovery, then needs_relink); the give-up below is a backstop.
                 parks = getattr(self, "_sync_parks", 0) + 1
                 self._sync_parks = parks
                 if parks >= WA_SYNC_GIVE_UP:
@@ -1087,8 +1107,8 @@ class WhatsAppLane(Lane):
                               "in Lead Finder > Systems", "error")
                     return "error:WhatsApp Web keeps re-syncing — relink on this machine"
                 self.note(f"WhatsApp Web keeps re-syncing — pausing WhatsApp checks "
-                          f"{int(WA_SYNC_PARK_SEC / 60)} min (pause {parks}/{WA_SYNC_GIVE_UP}); "
-                          "the numbers stay queued", "warn")
+                          f"{int(WA_SYNC_PARK_SEC / 60)} min (pause {parks}); the numbers stay queued — "
+                          "the account escalates to a browser recovery, then to NEEDS RELINK (W143)", "warn")
                 self._slot_idle("WhatsApp Web is re-syncing", force=True)
                 deadline = time.monotonic() + WA_SYNC_PARK_SEC
                 while time.monotonic() < deadline:

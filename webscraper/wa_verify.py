@@ -108,6 +108,78 @@ WA_REQUEUE_MAX = 2
 #: Benched = skipped this slice, still linked, its Chrome closed so the next slice boots clean.
 WA_SYNC_STRIKES = 3
 
+#: W143 (CRM T1021, MAC 2026-10-05: 92 five-minute pauses, 0 verdicts in 5.5 h — every job's lane
+#: restarted the W137 park count from zero and nobody was told). Per-ACCOUNT ladder of consecutive
+#: re-sync episodes (a slice that benched the account and decided nothing), module-level so it
+#: survives jobs: episodes 1-2 the lane parks as before; episode 3 = full browser recovery (kill the
+#: profile's Chrome, clear its lock files, relaunch, ONE long sync wait — cheaper than 90 short
+#: ones); episode 4 = the account is flagged `needs_relink` (out of rotation until a QR login) and
+#: the lane runs on as if no account were linked. Any yes/no verdict resets the ladder. The profile
+#: is never wiped: the owner's history survives a relink.
+WA_RESYNC_RECOVERY_EPISODE = 3
+WA_RESYNC_RELINK_EPISODE = 4
+WA_RESYNC_LONG_WAIT_SEC = 900.0
+#: W143: a load whose sync took longer than this marks the account "heavy" — the W131 recycle is held
+#: off for WA_RECYCLE_BACKOFF_CHECKS checks so a heavy-history account is not re-synced every N numbers.
+WA_RECYCLE_SLOW_SYNC_SEC = 60.0
+WA_RECYCLE_BACKOFF_CHECKS = 400
+_RESYNC_EPISODES: dict[str, int] = {}      # account -> consecutive zero-verdict re-sync episodes
+_RESYNC_FIRST_AT: dict[str, float] = {}    # account -> time.time() of the first episode of the run
+_RECYCLE_HOLD: dict[str, int] = {}         # account -> checks left before a W131 recycle may fire
+_LAST_SYNC_SEC: dict[str, float] = {}      # account -> seconds the last load spent on the sync splash
+_SYNC_MAX_OVERRIDE: dict[str, float] = {}  # account -> one-off sync window for its next `wait_boot`
+
+
+def wa_resync_long_wait_sec() -> float:
+    """W143: the single long sync window the episode-3 recovery waits (env WA_RESYNC_LONG_WAIT_SEC)."""
+    import os
+    try:
+        return max(60.0, float(os.environ.get("WA_RESYNC_LONG_WAIT_SEC") or WA_RESYNC_LONG_WAIT_SEC))
+    except ValueError:
+        return WA_RESYNC_LONG_WAIT_SEC
+
+
+def wa_recycle_backoff_checks() -> int:
+    """W143: checks a heavy account skips the W131 recycle for (env WA_RECYCLE_BACKOFF_CHECKS; 0 = off)."""
+    import os
+    try:
+        return max(0, int(os.environ.get("WA_RECYCLE_BACKOFF_CHECKS") or WA_RECYCLE_BACKOFF_CHECKS))
+    except ValueError:
+        return WA_RECYCLE_BACKOFF_CHECKS
+
+
+def resync_step(episode: int) -> str:
+    """W143 ladder: 'pause' (episodes 1-2) | 'recover' (3) | 'relink' (4 and up)."""
+    if episode >= WA_RESYNC_RELINK_EPISODE:
+        return "relink"
+    return "recover" if episode == WA_RESYNC_RECOVERY_EPISODE else "pause"
+
+
+def resync_reset(name: str) -> None:
+    """W143: a decided verdict ends the account's re-sync ladder."""
+    _RESYNC_EPISODES.pop(name, None)
+    _RESYNC_FIRST_AT.pop(name, None)
+
+
+def note_sync_duration(name: str, sec: float) -> None:
+    """W143: remember how long `name`'s last load spent syncing; a slow one holds off the recycle."""
+    _LAST_SYNC_SEC[name] = sec
+    if sec > WA_RECYCLE_SLOW_SYNC_SEC:
+        hold = wa_recycle_backoff_checks()
+        if hold:
+            _RECYCLE_HOLD[name] = hold
+            log.info("[%s] sync took %ds — holding the W131 browser recycle for the next %d checks (W143)",
+                     name, int(sec), hold)
+
+
+def recycle_allowed(name: str) -> bool:
+    """W143: one tick of the account's post-slow-sync hold per check; False while it is counting down."""
+    hold = _RECYCLE_HOLD.get(name, 0)
+    if hold <= 0:
+        return True
+    _RECYCLE_HOLD[name] = hold - 1
+    return False
+
 
 def wa_sync_max_sec() -> float:
     """How long a sync splash may run before we give up on it for THIS open (env WA_SYNC_MAX_SEC)."""
@@ -141,14 +213,17 @@ def wait_boot(page: Page, name: str, *, blank_ms: int, sync_max_sec: float | Non
     — which wiped profiles (W70) and unlinked accounts (the W65 misread) that were fine (W94).
     """
     start = time.monotonic()
-    sync_max = sync_max_sec if sync_max_sec is not None else wa_sync_max_sec()
+    # W143: the episode-3 recovery sets a one-off long window for this account's next boot.
+    sync_max = sync_max_sec if sync_max_sec is not None else (_SYNC_MAX_OVERRIDE.get(name) or wa_sync_max_sec())
     seen_sync = False
     last_log = -30.0
     while True:
         st = _boot_state(page)
-        if st in ("chat", "qr"):
-            return st
         el = time.monotonic() - start
+        if st in ("chat", "qr"):
+            if seen_sync:
+                note_sync_duration(name, el)                      # W143: heavy account -> recycle hold
+            return st
         if st == "syncing":
             seen_sync = True
             if el - last_log >= 30:
@@ -157,6 +232,7 @@ def wait_boot(page: Page, name: str, *, blank_ms: int, sync_max_sec: float | Non
                 last_log = el
         if seen_sync:
             if el >= sync_max:
+                note_sync_duration(name, el)                      # W143
                 return "syncing"
         elif el >= blank_ms / 1000:
             return "blank"
@@ -562,6 +638,11 @@ def login(name: str, *, busy: bool = False) -> bool:
                 remember_browser(name, used, machine=fell_back)
                 _BROWSER_FELL_BACK.pop(name, None)
             ok = bool(booted)
+            if ok:
+                try:
+                    Store().set_wa_needs_relink(name, False)       # W143: a fresh QR link ends the flag
+                except Exception:                                 # noqa: BLE001
+                    log.warning("[%s] could not clear needs_relink", name, exc_info=True)
     finally:
         _LOGIN_ACTIVE.discard(name)                                # W68
     return ok
@@ -704,8 +785,12 @@ def verify_places(
     today = date.today().isoformat()
     counts = {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}
 
-    accounts = [a for a in store.list_wa_accounts() if not a["disabled"]]
+    all_accounts = store.list_wa_accounts()
+    accounts = [a for a in all_accounts if not a["disabled"] and not a.get("needs_relink")]
     if not accounts:
+        relink = [str(a["name"]) for a in all_accounts if a.get("needs_relink")]
+        if relink:                                                # W143
+            raise WaNotLoggedIn(f"WhatsApp account(s) need a fresh QR relink: {', '.join(relink)}")
         raise WaNotLoggedIn("no WhatsApp accounts - run `python -m webscraper wa-login <name>` first")
 
     open_ctx: dict[str, Any] = {}      # name -> (pw_ctx, page); all closed in `finally`
@@ -750,6 +835,40 @@ def verify_places(
                 ctx.close()
         except Exception:                                         # noqa: BLE001
             pass
+
+    def _resync_recover(name: str, ep: int) -> bool:
+        """W143 episode 3: kill the profile's Chrome + its lock files (SingletonLock/Socket/Cookie,
+        lockfile), relaunch, and wait ONE long sync out. True = the chat list came up, the account
+        is usable again. The profile itself is never touched."""
+        wait = wa_resync_long_wait_sec()
+        msg = (f"{name}: re-sync episode {ep} — full browser recovery: closing its Chrome, clearing the "
+               f"profile locks and waiting up to {int(wait / 60)} min for one sync to finish")
+        log.warning("[%s] %s", name, msg)
+        if job_id is not None:
+            store.log(job_id, "whatsapp", msg, "warn")
+        _close_account(name)
+        relaunchers.pop(name, None)
+        try:
+            _br.kill_profile_holder(profile_dir(name), "W143 re-sync recovery")
+        except Exception as e:                                    # noqa: BLE001
+            log.warning("[%s] could not evict the profile holder: %s", name, e)
+        _SYNC_MAX_OVERRIDE[name] = wait
+        t0 = time.monotonic()
+        try:
+            page = _ensure_session(pw, open_ctx, relaunchers, name, headless)
+        except (WaUnavailable, WaNotLoggedIn) as e:
+            log.warning("[%s] recovery did not help: %s", name, e)
+            return False
+        finally:
+            _SYNC_MAX_OVERRIDE.pop(name, None)
+        if page is None:
+            return False
+        unavailable.discard(name)
+        done = f"{name}: WhatsApp Web finished syncing after {int(time.monotonic() - t0)}s — checks resume"
+        log.info("[%s] %s", name, done)
+        if job_id is not None:
+            store.log(job_id, "whatsapp", done, "info")
+        return True
 
     def _check(name: str, num: str) -> str:
         """One number on one account, retried on a fresh browser if Chrome dies.
@@ -877,6 +996,8 @@ def verify_places(
                 # W93: the client never painted with any browser — skip the account for this
                 # run only. It is NOT logged out: `disabled` and the W64 status stay as they are.
                 unavailable.add(name)
+                if getattr(e, "syncing", False):
+                    sync_benched.add(name)                        # W143: a sync-out at boot is an episode too
                 log.warning("%s", e)
                 if job_id is not None:
                     store.log(job_id, "whatsapp", f"{name}: WhatsApp Web did not render on this machine — skipped this run, still linked", "warn")
@@ -911,6 +1032,8 @@ def verify_places(
                 # way here: the account stays linked, this number stays unchecked for next time.
                 unavailable.add(name)
                 open_ctx.pop(name, None)
+                if getattr(e, "syncing", False):
+                    sync_benched.add(name)                        # W143
                 log.warning("%s", e)
                 if job_id is not None:
                     store.log(job_id, "whatsapp", f"{name}: WhatsApp Web was still syncing after a browser restart — skipped this run, still linked", "warn")
@@ -980,6 +1103,7 @@ def verify_places(
             counts["checked"] += 1
             if status in ("yes", "no"):
                 sync_strikes[name] = 0                             # W137: a real answer clears the strikes
+                resync_reset(name)                                 # W143: and ends the re-sync ladder
             # W131 (2026-09-19): recycle this account's Chrome every `WA_RELAUNCH_EVERY`
             # checks. Each verdict is a full `page.goto` of a wa.me send URL, so the WhatsApp
             # tab grows exactly the way W120 measured on the Maps tab (0.5 -> 1.45 GB over ~40
@@ -989,7 +1113,14 @@ def verify_places(
             # hence a much larger N than Maps uses.
             checks_since_recycle[name] = checks_since_recycle.get(name, 0) + 1
             _recycle_every = wa_relaunch_every()
-            if _recycle_every and checks_since_recycle[name] >= _recycle_every:
+            _allowed = recycle_allowed(name)                       # W143: one tick of the hold per check
+            if _recycle_every and checks_since_recycle[name] >= _recycle_every and not _allowed:
+                # W143: this account's last load needed a long sync — a recycle now would only
+                # re-sync it again. Keep counting; the recycle fires once the hold has run out.
+                if checks_since_recycle[name] == _recycle_every:
+                    log.info("[%s] WhatsApp recycle due but held — last sync took %ds, %d checks of backoff "
+                             "left (W143)", name, int(_LAST_SYNC_SEC.get(name, 0)), _RECYCLE_HOLD.get(name, 0))
+            elif _recycle_every and checks_since_recycle[name] >= _recycle_every:
                 checks_since_recycle[name] = 0
                 log.info("[%s] WhatsApp recycle due after %d checks (W131)", name, _recycle_every)
                 rl = relaunchers.get(name)
@@ -1030,6 +1161,39 @@ def verify_places(
             on_progress(pk, status, e164, source)
             lo, hi = wa_delay_range()
             time.sleep(random.uniform(lo, hi))
+        # W143: the per-account re-sync ladder. Runs while the driver is still up so episode 3 can
+        # relaunch the profile right here and wait one long sync out.
+        counts["needs_relink"] = 0
+        blocked = False
+        if sync_benched and counts["yes"] + counts["no"] == 0:
+            for name in sorted(sync_benched):
+                ep = _RESYNC_EPISODES.get(name, 0) + 1
+                _RESYNC_EPISODES[name] = ep
+                first = _RESYNC_FIRST_AT.setdefault(name, time.time())
+                step = resync_step(ep)
+                if step == "recover" and pw is not None:
+                    if _resync_recover(name, ep):
+                        continue                  # synced — the lane goes straight on, no park
+                    blocked = True
+                elif step == "relink":
+                    mins = int((time.time() - first) / 60)
+                    msg = (f"WhatsApp [{name}] needs a fresh QR relink — WhatsApp Web never finished "
+                           f"syncing ({ep} episodes, {mins} min)")
+                    log.error("%s", msg)
+                    if job_id is not None:
+                        store.log(job_id, "whatsapp", msg, "error")
+                    try:
+                        store.set_wa_needs_relink(name, True)
+                    except Exception:                             # noqa: BLE001 — db busy: the next slice retries
+                        log.warning("[%s] could not flag needs_relink (db busy)", name)
+                    resync_reset(name)
+                    counts["needs_relink"] += 1
+                else:
+                    log.warning("[%s] re-sync episode %d with no verdict — the lane parks; episode %d = browser "
+                                "recovery, %d = needs relink (W143)", name, ep,
+                                WA_RESYNC_RECOVERY_EPISODE, WA_RESYNC_RELINK_EPISODE)
+                    blocked = True
+        counts["sync_blocked"] = blocked
     finally:
         for pw_ctx, _ in open_ctx.values():
             try:
@@ -1046,9 +1210,8 @@ def verify_places(
                 log.warning("[%s] Playwright did not stop cleanly", account or "wa", exc_info=True)
         from webscraper.fdcount import fd_status
         log.info("[%s] verify slice done: %d checked, %s", account or "wa", counts["checked"], fd_status())
-    # W137: tell the lane when NOTHING was decided because WhatsApp Web never left its sync
-    # splash (every account used got benched) — it parks instead of asking again right away.
-    counts["sync_blocked"] = bool(sync_benched) and counts["yes"] + counts["no"] == 0
+    # W137: `sync_blocked` (set above, W143 ladder) tells the lane NOTHING was decided because
+    # WhatsApp Web never left its sync splash — it parks instead of asking again right away.
     return counts
 
 
@@ -1300,7 +1463,10 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
                 # W94: linked, still downloading messages. Not this run's problem — skip the
                 # account without touching its flag; the sync finishes in a later open.
                 ctx.close()
-                raise WaUnavailable(f"[{name}] WhatsApp Web is still downloading messages after {int(wa_sync_max_sec())}s — skipped this run (still linked)")
+                err = WaUnavailable(f"[{name}] WhatsApp Web is still downloading messages after "
+                                    f"{int(_SYNC_MAX_OVERRIDE.get(name) or wa_sync_max_sec())}s — skipped this run (still linked)")
+                err.syncing = True                                 # W143: counts as a re-sync episode
+                raise err
             if state != "chat":
                 qr_shown = state == "qr"
                 if not qr_shown:

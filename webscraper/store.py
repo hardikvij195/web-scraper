@@ -421,9 +421,19 @@ class Store:
             # W122: "give each job a priority number" (owner directive 2026-09-19) — the
             # Worker and the CRM's job-list both order by this, highest first.
             ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            # W143 (CRM T1021): yes/no verdicts only. `wa_verify_done` counts every attempt (the
+            # bar + ETA); this is the "useful output" the CRM's frozen detector should trust.
+            ("wa_decided", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+        # W143: an account whose WhatsApp Web never finishes syncing is flagged out of rotation
+        # until a QR login clears it (never auto-wiped — the history survives a relink).
+        acols = {r[1] for r in self.conn.execute("PRAGMA table_info(wa_accounts)")}
+        for col, typ in (("status", "TEXT"), ("status_at", "TEXT"),
+                         ("needs_relink", "INTEGER NOT NULL DEFAULT 0"), ("needs_relink_at", "TEXT")):
+            if col not in acols:
+                self.conn.execute(f"ALTER TABLE wa_accounts ADD COLUMN {col} {typ}")
         # W71: how many crawls a lead has had. Two failures is the cutoff (T441): the
         # lead keeps its status and error for the review page but stops being retried.
         pcols = {r[1] for r in self.conn.execute("PRAGMA table_info(places)")}
@@ -1058,11 +1068,21 @@ class Store:
             self.conn.commit()
         self._write(f"wa_accounts {name}", _do)
 
+    def set_wa_needs_relink(self, name: str, flag: bool) -> None:
+        """W143: flag / clear "WhatsApp Web never finished syncing — needs a QR relink". A flagged
+        account is out of `pick_wa_account` / `enabled_wa_accounts`; a finished `wa_login` clears it."""
+        def _do() -> None:
+            self.conn.execute("UPDATE wa_accounts SET needs_relink=?, needs_relink_at=? WHERE name=?",
+                              (1 if flag else 0, now_iso() if flag else None, name))
+            self.conn.commit()
+        self._write(f"wa_accounts needs_relink {name}", _do)
+
     def wa_relinked_since(self, since_iso: str) -> bool:
         """W110: has an enabled account been SEEN logged in at or after `since_iso`?"""
         try:
             return self.conn.execute(
-                "SELECT 1 FROM wa_accounts WHERE disabled=0 AND status='logged_in' AND status_at>=? LIMIT 1",
+                "SELECT 1 FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=0 "
+                "AND status='logged_in' AND status_at>=? LIMIT 1",
                 (since_iso,)).fetchone() is not None
         except sqlite3.Error:                                     # pre-W64 schema: no status column
             return False
@@ -1117,14 +1137,15 @@ class Store:
         return sum(max(0, cap - int(r[0])) for r in rows)
 
     def enabled_wa_accounts(self) -> list[str]:
-        return [r[0] for r in self.conn.execute("SELECT name FROM wa_accounts WHERE disabled=0 ORDER BY name")]
+        return [r[0] for r in self.conn.execute(
+            "SELECT name FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=0 ORDER BY name")]
 
     def pick_wa_account(self, cap: int, today: str, exclude: set[str] | None = None) -> str | None:
         """Enabled account with remaining cap today, least-recently-used first (rotation).
         `exclude` (W93): names skipped for this run without touching their `disabled` flag."""
         self._roll_day(today)
         # cap <= 0 = unlimited: rotate over every enabled account regardless of today's count.
-        where = "disabled=0" + (" AND sent_today<?" if cap > 0 else "")
+        where = "disabled=0 AND COALESCE(needs_relink,0)=0" + (" AND sent_today<?" if cap > 0 else "")   # W143
         args: tuple = (cap,) if cap > 0 else ()
         if exclude:
             where += " AND name NOT IN (" + ",".join("?" for _ in exclude) + ")"

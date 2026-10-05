@@ -498,7 +498,9 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
     out = {"scraped_count": row["scraped_count"], "links_found": row["links_found"],
            "enrich_done": row["enrich_done"], "enrich_total": row["enrich_total"],
            "research_done": row["research_done"], "research_total": row["research_total"],
-           "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"]}
+           "wa_verify_done": row["wa_verify_done"], "wa_verify_total": row["wa_verify_total"],
+           # W143 (CRM T1021): yes/no verdicts only — `wa_verify_done` counts every attempt.
+           "wa_decided": int(_col(row, "wa_decided", 0) or 0)}
     # Discovery stats for the card's info dialog (T172): what Maps offered, what was
     # opened, what was skipped and why. Best-effort — an old store has no job_links.
     try:
@@ -529,6 +531,11 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
                 "phase_eta_sec": s["phase_eta_sec"], "estimating": s["estimating"],
                 "budget_left_sec": (round(s["budget_left_sec"])
                                     if s["budget_left_sec"] is not None else None)})
+    # W143: the WhatsApp lane's `done` (count of wa_checks rows) advances on 'unknown' too; `useful`
+    # is the decided count, so a lane that only ever "could not decide" reads as no useful output.
+    for ln in out.get("lanes") or []:
+        if isinstance(ln, dict) and ln.get("key") == "whatsapp":
+            ln["useful"] = out["wa_decided"]
     # W124 (CRM T788): a job whose lanes are queued on the W122 stage gates has a frozen lanes
     # block, and the CRM's lead_gen_stop_stuck_jobs (T746) stops any job whose progress JSON
     # does not change for 10 min — five jobs died that way on 2026-09-19 while waiting for
