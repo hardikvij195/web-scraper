@@ -13,6 +13,14 @@
 
 ---
 
+- [x] **W141** `server.py` (CRM T1019, 2026-10-05, owner: "a google maps lane for any job running 24x7") — MI / ASUS /
+  DELL had every `max_inflight` slot held by jobs in enrichment / WhatsApp, so the Maps tab idled for hours with 100+
+  discovery jobs queued. One overflow slot above `max_inflight` is now reserved for a job that needs Maps:
+  `may_start_job()` lets a Maps job start at `len(inflight) == max` when `_disc_job is None` (never two overflows;
+  non-Maps jobs and the memory block unchanged); `capacity()` adds `maps_free` = Maps slot free, not memory-blocked, no
+  mirrored-unstarted job already needing Maps, `inflight < max + 1`. `lanes_free` / `discovery_free` unchanged; the
+  overflow job's lanes queue on the W122/W136 stage gates. 2.2.5, `tests/test_w141_maps_overflow.py`.
+
 - [ ] **W140** `wa_verify.py` / `agent.py` — after a CRM `restart now` (T1016, 21:19 IST) three WhatsApp lanes on ASUS/DELL
   died at `launch_persistent_context`: "Opening in existing browser session … profile is already in use" / "Target page,
   context or browser has been closed" — the relaunched agent opened the WhatsApp profile while the old process's Chrome

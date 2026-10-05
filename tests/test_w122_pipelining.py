@@ -150,19 +150,16 @@ def test_worker_pipelines_discovery_across_jobs_within_inflight_cap(_patched_wor
     assert _wait_until(lambda: w._disc_job == j3)
     assert sorted(w.inflight_jobs()) == [j1, j2, j3]
 
-    # Free job 3's discovery too -> the discovery slot is now free, but job 4 must NOT
-    # start: three jobs are already in flight (MAX_INFLIGHT_JOBS=3).
+    # Free job 3's discovery too -> the Maps slot is free and job 4 needs Maps: W141 lets it
+    # start as the ONE overflow job above the cap (3 in flight -> 4).
     pipes[j3].discovery_done.set()
     w.wake.set()
-    assert _wait_until(lambda: w._disc_job is None)
-    time.sleep(0.3)
-    assert j4 not in w.inflight_jobs()
-    assert sorted(w.inflight_jobs()) == [j1, j2, j3]
+    assert _wait_until(lambda: w._disc_job == j4)
+    assert sorted(w.inflight_jobs()) == [j1, j2, j3, j4]
 
     # Finish job 1 entirely (its thread exits) -> a slot frees -> job 4 can start.
     finish_events[j1].set()
     w.wake.set()
-    assert _wait_until(lambda: j4 in w.inflight_jobs())
     assert _wait_until(lambda: j1 not in w.inflight_jobs())
 
 

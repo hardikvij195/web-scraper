@@ -218,6 +218,16 @@ def fetch_known_cloud_keys(unique_new: bool, fetcher: Callable[[str | None], set
         return set()
 
 
+def may_start_job(needs_maps: bool, n_inflight: int, max_inflight: int, disc_free: bool) -> bool:
+    """W141 (CRM T1019): start rule for a queued local job. Non-Maps jobs obey max_inflight; a job
+    that NEEDS Maps may take ONE overflow slot (n_inflight == max_inflight) when the Maps tab is
+    free, so the tab never idles behind jobs sitting in enrichment / WhatsApp. Never two overflows:
+    at max+1 nothing starts, and a busy Maps tab blocks any discovery job."""
+    if needs_maps:
+        return disc_free and n_inflight < max_inflight + 1
+    return n_inflight < max_inflight
+
+
 def max_inflight_jobs() -> int:
     """W122/W128: how many jobs may be in flight (any lane running) at once. Google Maps
     discovery is still ONE job at a time (`_disc_job`, exactly two Chrome tabs total —
@@ -363,13 +373,16 @@ class Worker(threading.Thread):
         # time until the local queue held 5 for a max_inflight of 3 (ASUS/DELL, 2026-10-04 21:20
         # IST), jobs other machines could have run.
         pending = 0
+        pending_maps = 0
         try:
             s = Store()
             try:
                 with self._lock:
                     started = set(self._inflight)
-                pending = sum(1 for r in s.queued_jobs()
-                              if r["cloud_id"] is not None and int(r["id"]) not in started)
+                mirrored = [r for r in s.queued_jobs()
+                            if r["cloud_id"] is not None and int(r["id"]) not in started]
+                pending = len(mirrored)
+                pending_maps = sum(1 for r in mirrored if job_needs_discovery(r))
             finally:
                 s.close()
         except Exception:                                         # noqa: BLE001
@@ -379,6 +392,10 @@ class Worker(threading.Thread):
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,
                     "lanes_free": (not blocked) and inflight < max_inflight_jobs(),
+                    # W141 (CRM T1019): the Maps tab must never idle while a discovery job exists —
+                    # one overflow slot above max_inflight, reserved for a job that needs Maps.
+                    "maps_free": (self._disc_job is None) and not blocked and pending_maps == 0
+                                 and inflight < max_inflight_jobs() + 1,
                     "inflight": inflight, "started": len(self._inflight), "max_inflight": max_inflight_jobs(),
                     "memory_pct": mem.get("used_pct")}
 
@@ -407,8 +424,11 @@ class Worker(threading.Thread):
             # W122/W136 stage gates like any other), so no slot idles behind one discovery.
             mem_blocked = memory_blocked()
             with self._lock:
-                room = len(self._inflight) < max_inflight_jobs()
+                n_inflight = len(self._inflight)
+                max_inf = max_inflight_jobs()
                 disc_free = self._disc_job is None
+                # W141: one overflow slot above max_inflight, only for a job that needs Maps.
+                room = n_inflight < max_inf + 1
                 slot_free = room
                 can_start = room and not mem_blocked
             if slot_free and mem_blocked:
@@ -430,8 +450,8 @@ class Worker(threading.Thread):
                             store.update_job(int(cand["id"]), phase="waiting",
                                              message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
                         continue
-                    if not disc_free and job_needs_discovery(cand):
-                        continue                  # W138: Maps busy — look for a lane-only job
+                    if not may_start_job(job_needs_discovery(cand), n_inflight, max_inf, disc_free):
+                        continue                  # W138: Maps busy — lane-only job; W141: at max only a Maps job
                     job = cand
                     break
                 store.close()
