@@ -1337,9 +1337,11 @@ def _watchdog_should_restart(now: float, last_ok: float, last_attempt: float, la
 
 
 def _watchdog_restart(silent_sec: int) -> None:
-    """Flag the in-flight jobs (like the token-revoked path: the lanes poll `stop_requested`),
-    kill our Chromes so the next agent's launches are not swallowed, exit 3 — the supervisor
-    (`run-agent-loop.sh` / `.bat`) relaunches in 15 s."""
+    """Log the restart on every in-flight job WITHOUT flagging `stop_requested` (same choice as
+    the W137 `restart now` path): the relaunched agent's `_requeue_orphans` resumes them where
+    they stood instead of parking them for the CRM's 30-min auto-heal (owner 2026-10-05: lanes
+    24x7). Kill our Chromes so the next agent's launches are not swallowed, exit 3 — the
+    supervisor (`run-agent-loop.sh` / `.bat`) relaunches in 15 s."""
     log.error("watchdog: CRM loop silent for %ds — restarting the agent", silent_sec)
     cloud = _LOOP_WD.get("cloud")
     if cloud is not None and _CRM_LOG:
@@ -1352,14 +1354,13 @@ def _watchdog_restart(silent_sec: int) -> None:
         for cur in getattr(srv.worker, "inflight_jobs", lambda: [])():
             _st = Store()
             try:
-                _st.update_job(int(cur), stop_requested=1,
-                               message="stopped — the agent restarted itself (CRM loop hung)")
-                _st.log(int(cur), "job", "stopped: the agent's CRM loop hung for "
-                                         f"{silent_sec}s and the watchdog restarted it", level="warn")
+                _st.log(int(cur), "job", "the agent's CRM loop hung for "
+                                         f"{silent_sec}s — the watchdog restarted it; "
+                                         "this job resumes on the relaunch", level="warn")
             finally:
                 _st.close()
     except Exception:                                             # noqa: BLE001
-        log.debug("watchdog could not flag the running jobs", exc_info=True)
+        log.debug("watchdog could not log on the running jobs", exc_info=True)
     _close_browsers("watchdog restart")
     os._exit(3)
 
