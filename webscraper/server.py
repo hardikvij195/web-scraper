@@ -251,6 +251,22 @@ def may_start_job(lane: str | None, *, disc_free: bool, enrich_free: int, wa_fre
     return True
 
 
+#: W150 (CRM T1040): a CLAIMED job whose next lane is WhatsApp waits this long for a usable
+#: account before the agent gives it back to the CRM. ASUS / DELL (2026-10-06 15:30-17:10) claimed
+#: re-enrich follow-ups whose websites were already done, so the only lane left was WhatsApp — and
+#: their WhatsApp Web sat in "messages are downloading" (no usable account). `may_start_job` said
+#: no forever, the CRM errored the job after 5 min ("did not start"), auto-heal re-pinned it to the
+#: same machine, six times, then gave up: 14 jobs dead while both machines idled.
+WA_UNSTARTABLE_RELEASE_SEC = 120.0
+
+
+def unstartable_release_due(lane: str | None, wa_account: bool, is_cloud_job: bool,
+                            waited_sec: float, limit: float = WA_UNSTARTABLE_RELEASE_SEC) -> bool:
+    """True when a queued cloud job should be handed back: WhatsApp is its next lane, no account
+    can take it here, and it has waited `limit` seconds (W150)."""
+    return is_cloud_job and lane == LANE_WHATSAPP and not wa_account and waited_sec >= limit
+
+
 def max_inflight_jobs() -> int:
     """W144: a CRASH GUARD only — the most jobs this process will hold in flight at once, so a
     runaway queue can never open fifty Chromes. Scheduling is by LANE (`may_start_job`: Maps =
@@ -398,6 +414,8 @@ class Worker(threading.Thread):
         #: W129: monotonic time of the last "not starting a new job — memory" log line,
         #: so it prints at most once per 5 minutes instead of every 2s poll.
         self._last_mem_note = 0.0
+        #: W150: local job id -> when it was first refused for lack of a usable WhatsApp account.
+        self._wa_unstartable: dict[int, float] = {}
         #: W118 (CRM T765): set by the CRM agent (`run_agent`) to `CrmCloud.known_keys` —
         #: a local-only run (no `srv.worker.known_keys_fetcher`) or the old SaaS `Cloud`
         #: (no such method) both leave this `None`, so `unique_new` falls back to local-only.
@@ -587,7 +605,24 @@ class Worker(threading.Thread):
                         nl = self._next_lane(store, cand)
                         if not may_start_job(nl, disc_free=disc_free, enrich_free=enr_free, wa_free=wa_free,
                                              wa_account=wa_account, n_inflight=n_inflight, max_inflight=max_inf):
+                            # W150: a cloud job that only needs WhatsApp, on a machine with no usable
+                            # account, goes back to the CRM after WA_UNSTARTABLE_RELEASE_SEC instead of
+                            # sitting here until the CRM's 5-min "did not start" error re-pins it to us.
+                            # The 'no WhatsApp accounts' wording is what auto-heal step 8 re-queues UNPINNED.
+                            cid_local = int(cand["id"])
+                            is_cloud = cand["cloud_id"] is not None
+                            first = self._wa_unstartable.setdefault(cid_local, time.monotonic())
+                            if unstartable_release_due(nl, wa_account, is_cloud, time.monotonic() - first):
+                                self._wa_unstartable.pop(cid_local, None)
+                                msg = ("WhatsApp verify skipped — no WhatsApp accounts usable on this machine right now "
+                                       "(W150: released after %ds so a machine with a live session takes it)" % int(WA_UNSTARTABLE_RELEASE_SEC))
+                                store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
+                                store.log(cid_local, "job", msg, "warn")
+                                log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
+                            elif nl != LANE_WHATSAPP or wa_account:
+                                self._wa_unstartable.pop(cid_local, None)
                             continue                  # its lane is full (or no WA account) — leave it queued
+                        self._wa_unstartable.pop(int(cand["id"]), None)
                         job, lane = cand, nl
                         break
                 finally:

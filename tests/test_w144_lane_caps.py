@@ -67,6 +67,15 @@ def test_start_rule_crash_guard_and_memory_and_account():
     assert may_start_job(LANE_DISCOVERY, **_ok(wa_account=False)) is True       # only WhatsApp needs one
 
 
+def test_w150_unstartable_whatsapp_job_is_released_after_the_grace_period():
+    from webscraper.server import LANE_WHATSAPP, unstartable_release_due
+    assert unstartable_release_due(LANE_WHATSAPP, False, True, 119) is False
+    assert unstartable_release_due(LANE_WHATSAPP, False, True, 120) is True
+    assert unstartable_release_due(LANE_WHATSAPP, True, True, 999) is False      # an account is usable: just wait for the slot
+    assert unstartable_release_due(LANE_WHATSAPP, False, False, 999) is False    # local CLI job: nothing to hand back
+    assert unstartable_release_due(LANE_ENRICHMENT, False, True, 999) is False   # other lanes are not account-bound
+
+
 def test_max_inflight_is_a_crash_guard(monkeypatch):
     monkeypatch.delenv("MAX_INFLIGHT_JOBS", raising=False)
     monkeypatch.setattr(server_mod, "DEVICE_NAME", "", raising=False)
