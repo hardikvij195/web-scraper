@@ -359,6 +359,16 @@ def apply_stage_slots() -> dict[str, int]:
 #: another job is actually queued for that gate.
 YIELD_UNITS = {"enrichment": 20, "whatsapp": 25}
 YIELD_AFTER_SEC = 300.0
+#: W149 (CRM T1032): a lane this close to the end keeps its slot instead of yielding — with 8
+#: WhatsApp-only jobs round-robining 25 numbers a turn on ASUS, a job with 25 numbers left waited
+#: ~50 min per turn and nothing ever FINISHED (slots stayed held, the agents table read "waiting"
+#: for hours). Finishing small tails first frees in-flight slots for queued work.
+TAIL_KEEP_UNITS = {"enrichment": 40, "whatsapp": 50}
+
+
+def tail_keep(key: str, remaining: int | None) -> bool:
+    """True when a lane with `remaining` units left should finish without yielding (W149)."""
+    return remaining is not None and 0 < remaining <= TAIL_KEEP_UNITS.get(key, 0)
 
 
 
@@ -489,6 +499,19 @@ class Lane(threading.Thread):
     def stopped(self) -> bool:
         return bool(self.store and self.store.stop_requested(self.job_id))
 
+    def _remaining(self) -> int | None:
+        """Units this lane still has to process (W149 tail rule); None = unknown."""
+        if not self.store:
+            return None
+        try:
+            if self.key == "whatsapp":
+                return int(self.store.count_wa_pending(self.job_id))
+            if self.key == "enrichment":
+                return int(self.store.count_pending_enrichment(self.job_id))
+        except Exception:                                         # noqa: BLE001
+            return None
+        return None
+
     def _slice_done(self, n: int) -> bool:
         """W135 (CRM T1011): fair interleaving. Count `n` units into the current slice; once
         the slice is full (`YIELD_UNITS` / `YIELD_AFTER_SEC`) and another job is queued for
@@ -509,6 +532,8 @@ class Lane(threading.Thread):
         self._slice_t0 = time.monotonic()
         if not gate.others_waiting(self.job_id):
             return True                                  # lone job: keep the slot
+        if tail_keep(self.key, self._remaining()):
+            return True                                  # W149: almost done — finish, free the job
 
         def _note_limited(m: str) -> None:
             now = time.monotonic()

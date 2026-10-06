@@ -31,5 +31,23 @@ def test_busy_maps_tab_blocks_a_discovery_job():
 
 
 def test_crash_guard_is_the_only_job_count_that_matters():
-    assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD)) is False
+    # W149: ONE overflow slot above the guard for a discovery job (ASUS 8/8 WhatsApp-only, Maps idle 8 h)
+    assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD)) is True
+    assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD + 1)) is False
     assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD - 1)) is True
+    assert may_start_job(LANE_ENRICHMENT, **_args(enrich_free=1, n_inflight=GUARD)) is False   # lane-only: no overflow
+
+
+def test_memory_guard_still_holds_the_overflow_slot():
+    assert may_start_job(LANE_DISCOVERY, **_args(n_inflight=GUARD, mem_blocked=True)) is False
+
+
+def test_tail_keep_lets_an_almost_finished_lane_keep_its_slot():
+    from webscraper.lanes import tail_keep
+    assert tail_keep("whatsapp", 25) is True
+    assert tail_keep("whatsapp", 50) is True
+    assert tail_keep("whatsapp", 51) is False
+    assert tail_keep("whatsapp", 0) is False
+    assert tail_keep("whatsapp", None) is False
+    assert tail_keep("enrichment", 40) is True
+    assert tail_keep("discovery", 5) is False

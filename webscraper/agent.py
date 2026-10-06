@@ -1127,6 +1127,27 @@ def _start_whoami_server() -> None:
     threading.Thread(target=_serve, name="whoami", daemon=True).start()
 
 
+def _keep_awake() -> None:
+    """W149 (CRM T1032): stop Windows from sleeping while the agent runs. DELL slept for 14 min
+    mid-job on 2026-10-06 (13:08-13:22 IST, watchdog gap 856 s): every lane froze, two stuck
+    alerts fired, its WhatsApp session was logged out on wake. ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    keeps the SYSTEM (not the display) awake for the lifetime of this thread — run_agent is the
+    main thread, so it holds until the process exits. `AGENT_KEEP_AWAKE=0` opts out. The Mac
+    equivalent is `caffeinate` in run-agent-loop.sh (W146)."""
+    if sys.platform != "win32" or (os.getenv("AGENT_KEEP_AWAKE", "1") or "1").strip().lower() in ("0", "false", "no"):
+        return
+    try:
+        import ctypes
+        es_continuous, es_system_required = 0x80000000, 0x00000001
+        prev = ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required)
+        if prev:
+            log.info("keep-awake: system sleep blocked while the agent runs (W149; AGENT_KEEP_AWAKE=0 to allow)")
+        else:
+            log.warning("keep-awake: SetThreadExecutionState refused — keep this machine's sleep off by hand")
+    except Exception as e:                                        # noqa: BLE001
+        log.warning("keep-awake unavailable: %s", e)
+
+
 def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     if kind == "crm":
@@ -1144,6 +1165,7 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     _LOOP_WD.update(cloud=cloud, ok=time.monotonic())
     if kind == "crm":
         _start_loop_watchdog()
+    _keep_awake()
     # W102 (CRM T545): macOS starts a process with 256 open files. Six Chromes' worth of
     # Playwright drivers, three sqlite lanes, httpx and the log fit — until anything leaks,
     # and job #6619's WhatsApp lane died of `[Errno 24] Too many open files` after ~2 h.
@@ -1407,7 +1429,8 @@ def _start_loop_watchdog() -> threading.Thread | None:
             wall = time.time()
             if gap > 2 * LOOP_WATCHDOG_POLL_SEC:
                 log.warning("watchdog: this machine was asleep/suspended for ~%ds — keep it "
-                            "awake (plugged in, lid open; the Mac loop now runs caffeinate)", int(gap))
+                            "awake (plugged in, lid open; Windows: W149 keep-awake is on unless "
+                            "AGENT_KEEP_AWAKE=0; the Mac loop runs caffeinate)", int(gap))
                 _loop_wd_mark("ok")
                 continue
             lim = _limit()
@@ -2723,6 +2746,26 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 store.update_job(row["id"], stop_requested=1, note="synced")
                 store.log(row["id"], "job", f"stopping: job now runs on {reply.agent_device} (W114, CRM T624)", "warn")
         elif row["phase"] in ("done", "stopped", "failed"):
+            # W149 (CRM T1032): a job the CRM already stopped / moved is NOT re-sent. PC's local copy
+            # of #433 ended 00:36 under the park; its final sync ran 11 h later (11:54) and pushed
+            # 1,391 rows into a row MAC had since taken over, bumping the CRM's work clock on a job
+            # with no owner -> a stuck alert + auto-stop. The leads were streamed live during the
+            # run; the final re-send is a safety net, not a right.
+            if _cancelled_by_crm(store, int(row["id"])):
+                log.info("job #%s was stopped by the CRM — not re-sending its saved leads (W149)", cid)
+                store.update_job(row["id"], note="synced")
+                continue
+            try:
+                reply = _cloud_retry(lambda: cloud.progress(cid, row["phase"], _local_progress(row, store)),
+                                     f"final progress for #{cid}")
+            except httpx.HTTPError as e:
+                log.warning("final progress for #%s failed (sync still sent): %s", cid, e)
+                reply = None
+            if reply is not None and (reply.cancelled or reply.reassigned):
+                log.info("job #%s is %s in the CRM — not re-sending its saved leads (W149)", cid,
+                         "cancelled" if reply.cancelled else f"running on {reply.agent_device}")
+                store.update_job(row["id"], note="synced")
+                continue
             rows = store.places(row["id"])
             quota_hit = False
             for i in range(0, len(rows), 200):
@@ -2744,11 +2787,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                 # lanes ending, so without this the CRM row kept every lane as
                 # status=running / reason=None and had to guess: job #13 (2026-08-25)
                 # showed enrichment + WhatsApp "Completed" on 0 / 0 after discovery died.
-                try:
-                    _cloud_retry(lambda: cloud.progress(cid, row["phase"], _local_progress(row, store)),
-                                f"final progress for #{cid}")
-                except httpx.HTTPError as e:
-                    log.warning("final progress for #%s failed (done still sent): %s", cid, e)
+                # (W149: the final lane picture was pushed above, before the re-send.)
                 # W83: 'stopped' after every lane completed (a watchdog that fired during
                 # the after-job housekeeping, or Stop pressed as the last lane ended) is a
                 # finished job — the CRM row read "Error: discovery: completed · …" before.

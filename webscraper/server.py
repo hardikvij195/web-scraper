@@ -234,10 +234,16 @@ def may_start_job(lane: str | None, *, disc_free: bool, enrich_free: int, wa_fre
     it would only queue on the gate and look stuck. `max_inflight` is a crash guard only
     (`max_inflight_jobs()`), never a scheduling knob; `mem_blocked` is W129. A job with no
     lane work left (`lane is None`) just needs the guards: it ends in seconds."""
-    if mem_blocked or n_inflight >= max_inflight:
+    if mem_blocked:
         return False
     if lane == LANE_DISCOVERY:
-        return disc_free
+        # W149 (CRM T1032): ONE overflow slot above the crash guard for a discovery job. ASUS sat
+        # at 8/8 for 8 h with every job WhatsApp-only, waiting on the single WA slot, while 3
+        # discovery jobs stayed queued — the Maps tab idled because the guard counted the
+        # waiting jobs. A discovery job holds one Chrome tab; the guard still bounds the rest.
+        return disc_free and n_inflight < max_inflight + 1
+    if n_inflight >= max_inflight:
+        return False
     if lane == LANE_ENRICHMENT:
         return enrich_free > 0
     if lane == LANE_WHATSAPP:
@@ -502,7 +508,10 @@ class Worker(threading.Thread):
             inflight = len(self._inflight) + pending
             guard = max_inflight_jobs()
             ok = (not blocked) and inflight < guard
-            maps_free = ok and busy[LANE_DISCOVERY] == 0 and pending_by[LANE_DISCOVERY] == 0
+            # W149: the Maps flag allows the one overflow slot `may_start_job` grants a discovery
+            # job (inflight <= guard), so the CRM still offers discovery work at the guard.
+            maps_free = ((not blocked) and inflight <= guard
+                         and busy[LANE_DISCOVERY] == 0 and pending_by[LANE_DISCOVERY] == 0)
             enrich_free = ok and cap[LANE_ENRICHMENT] - busy[LANE_ENRICHMENT] - pending_by[LANE_ENRICHMENT] > 0
             wa_free = (ok and account
                        and cap[LANE_WHATSAPP] - busy[LANE_WHATSAPP] - pending_by[LANE_WHATSAPP] > 0)
@@ -550,7 +559,7 @@ class Worker(threading.Thread):
                 n_inflight = len(self._inflight)
                 max_inf = max_inflight_jobs()
                 disc_free = self._disc_job is None
-            room = n_inflight < max_inf
+            room = n_inflight < max_inf + 1          # W149: +1 = the discovery overflow slot
             if room and mem_blocked:
                 now = time.monotonic()
                 if now - self._last_mem_note >= 300:

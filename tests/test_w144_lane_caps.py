@@ -58,7 +58,9 @@ def test_start_rule_per_lane():
 
 
 def test_start_rule_crash_guard_and_memory_and_account():
-    assert may_start_job(LANE_DISCOVERY, **_ok(n_inflight=8, max_inflight=8)) is False
+    assert may_start_job(LANE_DISCOVERY, **_ok(n_inflight=8, max_inflight=8)) is True     # W149: one overflow slot for Maps
+    assert may_start_job(LANE_DISCOVERY, **_ok(n_inflight=9, max_inflight=8)) is False
+    assert may_start_job(LANE_WHATSAPP, **_ok(n_inflight=8, max_inflight=8)) is False     # lane-only jobs: no overflow
     assert may_start_job(LANE_ENRICHMENT, **_ok(n_inflight=7, max_inflight=8)) is True
     assert may_start_job(LANE_ENRICHMENT, **_ok(mem_blocked=True)) is False
     assert may_start_job(LANE_WHATSAPP, **_ok(wa_account=False)) is False       # no linked/enabled/unpaused account
@@ -195,8 +197,13 @@ def test_capacity_crash_guard_and_memory_block_everything(cap_env, monkeypatch):
     monkeypatch.setattr(server_mod, "max_inflight_jobs", lambda: 1)
     w._inflight[1] = None
     c = w.capacity()
-    assert not c["maps_free"] and not c["enrich_free"] and not c["wa_free"] and not c["lanes_free"]
+    # W149: at the guard the Maps tab may still take ONE discovery job (overflow slot); the other lanes may not
+    assert c["maps_free"] and not c["enrich_free"] and not c["wa_free"] and c["lanes_free"]
     assert c["hard_max"] == 1 and c["discovery_free"] is True       # the Maps tab itself is idle
+    w._inflight[2] = None                                           # one past the guard: nothing more
+    c = w.capacity()
+    assert not c["maps_free"] and not c["lanes_free"]
+    del w._inflight[2]
     monkeypatch.setattr(server_mod, "max_inflight_jobs", lambda: 8)
     monkeypatch.setattr(server_mod, "memory_blocked", lambda: True)
     c = w.capacity()
