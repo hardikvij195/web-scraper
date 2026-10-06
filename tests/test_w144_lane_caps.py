@@ -76,6 +76,19 @@ def test_w150_unstartable_whatsapp_job_is_released_after_the_grace_period():
     assert unstartable_release_due(LANE_ENRICHMENT, False, True, 999) is False   # other lanes are not account-bound
 
 
+def test_w151_ram_cap_and_shed_victim():
+    from webscraper.server import LANE_DISCOVERY, LANE_ENRICHMENT, LANE_WHATSAPP, pick_shed_victim, ram_inflight_cap
+    assert ram_inflight_cap(8365.5) == 5          # ASUS / MAC / MI
+    assert ram_inflight_cap(17072.8) == 10        # DELL
+    assert ram_inflight_cap(68469.9) == 12        # PC: hard ceiling
+    assert ram_inflight_cap(None) == 12           # unknown RAM: configured guard rules
+    assert ram_inflight_cap(2000) == 2            # floor
+    started = [(1, LANE_DISCOVERY), (2, LANE_WHATSAPP), (3, LANE_ENRICHMENT), (4, LANE_DISCOVERY)]
+    assert pick_shed_victim(started) == 3         # newest lane-only job, not the Maps job
+    assert pick_shed_victim([(1, LANE_DISCOVERY), (4, LANE_DISCOVERY)]) == 4
+    assert pick_shed_victim([(1, LANE_DISCOVERY)]) is None
+
+
 def test_max_inflight_is_a_crash_guard(monkeypatch):
     monkeypatch.delenv("MAX_INFLIGHT_JOBS", raising=False)
     monkeypatch.setattr(server_mod, "DEVICE_NAME", "", raising=False)

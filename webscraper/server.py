@@ -283,15 +283,58 @@ def max_inflight_jobs() -> int:
     raw = (os.getenv(f"MAX_INFLIGHT__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
         or os.getenv("MAX_INFLIGHT_JOBS") or "8"
     try:
-        return max(1, min(12, int(str(raw).strip())))
+        configured = max(1, min(12, int(str(raw).strip())))
     except ValueError:
-        return 8
+        configured = 8
+    # W151 (CRM T1045): the guard can never exceed what the machine's RAM carries. ASUS (8 GB)
+    # ran 9 jobs at 86-91 % RAM for 20 min on 2026-10-06, recycling browsers to breathe, then
+    # went silent at 18:22 with no error — a thrashing machine cannot run its own watchdog.
+    total = (last_memory() or {}).get("total_mb")
+    return min(configured, ram_inflight_cap(total))
+
+
+#: W151: ~1.6 GB of RAM per in-flight job (a Chrome tab or two + the enrichment fetchers).
+RAM_MB_PER_JOB = 1600.0
+
+
+def ram_inflight_cap(total_mb: float | None) -> int:
+    """Most jobs this machine's RAM supports: 8 GB -> 5, 16 GB -> 10, 32 GB+ -> 12 (W151).
+    Unknown RAM keeps the configured guard."""
+    if not total_mb or total_mb <= 0:
+        return 12
+    return max(2, min(12, int(float(total_mb) // RAM_MB_PER_JOB)))
+
+
+#: W151: above this RAM use (held for MEMORY_SHED_HOLD_SEC) the worker PARKS its most recently
+#: started lane-only job so the machine never crosses into swap-thrash. The W129 start guard
+#: (85 %) only stops NEW starts; nothing shed load before.
+MEMORY_SHED_PCT = float(os.getenv("MEMORY_SHED_PCT", "92") or 92)
+MEMORY_SHED_HOLD_SEC = 30.0
+MEMORY_SHED_COOLDOWN_SEC = 120.0
+
+
+def pick_shed_victim(started: list[tuple[int, str | None]]) -> int | None:
+    """Which in-flight job to park under memory pressure: the most recently started job that did
+    NOT start on Maps (a lane-only pass resumes anywhere, cheaply); failing that the newest job;
+    never the only job (W151). `started` = [(job_id, start_lane)] in start order."""
+    if len(started) < 2:
+        return None
+    for jid, lane in reversed(started):
+        if lane != LANE_DISCOVERY:
+            return jid
+    return started[-1][0]
 
 
 #: W129: cache for `healthcheck._memory()` (it shells out to sysctl/vm_stat/WMI) — good
 #: for 20s, refreshed lazily. [timestamp, reading].
 _MEM_CACHE: list[Any] = [0.0, None]
 _MEM_CACHE_SEC = 20.0
+
+
+def last_memory() -> dict | None:
+    """The most recent memory reading WITHOUT refreshing it (W151): the scheduling path must never
+    block on the WMI / sysctl probe — `memory_blocked()` in the worker loop keeps it fresh."""
+    return _MEM_CACHE[1]
 
 
 def _cached_memory() -> dict:
@@ -416,6 +459,10 @@ class Worker(threading.Thread):
         self._last_mem_note = 0.0
         #: W150: local job id -> when it was first refused for lack of a usable WhatsApp account.
         self._wa_unstartable: dict[int, float] = {}
+        #: W151: memory shedding clock — since when RAM has been above the shed line, last shed.
+        self._mem_high_since: float | None = None
+        self._last_shed_at = 0.0
+        self._shed_ids: set[int] = set()         # parked but not yet gone — never picked twice
         #: W118 (CRM T765): set by the CRM agent (`run_agent`) to `CrmCloud.known_keys` —
         #: a local-only run (no `srv.worker.known_keys_fetcher`) or the old SaaS `Cloud`
         #: (no such method) both leave this `None`, so `unique_new` falls back to local-only.
@@ -485,6 +532,39 @@ class Worker(threading.Thread):
         except Exception:                                         # noqa: BLE001
             enr = wa = None
         return job_next_lane(row, enr, wa)
+
+    def _shed_if_memory_high(self) -> None:
+        """W151: park one job when RAM stays above MEMORY_SHED_PCT for MEMORY_SHED_HOLD_SEC."""
+        used = (last_memory() or {}).get("used_pct")
+        now = time.monotonic()
+        if used is None or float(used) < MEMORY_SHED_PCT:
+            self._mem_high_since = None
+            return
+        if self._mem_high_since is None:
+            self._mem_high_since = now
+            return
+        if now - self._mem_high_since < MEMORY_SHED_HOLD_SEC or now - self._last_shed_at < MEMORY_SHED_COOLDOWN_SEC:
+            return
+        with self._lock:
+            self._shed_ids &= set(self._inflight)                        # forget the ones that left
+            started = [(jid, self._start_lane.get(jid)) for jid in self._inflight if jid not in self._shed_ids]
+        victim = pick_shed_victim(started) if len(started) + len(self._shed_ids) >= 2 else None
+        if victim is None:
+            return
+        self._last_shed_at = now
+        self._shed_ids.add(victim)
+        msg = (f"parked by the memory guard (W151): {float(used):.0f}% RAM used on this machine — "
+               f"re-queued, resumes on another machine or here once memory frees")
+        try:
+            store = Store()
+            try:
+                store.update_job(victim, stop_requested=1, message=msg)
+                store.log(victim, "job", msg, "warn")
+            finally:
+                store.close()
+            log.warning("memory %s%% >= %s%% for %ds — parking job #%s (W151)", used, MEMORY_SHED_PCT, int(MEMORY_SHED_HOLD_SEC), victim)
+        except Exception:                                         # noqa: BLE001
+            log.warning("memory shed: could not park job #%s", victim, exc_info=True)
 
     def capacity(self) -> dict[str, Any]:
         """Sent to the CRM (`agent.py` CrmCloud `jobs`/`claim` payloads) so the Edge
@@ -573,6 +653,7 @@ class Worker(threading.Thread):
             # W136), so a start never blocks a running job's lane. `max_inflight_jobs()` is only
             # the crash guard; W129 memory still holds every new start.
             mem_blocked = memory_blocked()
+            self._shed_if_memory_high()                          # W151
             with self._lock:
                 n_inflight = len(self._inflight)
                 max_inf = max_inflight_jobs()

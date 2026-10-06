@@ -7,6 +7,7 @@ block-shaped ones only, the site is retried once through a real Chromium — see
 `browser_fetch.py` for why and how little that path is allowed to cost."""
 from __future__ import annotations
 
+import os
 import asyncio
 import logging
 import re
@@ -434,6 +435,31 @@ async def _with_proxies(attempt: Callable[[str | None], Awaitable[Fetched]],
     return got
 
 
+#: W151: no real-Chrome enrichment fallback once RAM use is at or above this (env override).
+BROWSER_FALLBACK_MAX_MEM_PCT = float(os.getenv("BROWSER_FALLBACK_MAX_MEM_PCT", "80") or 80)
+_MEM_PCT_CACHE: list[Any] = [0.0, 0.0]
+
+
+def memory_pct_for_browser() -> float:
+    """Machine RAM use in %, cached 20 s; 0 when unknown (never blocks on a missing reading)."""
+    import time as _t
+    now = _t.monotonic()
+    if now - _MEM_PCT_CACHE[0] >= 20.0:
+        try:
+            from webscraper import healthcheck
+            used = healthcheck._memory().get("used_pct")
+            _MEM_PCT_CACHE[1] = float(used) if used is not None else 0.0
+        except Exception:                                         # noqa: BLE001
+            _MEM_PCT_CACHE[1] = 0.0
+        _MEM_PCT_CACHE[0] = now
+    return _MEM_PCT_CACHE[1]
+
+
+def browser_fallback_allowed() -> bool:
+    """W151: may the enrichment lane launch its real-Chrome fallback right now?"""
+    return memory_pct_for_browser() < BROWSER_FALLBACK_MAX_MEM_PCT
+
+
 async def crawl_site(client: httpx.AsyncClient, website: str,
                      browser_retry: Callable[[str], Awaitable[Any]] | None = None,
                      camoufox_retry: Callable[[str], Awaitable[tuple[str | None, str | None]]] | None = None,
@@ -599,6 +625,16 @@ async def enrich_places(store: Store, rows: list[dict[str, Any]], concurrency: i
     browser_lock = asyncio.Lock()
 
     async def browser_retry(url: str) -> tuple[str | None, str | None]:
+        # W151 (CRM T1045): the real-Chrome fallback is the THIRD browser on a machine already
+        # running Maps + WhatsApp Chromes. On the 8 GB laptops that is what pushed RAM to 91 %
+        # (ASUS, 2026-10-06 18:02-18:22, then a silent freeze). Above the line the blocked site
+        # stays 'blocked' for the follow-up pass instead of launching another Chrome now.
+        if not browser_fallback_allowed():
+            if not browser.get("mem_noted"):
+                browser["mem_noted"] = True
+                log.warning("browser fallback skipped — memory %.0f%% used (limit %.0f%%, W151); blocked sites wait for the follow-up pass",
+                            memory_pct_for_browser(), BROWSER_FALLBACK_MAX_MEM_PCT)
+            return None, None
         async with browser_lock:
             if browser["fetcher"] is None:
                 if browser["off"]:
