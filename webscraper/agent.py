@@ -572,6 +572,32 @@ def _local_progress(row: Any, store: Store | None = None) -> dict:
     return out
 
 
+def _maps_done_before(claimed: dict) -> bool:
+    """W157 (CRM T1047): did this job's Google Maps lane already run to completion on an earlier
+    pass? Read from the CRM row's `progress.lanes` (the resume hydrates from the CRM, so the local
+    `disc_reason` may belong to another machine or not exist)."""
+    try:
+        lanes = (claimed.get("progress") or {}).get("lanes") or claimed.get("lanes") or []
+        for l in lanes:
+            if isinstance(l, dict) and l.get("key") == "discovery":
+                return str(l.get("status") or "") in ("done", "completed") or str(l.get("reason") or "") == "completed"
+    except Exception:                                             # noqa: BLE001
+        return False
+    return False
+
+
+def _discovery_pending_for(claimed: dict) -> bool:
+    """W157: `discovery_pending` asks for a Maps RESUME (T746: the lane stopped at `maps_cap`, or
+    stubs were saved without details). When the Maps lane had already COMPLETED, a resume only
+    re-walks every tile for +0 links — MAC's #22556 and #22562 (2026-10-07) spent ~10 min each on
+    33 empty tiles while their websites lane idled at "100 %". A completed Maps lane is not resumed."""
+    want = bool(claimed.get("discovery_pending", False))
+    if want and _maps_done_before(claimed):
+        log.info("cloud job #%s: discovery_pending dropped — its Maps lane already completed (W157)", claimed.get("id"))
+        return False
+    return want
+
+
 _TERMINAL_PHASES = ("done", "stopped", "failed", "error", "cancelled")
 
 
@@ -2441,7 +2467,7 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         phase="queued", status="running", note=None, finished_at=None,
         stop_requested=0,
         reenrich_only=int(bool(claimed.get("reenrich_only", False))),
-        discovery_pending=int(bool(claimed.get("discovery_pending", False))),
+        discovery_pending=int(_discovery_pending_for(claimed)),
         do_enrich=int(bool(claimed.get("do_enrich", True))),
         do_wa_verify=int(bool(claimed.get("do_wa_verify", False))),
         place_keys=_place_keys_json(claimed),
@@ -2668,7 +2694,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                          # created as a scoped re-enrich would otherwise start a full Maps
                          # scrape of everything.
                          reenrich_only=int(bool(claimed.get("reenrich_only", False))),
-                         discovery_pending=int(bool(claimed.get("discovery_pending", False))),
+                         discovery_pending=int(_discovery_pending_for(claimed)),
                          place_keys=_place_keys_json(claimed),
                          enrich_scope=str(claimed.get("enrich_scope") or "all"),   # W76
                          locations=_json.dumps(locs) if isinstance(locs, list) and len(locs) > 1 else None)
