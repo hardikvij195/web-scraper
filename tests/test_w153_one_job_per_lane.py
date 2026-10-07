@@ -25,6 +25,7 @@ from webscraper.store import Store
 def _rule_on(monkeypatch):
     monkeypatch.delenv("LANE_ONE_JOB_PER_LANE", raising=False)
     monkeypatch.setattr(L.StageGate, "POLL_SEC", 0.005)
+    monkeypatch.setattr(L, "PARK_GRACE_SEC", 0.0)             # W160 grace is wall-clock; tests skip it
     L.reset_stage_gates()
     yield
     L.reset_stage_gates()
@@ -184,7 +185,13 @@ def test_pipeline_other_lanes_done(tmp_path: Path):
     job = {"do_enrich": 1, "do_research": 0, "do_wa_verify": 1, "country": "IN", "reenrich_only": 1}
     pipe = L.Pipeline(job_id, job, lambda lane: L.R_COMPLETED, store_factory=lambda: Store(path))
     assert not pipe.discovery.enabled(), "a re-enrich job has no Maps lane"
-    assert pipe.other_lanes_done(pipe.whatsapp) is False          # enrichment still to run
+    # W160: an enrichment lane that holds no slot yet is "not working" — the job may park if the
+    # WhatsApp gate is held by another job (PARK_GRACE_SEC gives the websites lane time to take a free slot)
+    assert pipe.other_lanes_done(pipe.whatsapp) is True
+    g = L.STAGE_GATES["enrichment"]
+    assert g.acquire(job_id, lambda: False, lambda m: None)
+    assert pipe.other_lanes_done(pipe.whatsapp) is False          # websites lane IS working now
+    g.release(job_id)
     pipe.enrichment.done.set()
     assert pipe.other_lanes_done(pipe.whatsapp) is True
     # W160: an alive WhatsApp lane that holds NO slot (idle, waiting for numbers) is not working
@@ -199,3 +206,14 @@ def test_pipeline_other_lanes_done(tmp_path: Path):
     assert full.discovery.enabled() and full.other_lanes_done(full.enrichment) is False
     full.discovery.done.set()
     assert full.other_lanes_done(full.enrichment) is True
+
+
+def test_park_grace_holds_off_the_park(monkeypatch):
+    """W160: within PARK_GRACE_SEC a blocked lane waits (its sibling may be about to take a free slot)."""
+    monkeypatch.setattr(L, "PARK_GRACE_SEC", 0.3)
+    gate = L.STAGE_GATES["whatsapp"]
+    assert gate.acquire(7, lambda: False, lambda m: None)
+    lane = _lane(job_id=8)
+    t0 = time.monotonic()
+    assert lane._acquire(gate) is False
+    assert time.monotonic() - t0 >= 0.3 and "parked by the lane rule" in lane.store.updates[-1]["message"]

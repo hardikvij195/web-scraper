@@ -421,6 +421,11 @@ def one_job_per_lane() -> bool:
 PARK_MSG = ("parked by the lane rule (W153): the {lane} lane on this machine is busy with job #{holder} — "
             "re-queued, resumes when a {lane} lane is free")
 
+#: W160: how long a lane waits on its gate before `_park_due` may park the job — long enough for the
+#: job's OTHER lanes to take a free slot (they start within the same second), so a job is never parked
+#: in the race where its websites lane was about to hold the websites slot.
+PARK_GRACE_SEC = 20.0
+
 
 def enrich_slots() -> int:
     """W135: jobs whose enrichment lane may run at once on this machine. CRM setting
@@ -739,11 +744,12 @@ class Lane(threading.Thread):
         """`gate.acquire` that also gives up — and parks the job — when `_park_due` becomes true
         while waiting. False = stopped or parked (the caller ends the lane R_STOPPED either way)."""
         parked = {"v": False}
+        t0 = time.monotonic()
 
         def stop_or_park() -> bool:
             if self.stopped():
                 return True
-            if self._park_due(gate):
+            if time.monotonic() - t0 >= PARK_GRACE_SEC and self._park_due(gate):
                 parked["v"] = True
                 return True
             return False
