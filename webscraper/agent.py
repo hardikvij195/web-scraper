@@ -1700,24 +1700,64 @@ def _do_update(cloud: "CrmCloud", cmd_id: int | None) -> tuple[bool, str | None]
                            capture_output=True, text=True).stdout.strip()
     result = f"already on {after}" if after == before else f"updated {before} → {after}, restarting"
     log.info("%s: %s", tag, result)
-    if cmd_id is not None:
-        cloud.command_done(int(cmd_id), True, result)
-    _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
-    _close_browsers(); os._exit(0)
+    # W178 (DELL 2026-10-07 11:51Z): the pull had already put 2.4.9 on disk when the
+    # command_done POST died on a DNS blip (getaddrinfo failed) — the exception skipped
+    # os._exit, the agent kept running the OLD code for 20 min and the CRM showed
+    # `cmd update/running`. The restart is unconditional now: ack (retried once), then exit.
+    try:
+        if cmd_id is not None:
+            _ack_command_done(cloud, int(cmd_id), True, result)
+    finally:
+        _exit_for_restart(cloud)
     return True, result                           # unreachable; keeps the signature honest
+
+
+#: W178: one retry of the command_done POST after this many seconds before giving up.
+ACK_RETRY_SEC = 5.0
+
+
+def _ack_command_done(cloud: "CrmCloud", cmd_id: int, ok: bool, result: str | None) -> bool:
+    """W178: close a restart-class command on the CRM, retrying once after ACK_RETRY_SEC.
+    Never raises — the caller restarts either way; on a double failure it logs that the
+    next heartbeat (which carries `agent_version`) is what will tell the CRM."""
+    for attempt in (1, 2):
+        try:
+            cloud.command_done(cmd_id, ok, result)
+            return True
+        except Exception as e:                    # network / DNS / 5xx — all the same here
+            if attempt == 1:
+                log.warning("ack to CRM failed (%s) — retrying once in %ds", e, int(ACK_RETRY_SEC))
+                time.sleep(ACK_RETRY_SEC)
+            else:
+                log.warning("ack to CRM failed (%s) — restarting anyway, the next heartbeat "
+                            "carries the new version", e)
+    return False
+
+
+def _exit_for_restart(cloud: "CrmCloud") -> None:
+    """W178: the one self-restart path for `update` / `restart`: ship the agent log (best
+    effort), close the browsers, exit 0 — the supervisor loop (run-agent-loop.sh/.bat)
+    brings us back on the code now on disk. Monkeypatched by the tests."""
+    import os as _os
+    try:
+        if _CRM_LOG:
+            _ship_agent_logs(cloud, _CRM_LOG[0])
+    except Exception as e:
+        log.debug("agent log ship before restart failed: %s", e)
+    _close_browsers(); _os._exit(0)
 
 
 def _do_restart(cloud: "CrmCloud", cmd_id: int | None) -> None:
     """W46: plain restart from the CRM — no pull. Same exit path as update; the supervisor
     loop brings us back and _requeue_orphans resumes anything left mid-run. `cmd_id` None =
     the deferred run (W100), whose command was already closed as "deferred"."""
-    import os as _os
     log.info("restart requested by the CRM" if cmd_id is not None
              else "deferred restart: this machine's job has finished — restarting now")
-    if cmd_id is not None:
-        cloud.command_done(int(cmd_id), True, "restarting")
-    _ship_agent_logs(cloud, _CRM_LOG[0]) if _CRM_LOG else None
-    _close_browsers(); _os._exit(0)
+    try:
+        if cmd_id is not None:
+            _ack_command_done(cloud, int(cmd_id), True, "restarting")   # W178: never blocks the exit
+    finally:
+        _exit_for_restart(cloud)
 
 
 #: W115 (CRM T646): opt-in (default ON) self-update. The fleet stayed on 1.9.3 while 1.9.4
