@@ -13,7 +13,8 @@ def test_release_rule(monkeypatch):
     assert not due(S.LANE_WHATSAPP, True, False, 10), "grace: the slot may free within seconds"
     assert not due(S.LANE_WHATSAPP, False, False, 999), "a local job is not the CRM's to re-route"
     assert not due(S.LANE_WHATSAPP, True, True, 999), "a job that still needs Maps is not lane-only"
-    assert not due(S.LANE_DISCOVERY, True, False, 999) and not due(None, True, False, 999)
+    assert due(S.LANE_DISCOVERY, True, True, 31), "W165: a Maps job behind a held Maps tab goes back too"
+    assert not due(S.LANE_DISCOVERY, True, True, 10) and not due(None, True, False, 999)
     monkeypatch.setenv("LANE_ONE_JOB_PER_LANE", "0")
     assert not due(S.LANE_WHATSAPP, True, False, 999), "old W144 behaviour: wait on the gate"
     assert S.LANE_BUSY_RELEASE_SEC == 30.0

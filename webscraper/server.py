@@ -278,10 +278,15 @@ LANE_BUSY_RELEASE_SEC = 30.0
 
 def lane_busy_release_due(lane: str | None, is_cloud_job: bool, needs_maps: bool, waited_sec: float,
                           limit: float = LANE_BUSY_RELEASE_SEC) -> bool:
-    """True when a queued cloud job waiting for a held enrichment / WhatsApp gate should go back to
-    the CRM (W155): lane-only (no Maps), the rule is on, and it has waited `limit` seconds."""
-    return (is_cloud_job and not needs_maps and lane in (LANE_ENRICHMENT, LANE_WHATSAPP)
-            and lanes_mod.one_job_per_lane() and waited_sec >= limit)
+    """True when a queued cloud job waiting for a held gate should go back to the CRM: the rule is on,
+    it has waited `limit` seconds, and either (W155) its next lane is enrichment / WhatsApp and it
+    needs no Maps, or (W165) its next lane IS Maps and this machine's Maps tab is held by another
+    job — ASUS claimed #22568 in a restart gap (12:19) and would have queued hours behind #22564."""
+    if not (is_cloud_job and lanes_mod.one_job_per_lane() and waited_sec >= limit):
+        return False
+    if lane == LANE_DISCOVERY:
+        return True
+    return (not needs_maps) and lane in (LANE_ENRICHMENT, LANE_WHATSAPP)
 
 
 def max_inflight_jobs() -> int:
@@ -569,9 +574,14 @@ class Worker(threading.Thread):
         return max(0, self._lane_cap(lane) - self._lane_busy(lane))
 
     def _lane_holder_label(self, store: Store, lane: str) -> str:
-        """W155: the CRM job id (cloud_id) of the job holding `lane`'s gate, else its local id."""
-        gate = lanes_mod.STAGE_GATES.get(lane)
-        ids = gate.holder_ids() if gate is not None else []
+        """W155: the CRM job id (cloud_id) of the job holding `lane`'s gate, else its local id.
+        W165: for Maps the holder is the Worker's `_disc_job`."""
+        if lane == LANE_DISCOVERY:
+            with self._lock:
+                ids = [self._disc_job] if self._disc_job is not None else []
+        else:
+            gate = lanes_mod.STAGE_GATES.get(lane)
+            ids = gate.holder_ids() if gate is not None else []
         if not ids:
             return "?"
         # W161: a WhatsApp re-verify (agent.py, no local row) holds the gate as `-cloud_id`.
