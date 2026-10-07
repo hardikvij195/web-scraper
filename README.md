@@ -109,3 +109,7 @@ Mac becomes pickable the moment its agent runs once.
    syncs results; verified leads (phone or email found) use 1 credit each and are POSTed to
    your webhook (Settings) with an `X-Signature` HMAC header.
 5. Buy credits in the Billing tab (Razorpay or PayU).
+
+## Reboot survival (W173)
+
+4. Survive an unattended reboot (W173 / T1046): the logon task only fires once someone signs in, so a laptop that Windows Update reboots stays at the login screen with the agent OFFLINE. Run once per agent laptop, elevated: `powershell -ExecutionPolicy Bypass -File scripts\enable-autologon.ps1` (Sysinternals Autologon, password kept as an LSA secret; `-Check` reports, `-Disable` reverts). Keep BitLocker on.

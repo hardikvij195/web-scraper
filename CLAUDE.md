@@ -139,3 +139,5 @@ W138: lanes of different jobs run together — the Worker starts a lane-only job
 while another job's Maps runs (`job_needs_discovery`, `capacity().lanes_free`, Edge Function offers only
 no-Maps jobs then), and websites crawl alongside Maps / WhatsApp whenever nobody else is queued for the
 websites slot (W76 is a priority, not a block). Machine-wide concurrency is still bounded by the slots.
+
+- W173 (T1046 root cause, 2026-10-07): agents never relaunch after an UNATTENDED reboot because the 'HVT Lead Finder Agent' task is AtLogOn/interactive (Chrome needs a desktop) and auto-logon is off → `scripts/enable-autologon.ps1` once per laptop (Sysinternals Autologon, LSA secret). Not a code bug.
