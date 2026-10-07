@@ -2502,6 +2502,20 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
             n = _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
             if n:
                 store.log(local_id, "job", f"pulled {n} lead(s) from the CRM to refresh this machine's copy")
+            # W166 (CRM T1047): the CRM's lane picture for a re-enrich follow-up still says "N websites
+            # pending" when every one of them already failed twice (T441 cutoff) — so the claim side
+            # offered #22561 to DELL (no WhatsApp session) as a websites job, the agent found nothing to
+            # crawl, released it (W155) and the CRM offered it again five minutes later. Report the
+            # true picture right away so `lead-finder-agent` classifies it WhatsApp-next.
+            try:
+                if int(store.count_pending_enrichment(local_id)) == 0:
+                    row = store.get_job(local_id)
+                    if row is not None:
+                        cloud.progress(cj["id"], "queued", _local_progress(row, store))
+                        store.log(local_id, "job", "nothing left to crawl on this re-enrich (every website already "
+                                                   "had its two tries) — told the CRM; WhatsApp is the only lane left (W166)")
+            except Exception:                                     # noqa: BLE001 — a status hint, never fatal
+                log.debug("W166 lane report skipped", exc_info=True)
         except Exception:                                         # noqa: BLE001
             log.warning("could not hydrate the re-enrich from the CRM", exc_info=True)
     srv.worker.wake.set()                        # do not wait out the poll interval

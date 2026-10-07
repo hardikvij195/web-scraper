@@ -276,6 +276,19 @@ def unstartable_release_due(lane: str | None, wa_account: bool, is_cloud_job: bo
 LANE_BUSY_RELEASE_SEC = 30.0
 
 
+def release_message(lane: str, holder: str, wa_account: bool) -> str:
+    """W155 / W166: the text a released-before-start job carries back to the CRM. Always starts with
+    `parked by the lane rule` (what `lead_gen_requeue_orphans()` matches). DELL 12:52 (#22561) read
+    "busy with job #?" when the truth was "no WhatsApp session on this machine" — say which."""
+    if holder == "?":
+        why = ("no WhatsApp session on this machine" if lane == LANE_WHATSAPP and not wa_account
+               else f"the {lane} lane has no free slot here")
+        return (f"parked by the lane rule (W155, released before it started): {why} — re-queued, "
+                f"resumes on a machine with a free {lane} lane")
+    return (lanes_mod.PARK_MSG.format(lane=lane, holder=holder)
+            .replace("(W153)", "(W155, released before it started)"))
+
+
 def lane_busy_release_due(lane: str | None, is_cloud_job: bool, needs_maps: bool, waited_sec: float,
                           limit: float = LANE_BUSY_RELEASE_SEC) -> bool:
     """True when a queued cloud job waiting for a held gate should go back to the CRM: the rule is on,
@@ -781,8 +794,7 @@ class Worker(threading.Thread):
                                 # W155: one job per lane — hand it back rather than hold it unstarted.
                                 self._wa_unstartable.pop(cid_local, None)
                                 self._lane_wait_since.pop(cid_local, None)
-                                msg = lanes_mod.PARK_MSG.format(lane=nl, holder=self._lane_holder_label(store, nl)) \
-                                    .replace("(W153)", "(W155, released before it started)")
+                                msg = release_message(nl, self._lane_holder_label(store, nl), wa_account)
                                 store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
                                 store.log(cid_local, "job", msg, "warn")
                                 log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
