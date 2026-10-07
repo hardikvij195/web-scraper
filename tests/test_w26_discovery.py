@@ -87,13 +87,16 @@ def test_pending_enrichment_excludes_stubs(db):
 
 
 def test_migration_marks_old_rows_detailed(db):
+    # W172: the backfill now runs only when `detail_status` is CREATED by _migrate (a pre-W26 database),
+    # not on every re-open — so simulate the old schema by dropping the column before the insert.
     jid = _job(db)
     s = db()
-    s.conn.execute("INSERT INTO places(job_id, place_key, name, enrich_status, detail_status) "
-                   "VALUES (?,?,?,'pending',NULL)", (jid, "old", "Old"))
+    s.conn.execute("ALTER TABLE places DROP COLUMN detail_status")
+    s.conn.execute("INSERT INTO places(job_id, place_key, name, enrich_status) "
+                   "VALUES (?,?,?,'pending')", (jid, "old", "Old"))
     s.conn.commit()
     s.close()
-    s = db()                       # re-open → _migrate runs
+    s = db()                       # re-open → _migrate adds the column and backfills existing rows once
     assert s.places(jid)[0]["detail_status"] == "done"
     assert [r["place_key"] for r in s.pending_enrichment(jid)] == ["old"]
     s.close()
