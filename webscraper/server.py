@@ -737,120 +737,132 @@ class Worker(threading.Thread):
                     "max_inflight": guard, "hard_max": guard,
                     "memory_pct": mem.get("used_pct")}
 
-    def run(self) -> None:  # noqa: C901 — linear orchestration, fine
+    def run(self) -> None:
+        # W168 (CRM T1047): DELL 13:2x — "did not start within 5 min — the agent's worker thread is dead".
+        # One unhandled exception in a tick used to end the Worker thread for good (every queued job then
+        # died by the 5-min failer until the agent restarted itself). A tick that raises is logged with
+        # its traceback (the agent log syncs to the CRM) and the loop carries on.
         while True:
-            # 1. reap finished job threads.
-            for jid in [j for j, th in self._threads.items() if not th.is_alive()]:
-                del self._threads[jid]
-                with self._lock:
-                    self._inflight.pop(jid, None)
-                    self._start_lane.pop(jid, None)
-                    if self._disc_job == jid:
-                        self._disc_job = None
+            try:
+                self._tick()
+            except Exception:                                 # noqa: BLE001
+                log.exception("worker tick failed — continuing after 2 s (W168)")
+                time.sleep(2.0)
 
-            # 2. free the discovery slot once that job no longer needs the Maps tab.
+    def _tick(self) -> None:  # noqa: C901 — linear orchestration, fine
+        """One pass of the scheduler: reap finished jobs, free the Maps tab, start what fits, wait."""
+        # 1. reap finished job threads.
+        for jid in [j for j, th in self._threads.items() if not th.is_alive()]:
+            del self._threads[jid]
             with self._lock:
-                disc_job = self._disc_job
-                disc_pipe = self._inflight.get(disc_job) if disc_job is not None else None
-            if disc_job is not None and disc_pipe is not None and disc_pipe.discovery_slot_free():
-                with self._lock:
-                    if self._disc_job == disc_job:
-                        self._disc_job = None
+                self._inflight.pop(jid, None)
+                self._start_lane.pop(jid, None)
+                if self._disc_job == jid:
+                    self._disc_job = None
 
-            # 3. W144: start the next queued job whose FIRST lane has a free slot right now —
-            # Maps tab free for a discovery job, an enrichment / WhatsApp gate slot (minus lanes
-            # already on the gate and starts already promised) for a lane-only job, plus a usable
-            # account for WhatsApp. Lanes of a started job queue on the gates as before (W122/
-            # W136), so a start never blocks a running job's lane. `max_inflight_jobs()` is only
-            # the crash guard; W129 memory still holds every new start.
-            mem_blocked = memory_blocked()
-            self._shed_if_memory_high()                          # W151
+        # 2. free the discovery slot once that job no longer needs the Maps tab.
+        with self._lock:
+            disc_job = self._disc_job
+            disc_pipe = self._inflight.get(disc_job) if disc_job is not None else None
+        if disc_job is not None and disc_pipe is not None and disc_pipe.discovery_slot_free():
             with self._lock:
-                n_inflight = len(self._inflight)
-                max_inf = max_inflight_jobs()
-                disc_free = self._disc_job is None
-            room = n_inflight < max_inf + 1          # W149: +1 = the discovery overflow slot
-            if room and mem_blocked:
-                now = time.monotonic()
-                if now - self._last_mem_note >= 300:
-                    self._last_mem_note = now
-                    mem = _cached_memory()
-                    limit = os.getenv("MEMORY_START_MAX_PCT", "85") or "85"
-                    log.warning("not starting a new job — memory %s%% used (limit %s%%)",
-                                mem.get("used_pct"), limit)
-            if room and not mem_blocked:
-                store = Store()
-                job = None
-                lane: str | None = None
-                try:
-                    wa_account = wa_account_usable(store)
-                    enr_free = self._lane_free(LANE_ENRICHMENT)
-                    wa_free = self._lane_free(LANE_WHATSAPP)
-                    # W167: a lane an in-flight job still has work for is not free, even between batches
-                    if enr_free and self._lane_claimed(store, LANE_ENRICHMENT):
-                        enr_free = 0
-                    if wa_free and self._lane_claimed(store, LANE_WHATSAPP):
-                        wa_free = 0
-                    # First queued job whose window is open and whose next lane has room; jobs
-                    # outside their window show 'waiting'. The CRM queues highest-priority-first.
-                    for cand in store.queued_jobs():
-                        if not in_window(cand["window_start"], cand["window_end"]):
-                            if cand["phase"] != "waiting":
-                                store.update_job(int(cand["id"]), phase="waiting",
-                                                 message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
-                            continue
-                        nl = self._next_lane(store, cand)
-                        if not may_start_job(nl, disc_free=disc_free, enrich_free=enr_free, wa_free=wa_free,
-                                             wa_account=wa_account, n_inflight=n_inflight, max_inflight=max_inf):
-                            # W150: a cloud job that only needs WhatsApp, on a machine with no usable
-                            # account, goes back to the CRM after WA_UNSTARTABLE_RELEASE_SEC instead of
-                            # sitting here until the CRM's 5-min "did not start" error re-pins it to us.
-                            # The 'no WhatsApp accounts' wording is what auto-heal step 8 re-queues UNPINNED.
-                            cid_local = int(cand["id"])
-                            is_cloud = cand["cloud_id"] is not None
-                            first = self._wa_unstartable.setdefault(cid_local, time.monotonic())
-                            since = self._lane_wait_since.setdefault(cid_local, time.monotonic())
-                            if unstartable_release_due(nl, wa_account, is_cloud, time.monotonic() - first):
-                                self._wa_unstartable.pop(cid_local, None)
-                                self._lane_wait_since.pop(cid_local, None)
-                                msg = ("WhatsApp verify skipped — no WhatsApp accounts usable on this machine right now "
-                                       "(W150: released after %ds so a machine with a live session takes it)" % int(WA_UNSTARTABLE_RELEASE_SEC))
-                                store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
-                                store.log(cid_local, "job", msg, "warn")
-                                log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
-                            elif lane_busy_release_due(nl, is_cloud, job_needs_discovery(cand), time.monotonic() - since):
-                                # W155: one job per lane — hand it back rather than hold it unstarted.
-                                self._wa_unstartable.pop(cid_local, None)
-                                self._lane_wait_since.pop(cid_local, None)
-                                msg = release_message(nl, self._lane_holder_label(store, nl), wa_account)
-                                store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
-                                store.log(cid_local, "job", msg, "warn")
-                                log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
-                            elif nl != LANE_WHATSAPP or wa_account:
-                                self._wa_unstartable.pop(cid_local, None)
-                            continue                  # its lane is full (or no WA account) — leave it queued
-                        self._wa_unstartable.pop(int(cand["id"]), None)
-                        self._lane_wait_since.pop(int(cand["id"]), None)
-                        job, lane = cand, nl
-                        break
-                finally:
-                    store.close()
-                if job is not None:
-                    job_id = int(job["id"])
-                    with self._lock:
-                        if lane == LANE_DISCOVERY:
-                            self._disc_job = job_id
-                        self._inflight[job_id] = None
-                        self._start_lane[job_id] = lane
-                    if lane != LANE_DISCOVERY:
-                        log.info("job #%s needs no Maps — starting it for its %s lane alongside the running "
-                                 "jobs (W138/W144)", job_id, lane or "closing")
-                    th = threading.Thread(target=self._run_job, args=(job,), name=f"job-{job_id}", daemon=True)
-                    self._threads[job_id] = th
-                    th.start()
+                if self._disc_job == disc_job:
+                    self._disc_job = None
 
-            self.wake.wait(timeout=2.0)
-            self.wake.clear()
+        # 3. W144: start the next queued job whose FIRST lane has a free slot right now —
+        # Maps tab free for a discovery job, an enrichment / WhatsApp gate slot (minus lanes
+        # already on the gate and starts already promised) for a lane-only job, plus a usable
+        # account for WhatsApp. Lanes of a started job queue on the gates as before (W122/
+        # W136), so a start never blocks a running job's lane. `max_inflight_jobs()` is only
+        # the crash guard; W129 memory still holds every new start.
+        mem_blocked = memory_blocked()
+        self._shed_if_memory_high()                          # W151
+        with self._lock:
+            n_inflight = len(self._inflight)
+            max_inf = max_inflight_jobs()
+            disc_free = self._disc_job is None
+        room = n_inflight < max_inf + 1          # W149: +1 = the discovery overflow slot
+        if room and mem_blocked:
+            now = time.monotonic()
+            if now - self._last_mem_note >= 300:
+                self._last_mem_note = now
+                mem = _cached_memory()
+                limit = os.getenv("MEMORY_START_MAX_PCT", "85") or "85"
+                log.warning("not starting a new job — memory %s%% used (limit %s%%)",
+                            mem.get("used_pct"), limit)
+        if room and not mem_blocked:
+            store = Store()
+            job = None
+            lane: str | None = None
+            try:
+                wa_account = wa_account_usable(store)
+                enr_free = self._lane_free(LANE_ENRICHMENT)
+                wa_free = self._lane_free(LANE_WHATSAPP)
+                # W167: a lane an in-flight job still has work for is not free, even between batches
+                if enr_free and self._lane_claimed(store, LANE_ENRICHMENT):
+                    enr_free = 0
+                if wa_free and self._lane_claimed(store, LANE_WHATSAPP):
+                    wa_free = 0
+                # First queued job whose window is open and whose next lane has room; jobs
+                # outside their window show 'waiting'. The CRM queues highest-priority-first.
+                for cand in store.queued_jobs():
+                    if not in_window(cand["window_start"], cand["window_end"]):
+                        if cand["phase"] != "waiting":
+                            store.update_job(int(cand["id"]), phase="waiting",
+                                             message=f"waiting for run window {cand['window_start']}–{cand['window_end']}")
+                        continue
+                    nl = self._next_lane(store, cand)
+                    if not may_start_job(nl, disc_free=disc_free, enrich_free=enr_free, wa_free=wa_free,
+                                         wa_account=wa_account, n_inflight=n_inflight, max_inflight=max_inf):
+                        # W150: a cloud job that only needs WhatsApp, on a machine with no usable
+                        # account, goes back to the CRM after WA_UNSTARTABLE_RELEASE_SEC instead of
+                        # sitting here until the CRM's 5-min "did not start" error re-pins it to us.
+                        # The 'no WhatsApp accounts' wording is what auto-heal step 8 re-queues UNPINNED.
+                        cid_local = int(cand["id"])
+                        is_cloud = cand["cloud_id"] is not None
+                        first = self._wa_unstartable.setdefault(cid_local, time.monotonic())
+                        since = self._lane_wait_since.setdefault(cid_local, time.monotonic())
+                        if unstartable_release_due(nl, wa_account, is_cloud, time.monotonic() - first):
+                            self._wa_unstartable.pop(cid_local, None)
+                            self._lane_wait_since.pop(cid_local, None)
+                            msg = ("WhatsApp verify skipped — no WhatsApp accounts usable on this machine right now "
+                                   "(W150: released after %ds so a machine with a live session takes it)" % int(WA_UNSTARTABLE_RELEASE_SEC))
+                            store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
+                            store.log(cid_local, "job", msg, "warn")
+                            log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
+                        elif lane_busy_release_due(nl, is_cloud, job_needs_discovery(cand), time.monotonic() - since):
+                            # W155: one job per lane — hand it back rather than hold it unstarted.
+                            self._wa_unstartable.pop(cid_local, None)
+                            self._lane_wait_since.pop(cid_local, None)
+                            msg = release_message(nl, self._lane_holder_label(store, nl), wa_account)
+                            store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
+                            store.log(cid_local, "job", msg, "warn")
+                            log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
+                        elif nl != LANE_WHATSAPP or wa_account:
+                            self._wa_unstartable.pop(cid_local, None)
+                        continue                  # its lane is full (or no WA account) — leave it queued
+                    self._wa_unstartable.pop(int(cand["id"]), None)
+                    self._lane_wait_since.pop(int(cand["id"]), None)
+                    job, lane = cand, nl
+                    break
+            finally:
+                store.close()
+            if job is not None:
+                job_id = int(job["id"])
+                with self._lock:
+                    if lane == LANE_DISCOVERY:
+                        self._disc_job = job_id
+                    self._inflight[job_id] = None
+                    self._start_lane[job_id] = lane
+                if lane != LANE_DISCOVERY:
+                    log.info("job #%s needs no Maps — starting it for its %s lane alongside the running "
+                             "jobs (W138/W144)", job_id, lane or "closing")
+                th = threading.Thread(target=self._run_job, args=(job,), name=f"job-{job_id}", daemon=True)
+                self._threads[job_id] = th
+                th.start()
+
+        self.wake.wait(timeout=2.0)
+        self.wake.clear()
 
     def _run_job(self, job: sqlite3.Row) -> None:
         from webscraper.enrich import enrich_places

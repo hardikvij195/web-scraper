@@ -2458,10 +2458,31 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         "SELECT id FROM jobs WHERE cloud_id=? AND cloud_kind=?", (cj["id"], kind)).fetchone()
     if not row:
         return
+    local_id = int(row["id"])
+    try:
+        inflight = local_id in getattr(getattr(srv, "worker", None), "_inflight", {})
+    except Exception:                                             # noqa: BLE001
+        inflight = False
+    if inflight:
+        # W168 (CRM T1047): the CRM re-queued a job this machine is STILL running (an operator re-queue
+        # during a 15-min heartbeat gap, 13:12). Re-queuing it locally started a SECOND pipeline for the
+        # same local job; its WhatsApp lane then waited on the slot its own first pipeline held. Keep the
+        # running pipeline, tell the CRM it is alive here, and let its progress pings re-claim the row.
+        log.warning("cloud job #%s re-run requested but local job #%s is still running here — keeping it (W168)",
+                    cj["id"], local_id)
+        store.log(local_id, "job", "re-run requested by the CRM while this job is still running on this machine — "
+                                   "kept the running pipeline (W168)", "warn")
+        try:
+            r2 = store.get_job(local_id)
+            if r2 is not None:
+                cloud.claim(cj["id"])
+                cloud.progress(cj["id"], _cloud_phase(r2), _local_progress(r2, store))
+        except Exception:                                         # noqa: BLE001
+            log.debug("W168 re-claim ping failed", exc_info=True)
+        return
     claimed = cloud.claim(cj["id"])
     if claimed is None:
         return                                   # another agent got there first
-    local_id = int(row["id"])
     # T920: use `claim()`'s full row from here on, never the (possibly slimmed) list row `cj`.
     store.update_job(
         local_id,

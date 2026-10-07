@@ -305,7 +305,13 @@ class StageGate:
 
     def acquire(self, job_id: int, stopped: Callable[[], bool], on_wait: Callable[[str], None]) -> bool:
         with self._cond:
-            if job_id not in self._queue and job_id not in self._holders:
+            if job_id in self._holders:
+                # W168 (CRM T1047): a lane asking for a slot it already holds must not queue behind
+                # itself — MI's #22565 (13:13-13:33) logged "waiting for the whatsapp slot — held by
+                # job #342" for 20 min where #342 was the job itself (a second pipeline for the same
+                # local job). Holding is holding.
+                return True
+            if job_id not in self._queue:
                 self._queue.append(job_id)
         noted_at: float | None = None
         while True:

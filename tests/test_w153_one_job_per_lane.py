@@ -217,3 +217,12 @@ def test_park_grace_holds_off_the_park(monkeypatch):
     t0 = time.monotonic()
     assert lane._acquire(gate) is False
     assert time.monotonic() - t0 >= 0.3 and "parked by the lane rule" in lane.store.updates[-1]["message"]
+
+
+def test_acquire_is_idempotent_for_the_holder():
+    """W168: a lane that already holds the slot gets True at once — never 'held by job #<itself>'."""
+    gate = L.STAGE_GATES["whatsapp"]
+    assert gate.acquire(5, lambda: False, lambda m: None)
+    t0 = time.monotonic()
+    assert gate.acquire(5, lambda: False, lambda m: None) is True
+    assert time.monotonic() - t0 < 0.5 and gate.holds(5) and 5 not in gate._queue
