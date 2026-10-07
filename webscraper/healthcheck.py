@@ -116,6 +116,7 @@ def _wa_session() -> dict:
     # `wa_not_logged_in` in every job. Report what was last actually SEEN.
     seen: dict[str, tuple[str, str]] = {}
     relink: dict[str, str] = {}          # W143: account -> since when it needs a QR relink
+    stuck: dict[str, str] = {}           # W171: account -> since when it is benched (linked, sync never finishes)
     try:
         from webscraper.store import Store
         for row in Store().list_wa_accounts():
@@ -123,18 +124,27 @@ def _wa_session() -> dict:
                 seen[str(row["name"])] = (str(row["status"]), str(row.get("status_at") or ""))
             if row.get("needs_relink"):
                 relink[str(row["name"])] = str(row.get("needs_relink_at") or "")
+            elif row.get("sync_stuck"):
+                stuck[str(row["name"])] = str(row.get("sync_stuck_at") or "")
     except Exception:                                             # noqa: BLE001 — no store yet
         pass
 
     def _label(a: str) -> str:
-        if a in relink:                                           # W143: read by the CRM agents table
-            return (f"{a}: NEEDS RELINK (sync never finished, since {_hhmm(relink[a])} — the agent re-probes it "
-                    "every 5 min; press Start session, a QR is only needed if one shows)")
+        # The CRM parses this text: `lead_gen_wa_usable` strips `NOT linked|NEEDS RELINK` then tests
+        # ~* 'linked'; the agents table turns NEEDS RELINK into an owner to-do. So the W171 benched
+        # label must contain neither "linked" (nor "unlinked") nor "NEEDS RELINK" — the machine then
+        # reads as not WA-usable without raising a to-do.
+        if a in relink:                                           # W143 / W171: proof-based (QR screen seen)
+            return (f"{a}: NEEDS RELINK (since {_hhmm(relink[a])} — the phone removed this device; WhatsApp Web "
+                    "showed its QR screen, so scan a QR via Start session)")
+        if a in stuck:                                            # W171
+            return (f"{a}: STUCK SYNCING (WhatsApp Web on this machine never finished syncing since "
+                    f"{_hhmm(stuck[a])} — session intact, auto-retry every 5 min, no action needed)")
         st, at = seen.get(a, ("unknown", ""))
         when = f" {_ago(at)}" if at else ""
         return f"{a}: {'linked' if st == 'logged_in' else 'NOT linked' if st == 'logged_out' else 'unchecked'}{when}"
 
-    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in" and a not in relink]
+    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in" and a not in relink and a not in stuck]
     detail = "WhatsApp accounts — " + ("; ".join(_label(a) for a in live) if live else "none")
     # Only a profile we have SEEN logged in counts as ok; unchecked stays a warning
     # rather than a green tick, because "we never looked" is not "it works".

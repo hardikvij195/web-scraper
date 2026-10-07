@@ -35,13 +35,18 @@ class _S(_Store):
     """Store fake with the W143 flag."""
     def __init__(self):
         self.flags: dict[str, bool] = {}
+        self.stuck: dict[str, bool] = {}                          # W171
         self.logs: list[str] = []
 
     def list_wa_accounts(self):
-        return [{"name": "acc1", "disabled": 0, "needs_relink": int(self.flags.get("acc1", False))}]
+        return [{"name": "acc1", "disabled": 0, "needs_relink": int(self.flags.get("acc1", False)),
+                 "sync_stuck": int(self.stuck.get("acc1", False))}]
 
     def set_wa_needs_relink(self, name, flag):
         self.flags[name] = flag
+
+    def set_wa_sync_stuck(self, name, flag):                       # W171
+        self.stuck[name] = flag
 
     def log(self, job_id, lane, message, level="info"):
         self.logs.append(message)
@@ -92,11 +97,12 @@ def test_episodes_pause_then_recover_then_relink(wa, monkeypatch):
     assert any("full browser recovery" in m for m in st.logs)
     assert st.flags == {}
 
+    monkeypatch.setattr(wv, "_relink_probe", lambda name: "logged_out")   # W171: the QR screen = proof
     r4 = wv.verify_places(st, _rows(25), job_id=7)            # episode 4: needs_relink, no more pauses
-    assert r4["sync_blocked"] is False and r4["needs_relink"] == 1
-    assert st.flags == {"acc1": True}
-    assert any(m.startswith("WhatsApp [acc1] needs a fresh QR relink — WhatsApp Web never finished syncing (4 episodes, ")
-               for m in st.logs)
+    assert r4["sync_blocked"] is False and r4["needs_relink"] == 1 and r4["sync_stuck"] == 0
+    assert st.flags == {"acc1": True} and st.stuck == {}
+    assert any(m.startswith("WhatsApp [acc1] needs a fresh QR relink — the phone removed this device: ")
+               and "after 4 zero-verdict episodes" in m for m in st.logs)
     assert "acc1" not in wv._RESYNC_EPISODES
 
     with pytest.raises(wv.WaNotLoggedIn, match="need a fresh QR relink: acc1"):
@@ -172,8 +178,9 @@ def test_store_flag_and_checks_string(monkeypatch, tmp_path):
     monkeypatch.setattr("webscraper.store.Store", lambda *a, **k: Store(path))
     chk = hc._wa_session()
     assert chk["ok"] is False
-    assert chk["detail"].startswith("WhatsApp accounts — main: NEEDS RELINK (sync never finished, since ")
-    assert chk["detail"].split("since ", 1)[1][:5].count(":") == 1   # HH:MM (W152 appends the Start-session hint)
+    assert chk["detail"].startswith("WhatsApp accounts — main: NEEDS RELINK (since ")   # W171 wording
+    assert chk["detail"].split("since ", 1)[1][:5].count(":") == 1   # HH:MM
+    assert "linked" not in chk["detail"], "the CRM's lead_gen_wa_usable tests ~* 'linked' after stripping NEEDS RELINK"
 
     s.set_wa_needs_relink("main", False)                          # what a finished wa_login does
     assert s.enabled_wa_accounts() == ["main"]

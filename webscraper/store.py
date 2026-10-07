@@ -436,7 +436,10 @@ class Store:
         # until a QR login clears it (never auto-wiped — the history survives a relink).
         acols = {r[1] for r in self.conn.execute("PRAGMA table_info(wa_accounts)")}
         for col, typ in (("status", "TEXT"), ("status_at", "TEXT"),
-                         ("needs_relink", "INTEGER NOT NULL DEFAULT 0"), ("needs_relink_at", "TEXT")):
+                         ("needs_relink", "INTEGER NOT NULL DEFAULT 0"), ("needs_relink_at", "TEXT"),
+                         # W171: linked but WhatsApp Web on THIS machine never finishes syncing — benched,
+                         # re-probed every 5 min, no QR / owner to-do (the MI false flag of 2026-10-07).
+                         ("sync_stuck", "INTEGER NOT NULL DEFAULT 0"), ("sync_stuck_at", "TEXT")):
             if col not in acols:
                 self.conn.execute(f"ALTER TABLE wa_accounts ADD COLUMN {col} {typ}")
         # W71: how many crawls a lead has had. Two failures is the cutoff (T441): the
@@ -1102,10 +1105,13 @@ class Store:
                 # finished because the machine was frozen, not because the phone unlinked); the owner's
                 # "Start session" found them already linked, no QR. Any sighting of a logged-in
                 # profile — a probe, a lane opening it, a login — ends the flag, not only `wa_login`.
+                # W171: the same sighting ends a `sync_stuck` bench — the chat list IS a finished sync.
                 try:
-                    self.conn.execute("UPDATE wa_accounts SET needs_relink=0, needs_relink_at=NULL "
-                                      "WHERE name=? AND COALESCE(needs_relink,0)=1", (name,))
-                except sqlite3.Error:                         # pre-W143 schema: no flag to clear
+                    self.conn.execute("UPDATE wa_accounts SET needs_relink=0, needs_relink_at=NULL, "
+                                      "sync_stuck=0, sync_stuck_at=NULL "
+                                      "WHERE name=? AND (COALESCE(needs_relink,0)=1 OR COALESCE(sync_stuck,0)=1)",
+                                      (name,))
+                except sqlite3.Error:                         # pre-W143 / pre-W171 schema: no flag to clear
                     pass
             self.conn.commit()
         self._write(f"wa_accounts {name}", _do)
@@ -1119,12 +1125,24 @@ class Store:
             self.conn.commit()
         self._write(f"wa_accounts needs_relink {name}", _do)
 
+    def set_wa_sync_stuck(self, name: str, flag: bool) -> None:
+        """W171: bench / un-bench an account that is linked but whose WhatsApp Web never finishes
+        syncing on this machine. Benched = out of `pick_wa_account` / `enabled_wa_accounts`, in
+        `flagged_wa_accounts` (re-probed every 5 min); any `logged_in` sighting or verdict clears it."""
+        def _do() -> None:
+            self.conn.execute("UPDATE wa_accounts SET sync_stuck=?, sync_stuck_at=? WHERE name=?",
+                              (1 if flag else 0, now_iso() if flag else None, name))
+            self.conn.commit()
+        self._write(f"wa_accounts sync_stuck {name}", _do)
+
     def flagged_wa_accounts(self) -> list[str]:
         """W152: enabled accounts the W143 ladder flagged `needs_relink` — the relink wait re-probes
-        these (`lanes._reprobe_flagged`) instead of waiting for a human to press Start session."""
+        these (`lanes._reprobe_flagged`) instead of waiting for a human to press Start session.
+        W171: `sync_stuck` (benched) accounts are re-probed the same way."""
         try:
             return [str(r[0]) for r in self.conn.execute(
-                "SELECT name FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=1 ORDER BY name")]
+                "SELECT name FROM wa_accounts WHERE disabled=0 AND (COALESCE(needs_relink,0)=1 "
+                "OR COALESCE(sync_stuck,0)=1) ORDER BY name")]
         except sqlite3.Error:                                     # pre-W143 schema
             return []
 
@@ -1133,7 +1151,7 @@ class Store:
         try:
             return self.conn.execute(
                 "SELECT 1 FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=0 "
-                "AND status='logged_in' AND status_at>=? LIMIT 1",
+                "AND COALESCE(sync_stuck,0)=0 AND status='logged_in' AND status_at>=? LIMIT 1",
                 (since_iso,)).fetchone() is not None
         except sqlite3.Error:                                     # pre-W64 schema: no status column
             return False
@@ -1188,15 +1206,18 @@ class Store:
         return sum(max(0, cap - int(r[0])) for r in rows)
 
     def enabled_wa_accounts(self) -> list[str]:
+        """Accounts a lane may open: enabled, not `needs_relink` (W143), not `sync_stuck` (W171)."""
         return [r[0] for r in self.conn.execute(
-            "SELECT name FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=0 ORDER BY name")]
+            "SELECT name FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=0 "
+            "AND COALESCE(sync_stuck,0)=0 ORDER BY name")]
 
     def pick_wa_account(self, cap: int, today: str, exclude: set[str] | None = None) -> str | None:
         """Enabled account with remaining cap today, least-recently-used first (rotation).
         `exclude` (W93): names skipped for this run without touching their `disabled` flag."""
         self._roll_day(today)
         # cap <= 0 = unlimited: rotate over every enabled account regardless of today's count.
-        where = "disabled=0 AND COALESCE(needs_relink,0)=0" + (" AND sent_today<?" if cap > 0 else "")   # W143
+        where = ("disabled=0 AND COALESCE(needs_relink,0)=0 AND COALESCE(sync_stuck,0)=0"      # W143 / W171
+                 + (" AND sent_today<?" if cap > 0 else ""))
         args: tuple = (cap,) if cap > 0 else ()
         if exclude:
             where += " AND name NOT IN (" + ",".join("?" for _ in exclude) + ")"

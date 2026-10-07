@@ -445,7 +445,8 @@ def job_next_lane(row: Any, enrich_pending: int | None = None, wa_pending: int |
 
 def wa_account_usable(store: Store) -> bool:
     """W144: can a WhatsApp lane start on this machine right now? An account that is linked,
-    enabled, not `needs_relink` (W143, `enabled_wa_accounts`) and not paused by a CRM command
+    enabled, not `needs_relink` (W143) / `sync_stuck` (W171) — both via `enabled_wa_accounts` — and not
+    paused by a CRM command
     (W142 `_PAUSED`)."""
     try:
         from webscraper import wa_verify

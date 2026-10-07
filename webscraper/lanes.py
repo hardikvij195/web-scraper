@@ -131,6 +131,8 @@ def wa_reprobe_force_min() -> float:
 
 def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
     """W152: probe every `needs_relink` account; True when one showed its chat list (link is fine).
+    W171: `sync_stuck` (benched, linked) accounts are probed the same way; a chat list un-benches
+    them, a rendered QR screen is the proof that turns the bench into a true `needs_relink`.
 
     W170: memory gate = the WhatsApp lane's own (`memory_high_for_whatsapp`, 88 %), not the 80 %
     enrichment gate; a probe deferred for >= WA_REPROBE_FORCE_MIN minutes runs regardless."""
@@ -160,6 +162,11 @@ def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
         lane.note(f"WhatsApp relink re-probe forced after {int(deferred_min)} min — the flag must not stay "
                   "stuck behind the memory gate", "info")
     _REPROBE_DEFERRED_SINCE = None                                # a probe runs: reset the deferral clock
+    try:
+        stuck = {str(r["name"]) for r in store.list_wa_accounts()
+                 if r.get("sync_stuck") and not r.get("needs_relink")}
+    except Exception:                                             # noqa: BLE001 — fakes / old schema
+        stuck = set()
     ok = False
     for name in names:
         try:
@@ -170,10 +177,26 @@ def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
             log.warning("[%s] relink re-probe failed: %s", name, str(e).splitlines()[0][:160])
             continue
         if state == "logged_in":
-            lane.note(f"WhatsApp [{name}] is still linked — the NEEDS RELINK flag was a false alarm (WhatsApp Web "
-                      "never finished syncing while this machine was under load); cleared it, WhatsApp lane resuming",
-                      "info")
+            if name in stuck:                                     # W171: Store.set_wa_status cleared the bench
+                lane.note(f"WhatsApp [{name}] synced again — benched flag cleared, WhatsApp lane resuming", "info")
+            else:
+                lane.note(f"WhatsApp [{name}] is still linked — the NEEDS RELINK flag was a false alarm (WhatsApp Web "
+                          "never finished syncing while this machine was under load); cleared it, WhatsApp lane resuming",
+                          "info")
             ok = True
+        elif name in stuck:
+            if state == "logged_out":
+                # W171: the QR screen was rendered — that IS the proof; the bench becomes a true flag.
+                try:
+                    store.set_wa_sync_stuck(name, False)
+                    store.set_wa_needs_relink(name, True)
+                except Exception:                                 # noqa: BLE001 — db busy: next probe retries
+                    pass
+                lane.note(f"WhatsApp [{name}] re-probed: the phone removed this device (QR screen shown) — "
+                          "flagged NEEDS RELINK; scan a QR via Start session", "error")
+            else:
+                lane.note(f"WhatsApp [{name}] re-probed: {str(state).replace('_', ' ')} — still stuck syncing on "
+                          "this machine (session intact); retrying in 5 min, no QR needed", "info")
         else:
             lane.note(f"WhatsApp [{name}] re-probed: {str(state).replace('_', ' ')} — still needs a QR relink from "
                       "Lead Finder > Systems > WhatsApp login", "info")
@@ -1364,6 +1387,7 @@ class WhatsAppLane(Lane):
                     res["sync_blocked"] = (any(bool(r.get("sync_blocked")) for r in results)
                                            and res["yes"] + res["no"] == 0)
                     res["needs_relink"] = sum(int(r.get("needs_relink", 0) or 0) for r in results)
+                    res["sync_stuck"] = sum(int(r.get("sync_stuck", 0) or 0) for r in results)   # W171
                 else:
                     res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
                                                   job_id=self.job_id, headless=hl)
@@ -1430,8 +1454,16 @@ class WhatsAppLane(Lane):
                 # W143: the ladder flagged the account(s) — no park. The next batch finds no enabled
                 # account and takes the W110 relink wait; the CRM shows NEEDS RELINK in the self-check.
                 self._sync_parks = 0
-                self.note(f"{res['needs_relink']} WhatsApp account(s) flagged NEEDS RELINK — WhatsApp Web never "
-                          "finished syncing; open Lead Finder > Systems > WhatsApp login and scan the QR", "error")
+                self.note(f"{res['needs_relink']} WhatsApp account(s) flagged NEEDS RELINK — the phone removed this "
+                          "device (QR screen shown); open Lead Finder > Systems > WhatsApp login and scan the QR", "error")
+                continue
+            if res.get("sync_stuck"):
+                # W171: linked, but WhatsApp Web on this machine never finishes syncing — benched, no
+                # park, no owner to-do. The next batch finds no enabled account and takes the W110
+                # relink wait, whose W152 re-probe un-benches it the moment a chat list renders.
+                self._sync_parks = 0
+                self.note(f"{res['sync_stuck']} WhatsApp account(s) benched — linked but WhatsApp Web on this "
+                          "machine is stuck syncing; re-probing every 5 min, no QR needed", "info")
                 continue
             if res.get("sync_blocked"):
                 # W137: nothing decided — WhatsApp Web on this machine never left its sync

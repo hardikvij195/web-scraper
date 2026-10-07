@@ -115,9 +115,12 @@ WA_SYNC_STRIKES = 3
 #: re-sync episodes (a slice that benched the account and decided nothing), module-level so it
 #: survives jobs: episodes 1-2 the lane parks as before; episode 3 = full browser recovery (kill the
 #: profile's Chrome, clear its lock files, relaunch, ONE long sync wait — cheaper than 90 short
-#: ones); episode 4 = the account is flagged `needs_relink` (out of rotation until a QR login) and
-#: the lane runs on as if no account were linked. Any yes/no verdict resets the ladder. The profile
-#: is never wiped: the owner's history survives a relink.
+#: ones); episode 4 = PROBE the profile first (W171, MI 2026-10-07 false flag): only a link-device /
+#: QR screen flags `needs_relink` (out of rotation until a QR login); a chat list, a blank page or a
+#: still-syncing splash means the phone is still linked and the account is benched `sync_stuck`
+#: instead (auto re-probed every 5 min, no owner to-do). Either way the lane runs on as if no
+#: account were linked. Any yes/no verdict resets the ladder. The profile is never wiped: the
+#: owner's history survives a relink.
 WA_RESYNC_RECOVERY_EPISODE = 3
 WA_RESYNC_RELINK_EPISODE = 4
 WA_RESYNC_LONG_WAIT_SEC = 900.0
@@ -161,6 +164,20 @@ def resync_reset(name: str) -> None:
     """W143: a decided verdict ends the account's re-sync ladder."""
     _RESYNC_EPISODES.pop(name, None)
     _RESYNC_FIRST_AT.pop(name, None)
+
+
+def _relink_probe(name: str) -> str:
+    """W171: the proof step at ladder episode 4 — `account_status` on the (closed) profile.
+
+    'logged_out' = the link-device screen was rendered = the phone really dropped this device, the
+    only thing that may set `needs_relink`. 'logged_in' / 'unknown' (blank, still syncing, Chrome
+    would not paint) = a load symptom on THIS machine, never proof of a logout. A probe that throws
+    answers 'unknown'."""
+    try:
+        return account_status(name)
+    except Exception as e:                                        # noqa: BLE001
+        log.warning("[%s] relink proof probe failed: %s", name, str(e).splitlines()[0][:160])
+        return "unknown"
 
 
 def note_sync_duration(name: str, sec: float) -> None:
@@ -799,11 +816,16 @@ def verify_places(
     counts = {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}
 
     all_accounts = store.list_wa_accounts()
-    accounts = [a for a in all_accounts if not a["disabled"] and not a.get("needs_relink")]
+    accounts = [a for a in all_accounts if not a["disabled"] and not a.get("needs_relink")
+                and not a.get("sync_stuck")]                   # W171: benched = out of rotation too
     if not accounts:
         relink = [str(a["name"]) for a in all_accounts if a.get("needs_relink")]
         if relink:                                                # W143
             raise WaNotLoggedIn(f"WhatsApp account(s) need a fresh QR relink: {', '.join(relink)}")
+        stuck = [str(a["name"]) for a in all_accounts if a.get("sync_stuck")]
+        if stuck:                                                 # W171: linked, benched on this machine
+            raise WaNotLoggedIn("WhatsApp account(s) linked but stuck syncing on this machine (benched, "
+                                f"re-probed every 5 min): {', '.join(stuck)}")
         raise WaNotLoggedIn("no WhatsApp accounts - run `python -m webscraper wa-login <name>` first")
 
     open_ctx: dict[str, Any] = {}      # name -> (pw_ctx, page); all closed in `finally`
@@ -971,6 +993,7 @@ def verify_places(
     requeue_tries: dict[tuple[str, str], int] = {}   # W115: (place_key, num) -> re-queues so far
     sync_strikes: dict[str, int] = {}      # W137: account -> consecutive sync non-answers
     sync_benched: set[str] = set()         # W137: accounts benched this slice for re-syncing
+    stuck_cleared: set[str] = set()        # W171: accounts whose verdict already cleared `sync_stuck`
     try:
         if targets:
             pw = sync_playwright().start()
@@ -1117,6 +1140,12 @@ def verify_places(
             if status in ("yes", "no"):
                 sync_strikes[name] = 0                             # W137: a real answer clears the strikes
                 resync_reset(name)                                 # W143: and ends the re-sync ladder
+                if name not in stuck_cleared:                      # W171: a verdict proves the sync works
+                    stuck_cleared.add(name)
+                    try:
+                        store.set_wa_sync_stuck(name, False)
+                    except Exception:                             # noqa: BLE001 — db busy / legacy store
+                        pass
             # W131 (2026-09-19): recycle this account's Chrome every `WA_RELAUNCH_EVERY`
             # checks. Each verdict is a full `page.goto` of a wa.me send URL, so the WhatsApp
             # tab grows exactly the way W120 measured on the Maps tab (0.5 -> 1.45 GB over ~40
@@ -1177,6 +1206,7 @@ def verify_places(
         # W143: the per-account re-sync ladder. Runs while the driver is still up so episode 3 can
         # relaunch the profile right here and wait one long sync out.
         counts["needs_relink"] = 0
+        counts["sync_stuck"] = 0                                  # W171
         blocked = False
         if sync_benched and counts["yes"] + counts["no"] == 0:
             for name in sorted(sync_benched):
@@ -1190,17 +1220,36 @@ def verify_places(
                     blocked = True
                 elif step == "relink":
                     mins = int((time.time() - first) / 60)
-                    msg = (f"WhatsApp [{name}] needs a fresh QR relink — WhatsApp Web never finished "
-                           f"syncing ({ep} episodes, {mins} min)")
-                    log.error("%s", msg)
-                    if job_id is not None:
-                        store.log(job_id, "whatsapp", msg, "error")
-                    try:
-                        store.set_wa_needs_relink(name, True)
-                    except Exception:                             # noqa: BLE001 — db busy: the next slice retries
-                        log.warning("[%s] could not flag needs_relink (db busy)", name)
+                    # W171 (MI 2026-10-07 15:24, Maps at 84-87 % RAM): four zero-verdict slices are a
+                    # load / Chrome symptom, not proof the phone unlinked — the owner was told to press
+                    # Start session and found it already linked. Probe first; only a rendered
+                    # link-device screen flags `needs_relink`, anything else benches `sync_stuck`.
+                    _close_account(name)
+                    proof = _relink_probe(name)
+                    if proof == "logged_out":
+                        msg = (f"WhatsApp [{name}] needs a fresh QR relink — the phone removed this device: "
+                               f"WhatsApp Web showed its link-device screen after {ep} zero-verdict episodes "
+                               f"({mins} min); scan a QR via Start session")
+                        log.error("%s", msg)
+                        if job_id is not None:
+                            store.log(job_id, "whatsapp", msg, "error")
+                        try:
+                            store.set_wa_needs_relink(name, True)
+                        except Exception:                         # noqa: BLE001 — db busy: the next slice retries
+                            log.warning("[%s] could not flag needs_relink (db busy)", name)
+                        counts["needs_relink"] += 1
+                    else:
+                        msg = (f"WhatsApp [{name}] is linked but WhatsApp Web on this machine is stuck syncing "
+                               f"({ep} episodes, {mins} min) — benched here, retrying every 5 min; no QR needed")
+                        log.info("%s (probe: %s)", msg, proof)
+                        if job_id is not None:
+                            store.log(job_id, "whatsapp", msg, "info")
+                        try:
+                            store.set_wa_sync_stuck(name, True)
+                        except Exception:                         # noqa: BLE001 — db busy: the next slice retries
+                            log.warning("[%s] could not bench sync_stuck (db busy)", name)
+                        counts["sync_stuck"] += 1
                     resync_reset(name)
-                    counts["needs_relink"] += 1
                 else:
                     log.warning("[%s] re-sync episode %d with no verdict — the lane parks; episode %d = browser "
                                 "recovery, %d = needs relink (W143)", name, ep,

@@ -44,6 +44,10 @@ data/           gitignored: leads.db, browser profiles, exports
   digits. `record_wa_check` re-derives `wa_verified` (any yes -> yes, all no -> no, else unknown),
   `whatsapp_number`, `wa_numbers`. Unknown re-offered once; settled at `checks >= 2` (CRM uses the same).
   Never assume a WhatsApp; numbers stored `+E.164`.
+- **WhatsApp account flags (W171):** `needs_relink` ONLY on proof — a probe that rendered the QR / link-device
+  screen (`account_status` -> `logged_out`). Zero-verdict sync episodes bench the account `sync_stuck` instead
+  (out of rotation, re-probed every 5 min, self-check label `STUCK SYNCING`, never an owner to-do). The CRM
+  parses the label: a benched label must contain neither `linked` (nor `unlinked`) nor `NEEDS RELINK`.
 - **Chrome profiles are ours to kill** (T397): `Relauncher(profile_dir=)` evicts the holder,
   `close_blank_pages`, `mark_profile_clean` + `RESTORE_BUBBLE_ARGS`. Crash recovery = `browser_recovery`.
   W120: Maps contexts are recycled every N places/tiles (`Relauncher.recycle`) because a long-lived
