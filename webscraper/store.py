@@ -409,6 +409,10 @@ class Store:
             # W26: 1 while the discovery OPENER has a place panel in flight (the collector
             # thread's tiling does not count — it produces links, not places).
             ("disc_active", "INTEGER NOT NULL DEFAULT 0"),
+            # W158 (CRM T1047): the Maps COLLECTOR's tile progress for THIS run, so the discovery lane
+            # can carry a real ETA once every found place is opened but tiles are still being walked
+            # (a resume / a sparse area read "189/189 · estimating…" for 12 min while 33 tiles ran).
+            ("tiles_done", "INTEGER NOT NULL DEFAULT 0"), ("tiles_total", "INTEGER"), ("tiles_started_at", "TEXT"),
             # W59: the WhatsApp lane's own window choice. NULL = follow the agent's
             # WA_VERIFY_HEADLESS setting, which is what every run did before. It is
             # separate from `headless` because the two lanes want opposite things:
@@ -599,8 +603,25 @@ class Store:
             self.conn.execute(
                 f"UPDATE jobs SET {started}=?, {ended}=NULL, {ok}=NULL, {reason}=NULL WHERE id=?",
                 (now_iso(), job_id))
+            if lane == "discovery":                               # W158: tiles belong to one run
+                try:
+                    self.conn.execute("UPDATE jobs SET tiles_done=0, tiles_total=NULL, tiles_started_at=NULL WHERE id=?",
+                                      (job_id,))
+                except sqlite3.Error:
+                    pass
             self.conn.commit()
         self._write(f"jobs row {job_id} (lane_start {lane})", _do)
+
+    def set_tiles(self, job_id: int, total: int | None = None, done: int | None = None) -> None:
+        """W158: record the collector's tile progress. `total` may be re-announced after a W50 split;
+        `done` is the 1-based index of the tile just finished. The first call stamps `tiles_started_at`."""
+        def _do() -> None:
+            self.conn.execute(
+                "UPDATE jobs SET tiles_total=COALESCE(?, tiles_total), tiles_done=COALESCE(?, tiles_done), "
+                "tiles_started_at=COALESCE(tiles_started_at, ?) WHERE id=?",
+                (total, done, now_iso(), job_id))
+            self.conn.commit()
+        self._write(f"jobs row {job_id} (tiles)", _do)
 
     def lane_disabled(self, job_id: int, lane: str) -> None:
         """Mark a lane this job will not run, and CLEAR its stamps.

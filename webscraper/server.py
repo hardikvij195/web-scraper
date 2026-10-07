@@ -922,6 +922,7 @@ class Worker(threading.Thread):
                     elif kind == "center_failed":
                         store.update_job(job_id, message=f"{pfx}couldn't resolve the location on Maps — radius ignored")
                     elif kind == "tiles":
+                        store.set_tiles(job_id, total=int(data["count"]))                # W158
                         store.update_job(job_id, message=f"{pfx}radius split into {data['count']} search tiles…")
                     elif kind == "tile_split":
                         # W50: a tile that hit Maps' result cap is being re-searched as 4 finer tiles.
@@ -980,6 +981,7 @@ class Worker(threading.Thread):
                     elif kind == "tile":
                         # W26 collector: one line per tile so the log shows links landing
                         # while the opener is already working through the earlier ones.
+                        store.set_tiles(job_id, total=int(data["tiles"]), done=int(data["tile"]))   # W158
                         store.log(job_id, "discovery",
                                   f"tile {data['tile']}/{data['tiles']}: +{data['added']} links, total {data['total']}")
                     elif kind == "collect_failed":

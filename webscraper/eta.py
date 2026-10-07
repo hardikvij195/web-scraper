@@ -97,6 +97,29 @@ PHASE_LANE = {
 #: so adding it in would systematically over-quote.
 LANE_RATE_PHASE = {"discovery": "scraping", "enrichment": "enriching", "whatsapp": "verifying_wa"}
 
+#: W158 (CRM T1047): seconds one Maps search tile takes when this run has not finished a tile yet.
+#: Measured 2026-10-07: 33 tiles in 702 s on MAC (#22556), ~21 s each; a dense tile with splits runs
+#: longer, which the live rate (tiles done so far / time since the first tile) picks up.
+DEFAULT_TILE_SEC = 21.0
+
+
+def tile_eta(row: Any, now: datetime) -> tuple[Optional[float], Optional[int], Optional[int]]:
+    """W158: (eta_sec, tiles_done, tiles_total) for the discovery lane's COLLECTOR — the ETA is None
+    when there is no tile total or every tile is done. Live rate = elapsed since the first tile /
+    tiles done; `DEFAULT_TILE_SEC` before the first tile finishes."""
+    total = _get(row, "tiles_total")
+    done = int(_get(row, "tiles_done", 0) or 0)
+    if total is None:
+        return None, (done or None), None
+    total = int(total)
+    if done >= total:
+        return None, done, total
+    started = _ts(_get(row, "tiles_started_at"))
+    per = DEFAULT_TILE_SEC
+    if done > 0 and started is not None:
+        per = max(3.0, (now - started).total_seconds() / done)
+    return (total - done) * per, done, total
+
 #: Mirror of `Store.LANE_COLS` -- (started, ended, ok, reason). Duplicated on purpose so
 #: this module stays pure/importable without a DB handle; keep the two in step.
 LANE_COLS = {
@@ -393,6 +416,13 @@ def lanes(row: Any, store: Any = None, now: Optional[datetime] = None) -> list[d
             elif key == "discovery" and total is None and maps_left is not None:
                 # Unlimited discovery: the only honest estimate is "until the cap".
                 eta, src = maps_left, "budget"
+            # W158: the collector is still walking tiles — the opener may have nothing left to open
+            # (done == total, eta 0) while 20 tiles are still to be searched. The lane ends when
+            # BOTH are done, so the ETA is the longer of the two.
+            if key == "discovery" and status == "running":
+                t_eta, _td, _tt = tile_eta(row, now)
+                if t_eta is not None and (eta is None or t_eta > eta):
+                    eta, src = t_eta, "tiles"
             # Discovery is the one lane with a hard stop; the other two drain the backlog
             # for as long as it takes, so nothing caps them.
             if key == "discovery" and eta is not None and maps_left is not None:
@@ -420,6 +450,9 @@ def lanes(row: Any, store: Any = None, now: Optional[datetime] = None) -> list[d
             "ok": st["ok"],
             "reason": "disabled" if not en[key] else st["reason"],
             "ran_sec": st["ran_sec"],
+            # W158: the Maps collector's tile progress (discovery only; None on the other lanes).
+            "tiles_done": tile_eta(row, now)[1] if key == "discovery" else None,
+            "tiles_total": tile_eta(row, now)[2] if key == "discovery" else None,
         })
     return out
 
