@@ -1075,6 +1075,17 @@ class Store:
                 "INSERT INTO wa_accounts(name, added_at, status, status_at) VALUES (?,?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET status=excluded.status, status_at=excluded.status_at",
                 (name, now_iso(), status, now_iso()))
+            if status == "logged_in":
+                # W152 (CRM T1037): the chat list on screen IS the proof the link is fine. ASUS / MI /
+                # DELL were flagged `needs_relink` while RAM-thrashing (W143 episode 4 — the sync never
+                # finished because the machine was frozen, not because the phone unlinked); the owner's
+                # "Start session" found them already linked, no QR. Any sighting of a logged-in
+                # profile — a probe, a lane opening it, a login — ends the flag, not only `wa_login`.
+                try:
+                    self.conn.execute("UPDATE wa_accounts SET needs_relink=0, needs_relink_at=NULL "
+                                      "WHERE name=? AND COALESCE(needs_relink,0)=1", (name,))
+                except sqlite3.Error:                         # pre-W143 schema: no flag to clear
+                    pass
             self.conn.commit()
         self._write(f"wa_accounts {name}", _do)
 
@@ -1086,6 +1097,15 @@ class Store:
                               (1 if flag else 0, now_iso() if flag else None, name))
             self.conn.commit()
         self._write(f"wa_accounts needs_relink {name}", _do)
+
+    def flagged_wa_accounts(self) -> list[str]:
+        """W152: enabled accounts the W143 ladder flagged `needs_relink` — the relink wait re-probes
+        these (`lanes._reprobe_flagged`) instead of waiting for a human to press Start session."""
+        try:
+            return [str(r[0]) for r in self.conn.execute(
+                "SELECT name FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=1 ORDER BY name")]
+        except sqlite3.Error:                                     # pre-W143 schema
+            return []
 
     def wa_relinked_since(self, since_iso: str) -> bool:
         """W110: has an enabled account been SEEN logged in at or after `since_iso`?"""

@@ -86,6 +86,63 @@ WA_RELINK_HEARTBEAT_SEC = 120.0
 WA_SYNC_PARK_SEC = 300.0
 WA_SYNC_GIVE_UP = 12
 
+#: W152 (CRM T1037, 2026-10-07): while the lane waits for a relink it re-PROBES every account the W143
+#: ladder flagged `needs_relink` — on entry and every WA_RELINK_REPROBE_SEC (env, default 300) — with
+#: `wa_verify.account_status` (one headless open, ~5 s when the link is fine). ASUS / MI / DELL were
+#: flagged during the T1045 RAM thrash (the sync never finished because the MACHINE was frozen); after
+#: the restart their sessions were fine, the owner's Start session showed the chat list with no QR,
+#: yet three WhatsApp lanes had already waited 15 min each and ended `wa_no_session`. A probe that
+#: sees the chat list stamps `logged_in` (which clears the flag — Store.set_wa_status) and the lane
+#: resumes by itself. Skipped while a login window is open for that account or RAM is >= 80 %.
+WA_RELINK_REPROBE_SEC = 300.0
+
+
+def wa_relink_reprobe_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("WA_RELINK_REPROBE_SEC", str(WA_RELINK_REPROBE_SEC)) or WA_RELINK_REPROBE_SEC))
+    except ValueError:
+        return WA_RELINK_REPROBE_SEC
+
+
+def _account_status(name: str) -> str:
+    """Indirection so tests swap the probe without touching wa_verify / Playwright."""
+    from webscraper import wa_verify
+    return wa_verify.account_status(name)
+
+
+def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
+    """W152: probe every `needs_relink` account; True when one showed its chat list (link is fine)."""
+    names = list(getattr(store, "flagged_wa_accounts", lambda: [])() or [])
+    if not names:
+        return False
+    wa_verify = None
+    try:
+        from webscraper import wa_verify
+        from webscraper.enrich import browser_fallback_allowed
+        if not browser_fallback_allowed():                      # W151: no extra Chrome above 80 % RAM
+            lane.note("WhatsApp relink re-probe skipped — memory is high on this machine; trying again later", "info")
+            return False
+    except Exception:                                             # noqa: BLE001 — no reading: probe anyway
+        pass
+    ok = False
+    for name in names:
+        try:
+            if wa_verify is not None and wa_verify.login_in_progress(name):
+                continue                                          # the owner is scanning right now
+            state = _account_status(name)
+        except Exception as e:                                    # noqa: BLE001 — a probe must never end the wait
+            log.warning("[%s] relink re-probe failed: %s", name, str(e).splitlines()[0][:160])
+            continue
+        if state == "logged_in":
+            lane.note(f"WhatsApp [{name}] is still linked — the NEEDS RELINK flag was a false alarm (WhatsApp Web "
+                      "never finished syncing while this machine was under load); cleared it, WhatsApp lane resuming",
+                      "info")
+            ok = True
+        else:
+            lane.note(f"WhatsApp [{name}] re-probed: {str(state).replace('_', ' ')} — still needs a QR relink from "
+                      "Lead Finder > Systems > WhatsApp login", "info")
+    return ok
+
 
 def _wait_for_relink(lane, store: Store, err: Exception):
     """W110: park the WhatsApp lane until an account on this machine is seen logged in again.
@@ -140,10 +197,16 @@ def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool |
     last_beat = time.monotonic()
     give_up = wa_no_session_give_up_sec()
     wait_t0 = _relink_now()
+    reprobe = wa_relink_reprobe_sec()
+    next_probe = wait_t0                                          # W152: first probe on entry
+    probed_ok = False
     while True:
         if lane.stopped():
             return R_STOPPED
-        if store.wa_relinked_since(since):
+        if reprobe > 0 and not probed_ok and _relink_now() >= next_probe:
+            next_probe = _relink_now() + reprobe
+            probed_ok = _reprobe_flagged(lane, store)
+        if probed_ok or store.wa_relinked_since(since):
             lane.note("WhatsApp account linked — WhatsApp lane resuming", "info")
             if gate is not None and not gate.acquire(lane.job_id, lane.stopped, lambda m: lane.note(m)):
                 return R_STOPPED
@@ -181,6 +244,10 @@ def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool |
 #: Enrichment gets its speed from concurrency inside `enrich_places`, so it takes a batch
 #: rather than one lead at a time. Small enough that a lead reaches WhatsApp quickly.
 ENRICH_BATCH = 10
+
+#: W152: all-provider AI research failures needed (with >= 50 % of the lane's researched leads) before
+#: the enrichment lane ends `error:AI research: …` instead of `completed`.
+RESEARCH_ERROR_MIN_FAILED = 5
 
 #: Reason tokens. `ok` is true only for the first two — see Store.OK_REASONS.
 R_COMPLETED = "completed"          # ran out of work: the honest "done"
@@ -392,6 +459,8 @@ _ENRICH_ERROR_EXPLAIN = {
                 "retry later; if it keeps refusing the website is offline"),
     "cf_deny": ("Cloudflare Error 1020 / 1015 — the site owner's firewall rule denies this network outright (no challenge offered)",
                 "no fingerprint or browser changes a static deny from the same IP; only a proxy (ENRICH_PROXIES) can"),
+    "bad_url": ("the site redirected to a malformed address (a Location header no browser could follow either)",
+                "not fixable by retrying; the site's own redirect is broken — check the website URL on Maps"),
     "no_pages": ("the site answered but the crawl came back with nothing usable",
                  "worth a re-enrich, ideally with 'Show window' so you can see what the page actually rendered"),
     "blocked": ("the site returned a block/deny page (not a Cloudflare one we recognise)",
@@ -487,6 +556,12 @@ class Lane(threading.Thread):
         # the lane then ends `error:AI research: …` instead of a clean "completed" that
         # hides 50 leads with no summary/owner (job #17, 2026-08-26).
         self.research_error: str | None = None
+        # W152: the verdict above is CUMULATIVE over the lane (AI calls that fell through every
+        # provider vs leads researched), not per batch: with 1-4 leads per batch one transient
+        # "could not reach the API" tripped `>= len // 2` and ended a 316/316 lane `error:AI research`
+        # (MAC #22535 / #22556, MI x6, 2026-10-06 — nvidia 369 fails vs 4,484 ok that day).
+        self._research_targets = 0
+        self._research_ai_failed = 0
 
     # -- helpers ---------------------------------------------------------------------
     def note(self, message: str, level: str = "info") -> None:
@@ -943,8 +1018,17 @@ class EnrichmentLane(Lane):
             # Gemini call 429'd; the CRM showed no summary/owner and no reason.
             why = rc.get("error") or "could not read the site text"
             self.note(f"AI research failed for {rc['failed']} of {len(targets)} in this batch — {why}", "warn")
-            if (rc.get("gemini_failed") or 0) >= max(1, len(targets) // 2):
-                self.research_error = why
+        self._research_targets += len(targets)
+        self._research_ai_failed += int((rc.get("gemini_failed") or 0) if isinstance(rc, dict) else 0)
+        # W152: at least RESEARCH_ERROR_MIN_FAILED all-provider failures AND half of everything
+        # researched so far — a quota outage (job #17) still ends the lane with the reason; a few
+        # transient network misses on a free tier no longer fail a lane that enriched every site.
+        if (self._research_ai_failed >= RESEARCH_ERROR_MIN_FAILED
+                and self._research_ai_failed * 2 >= self._research_targets):
+            self.research_error = ((rc.get("error") if isinstance(rc, dict) else None)
+                                   or self.research_error or "every AI provider failed")
+        else:
+            self.research_error = None
 
 
 class WhatsAppLane(Lane):

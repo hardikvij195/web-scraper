@@ -173,7 +173,7 @@ def test_store_flag_and_checks_string(monkeypatch, tmp_path):
     chk = hc._wa_session()
     assert chk["ok"] is False
     assert chk["detail"].startswith("WhatsApp accounts — main: NEEDS RELINK (sync never finished, since ")
-    assert chk["detail"].rstrip(")")[-5:].count(":") == 1          # HH:MM
+    assert chk["detail"].split("since ", 1)[1][:5].count(":") == 1   # HH:MM (W152 appends the Start-session hint)
 
     s.set_wa_needs_relink("main", False)                          # what a finished wa_login does
     assert s.enabled_wa_accounts() == ["main"]

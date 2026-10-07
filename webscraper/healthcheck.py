@@ -128,7 +128,8 @@ def _wa_session() -> dict:
 
     def _label(a: str) -> str:
         if a in relink:                                           # W143: read by the CRM agents table
-            return f"{a}: NEEDS RELINK (sync never finished, since {_hhmm(relink[a])})"
+            return (f"{a}: NEEDS RELINK (sync never finished, since {_hhmm(relink[a])} — the agent re-probes it "
+                    "every 5 min; press Start session, a QR is only needed if one shows)")
         st, at = seen.get(a, ("unknown", ""))
         when = f" {_ago(at)}" if at else ""
         return f"{a}: {'linked' if st == 'logged_in' else 'NOT linked' if st == 'logged_out' else 'unchecked'}{when}"

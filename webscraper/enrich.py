@@ -273,6 +273,12 @@ async def _fetch_ex(client: httpx.AsyncClient, url: str, retries: int = 1,
         except httpx.HTTPError as e:
             log.debug("fetch failed %s: %s", url, e)
             return Fetched(error=transport_error(e))
+        except httpx.InvalidURL as e:
+            # W152 (CRM T1037): NOT an HTTPError — a redirect to "http://host.compath" (no slash) raised
+            # "For absolute URLs, path must be empty or begin with '/'" straight through `enrich_places`
+            # AND `research._gather_text` and ended MI's #22525 enrichment lane twice. One bad site.
+            log.debug("fetch failed %s: malformed url: %s", url, e)
+            return Fetched(error="bad_url")
         except (UnicodeDecodeError, ValueError) as e:
             log.debug("fetch failed %s: %s", url, e)
             return Fetched(error="non_html")
