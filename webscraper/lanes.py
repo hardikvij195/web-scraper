@@ -1139,6 +1139,31 @@ class EnrichmentLane(Lane):
             self.research_error = None
 
 
+#: W162 (CRM T1047, ASUS / MI 2026-10-07 at 86-93 % RAM): a full run holds THREE Chromes on an 8 GB
+#: machine — Maps collector + opener, and WhatsApp Web — and WhatsApp Web is the one that suffers: its
+#: cache gets evicted and every load lands on "messages are downloading" (the W137/W143 re-sync ladder,
+#: yesterday's false `needs_relink` flags). While Maps is still running and RAM is at or above this,
+#: the WhatsApp lane waits (slot released, no Chrome) and checks its numbers once Maps is done.
+WA_HOLD_MEM_PCT = 88.0
+
+
+def wa_hold_mem_pct() -> float:
+    try:
+        return float(os.getenv("WA_HOLD_MEM_PCT", str(WA_HOLD_MEM_PCT)) or WA_HOLD_MEM_PCT)
+    except ValueError:
+        return WA_HOLD_MEM_PCT
+
+
+def memory_high_for_whatsapp() -> bool:
+    """W162: True when RAM use is at/above `WA_HOLD_MEM_PCT` (0 = unknown reading = never high)."""
+    try:
+        from webscraper.enrich import memory_pct_for_browser
+        pct = float(memory_pct_for_browser())
+    except Exception:                                             # noqa: BLE001
+        return False
+    return pct > 0 and pct >= wa_hold_mem_pct()
+
+
 class WhatsAppLane(Lane):
     """Verify numbers on WhatsApp Web, one lead at a time, as enrichment releases them.
 
@@ -1171,9 +1196,20 @@ class WhatsAppLane(Lane):
         checked = 0
         decided = 0                                                 # W143: yes/no only
         t0 = time.monotonic()
+        mem_note_at = 0.0
         while True:
             if self.stopped():
                 return R_STOPPED
+            if not self.ctl.discovery_finished() and memory_high_for_whatsapp():
+                # W162: three Chromes do not fit — WhatsApp waits for Maps, numbers stay queued.
+                self._slot_idle("memory high while Maps runs — WhatsApp waits for Maps to finish", force=True)
+                if time.monotonic() - mem_note_at >= 300:
+                    mem_note_at = time.monotonic()
+                    self.note(f"WhatsApp checks on hold — RAM >= {int(wa_hold_mem_pct())}% while Google Maps is "
+                              "still running on this machine; the numbers stay queued and are checked once Maps "
+                              "finishes (W162)", "info")
+                time.sleep(IDLE_POLL_SEC)
+                continue
             batch = store.pending_wa_verify(self.job_id, 25)
             if not batch:
                 if self.ctl.enrichment_finished():

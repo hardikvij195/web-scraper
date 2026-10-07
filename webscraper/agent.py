@@ -1956,7 +1956,8 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
                 # W142: a running job no longer blocks the login — the lane pauses this account.
                 ok = wa_verify.login(label, busy=getattr(srv.worker, "current_job", None) is not None)
-                result = f"linked {label}" if ok else "timed out waiting for the QR scan (2 min)"
+                result = (f"linked {label}" if ok
+                          else wa_verify.LAST_LOGIN_RESULT.get(label) or "timed out waiting for the QR scan (2 min)")
             elif cmd["command"] == "wa_reset":
                 # W91: wipe one account's profile + row so the next login is a clean QR.
                 from webscraper import wa_verify

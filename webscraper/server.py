@@ -545,6 +545,26 @@ class Worker(threading.Thread):
             return 1
         return lanes_mod.enrich_slots() if lane == LANE_ENRICHMENT else lanes_mod.wa_slots()
 
+    def _wa_lane_claimed(self, store: Store) -> bool:
+        """W164 (CRM T1047): under the one-job-per-lane rule the WhatsApp lane is spoken for while ANY
+        in-flight job still has numbers to check, even when that lane holds no slot right now (idle
+        between batches, parked 5 min on a re-sync — W136/W137). `wa_free` flickered true in those gaps,
+        the CRM offered WhatsApp-next jobs (#81 / #213 on MAC 11:49) and they only ever got parked."""
+        if not lanes_mod.one_job_per_lane():
+            return False
+        with self._lock:
+            pipes = [p for p in self._inflight.values() if p is not None]
+        for p in pipes:
+            wl = getattr(p, "whatsapp", None)
+            if wl is None or not wl.enabled() or wl.done.is_set():
+                continue
+            try:
+                if int(store.count_wa_pending(p.job_id)) > 0:
+                    return True
+            except Exception:                                     # noqa: BLE001
+                continue
+        return False
+
     def _lane_free(self, lane: str) -> int:
         return max(0, self._lane_cap(lane) - self._lane_busy(lane))
 
@@ -626,6 +646,7 @@ class Worker(threading.Thread):
         pending = 0
         pending_by = {LANE_DISCOVERY: 0, LANE_ENRICHMENT: 0, LANE_WHATSAPP: 0}
         account = False
+        wa_claimed = False                                            # W164
         try:
             s = Store()
             try:
@@ -639,6 +660,7 @@ class Worker(threading.Thread):
                     if ln in pending_by:
                         pending_by[ln] += 1
                 account = wa_account_usable(s)
+                wa_claimed = self._wa_lane_claimed(s)             # W164
             finally:
                 s.close()
         except Exception:                                         # noqa: BLE001
@@ -654,7 +676,7 @@ class Worker(threading.Thread):
             maps_free = ((not blocked) and inflight <= guard
                          and busy[LANE_DISCOVERY] == 0 and pending_by[LANE_DISCOVERY] == 0)
             enrich_free = ok and cap[LANE_ENRICHMENT] - busy[LANE_ENRICHMENT] - pending_by[LANE_ENRICHMENT] > 0
-            wa_free = (ok and account
+            wa_free = (ok and account and not wa_claimed                                 # W164
                        and cap[LANE_WHATSAPP] - busy[LANE_WHATSAPP] - pending_by[LANE_WHATSAPP] > 0)
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,

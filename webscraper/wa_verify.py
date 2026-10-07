@@ -310,6 +310,9 @@ _BOOT_TIMEOUT_MS = 90_000
 #:
 #: While a name is in here, nothing else opens, probes or reaps that profile.
 _LOGIN_ACTIVE: set[str] = set()
+#: W163 (CRM T1047): what the last `login(name)` saw, for the CRM command result — "QR shown, not
+#: scanned" is a very different thing from "WhatsApp Web never rendered" (the machine, not the link).
+LAST_LOGIN_RESULT: dict[str, str] = {}
 
 
 def login_in_progress(name: str | None = None) -> bool:
@@ -627,11 +630,16 @@ def login(name: str, *, busy: bool = False) -> bool:
                 if booted is not None:
                     used, fell_back = alt, True
             if booted is None:
-                import shutil
-                log.warning("[%s] WhatsApp Web never rendered on this profile — wiping it and "
-                            "starting fresh", name)
-                shutil.rmtree(profile_dir(name), ignore_errors=True)
-                booted = _login_attempt(pw, name, browser=used)
+                # W163 (CRM T1047): this used to WIPE the profile ("never rendered -> broken"). On an
+                # 8 GB machine at 90 % RAM WhatsApp Web can take longer than the boot window to paint —
+                # DELL / ASUS / MI lost LINKED sessions to this on 2026-10-06/07 and then needed a real
+                # QR. "Did not render" is the machine or Chrome, never proof the link is gone. The
+                # session is kept; `wa_reset` is the deliberate wipe.
+                LAST_LOGIN_RESULT[name] = ("WhatsApp Web did not render in either browser within the boot window — "
+                                           "that is this machine (RAM / Chrome), not the link; the saved session was "
+                                           "kept. Try Start session again when the machine is quieter, or use "
+                                           "WhatsApp reset to wipe it on purpose")
+                log.warning("[%s] %s", name, LAST_LOGIN_RESULT[name])
             if booted is not None:
                 # W93: the binary that painted this profile (QR or chat list) is the one every
                 # later open — job checks, probes, the next Start session — must use.
@@ -639,6 +647,7 @@ def login(name: str, *, busy: bool = False) -> bool:
                 _BROWSER_FELL_BACK.pop(name, None)
             ok = bool(booted)
             if ok:
+                LAST_LOGIN_RESULT.pop(name, None)
                 try:
                     Store().set_wa_needs_relink(name, False)       # W143: a fresh QR link ends the flag
                 except Exception:                                 # noqa: BLE001
@@ -702,6 +711,7 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
             return True
         except PWTimeout:
             log.warning("[%s] timed out waiting for QR scan", name)
+            LAST_LOGIN_RESULT[name] = "QR code was shown but not scanned within 2 min — open Start session again and scan it"
             Store().set_wa_status(name, "logged_out")              # W64
             return False
     finally:

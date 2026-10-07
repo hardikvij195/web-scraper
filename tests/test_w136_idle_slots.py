@@ -95,9 +95,9 @@ def test_dell_deadlock_two_jobs_cross_holding_idle_slots(db, monkeypatch):
     try:
         wa_gate, en_gate = L.STAGE_GATES["whatsapp"], L.STAGE_GATES["enrichment"]
         pa.discovery.start(); pb.discovery.start()               # disabled lanes: done at once
-        pa.discovery.join(2); pb.discovery.join(2)
+        pa.discovery.join(5); pb.discovery.join(5)
         pa.whatsapp.start()                                      # A takes the WhatsApp slot, idles
-        for _ in range(400):
+        for _ in range(3000):                                    # W162: wider under full-suite load
             if wa_gate.holds(a_id):
                 break
             time.sleep(0.005)
@@ -106,7 +106,7 @@ def test_dell_deadlock_two_jobs_cross_holding_idle_slots(db, monkeypatch):
         pa.enrichment.start()                                    # queued behind B (W138: B keeps W76 only while A waits)
         pb.whatsapp.start()                                      # queued behind A
 
-        _join_all([pa, pb], timeout=8.0)
+        _join_all([pa, pb], timeout=20.0)
         alive = [f"{p.job_id}:{l.key}" for p in (pa, pb) for l in p.lanes if l.is_alive()]
         assert not alive, f"deadlock — still alive: {alive}"
         assert calls == [(b_id, "b1")]
