@@ -418,7 +418,17 @@ def wa_account_usable(store: Store) -> bool:
     except Exception:                                             # noqa: BLE001
         paused = set()
     try:
-        return any(a not in paused for a in store.enabled_wa_accounts())
+        # W154 (CRM T1047): `enabled_wa_accounts` ignores `wa_accounts.status`, so DELL — "main: NOT
+        # linked" for 20 min, wa_login timed out twice — still answered "usable" and claimed WhatsApp
+        # work it could only wait 15 min on (`wa_no_session`). A profile last SEEN on the QR screen is
+        # out until something sees its chat list again (a W152 probe, a login, a lane open — all of
+        # which stamp `logged_in`); 'unknown' / never probed still counts, as before.
+        logged_out = {str(r["name"]) for r in store.list_wa_accounts()
+                      if str(r.get("status") or "") == "logged_out"}
+    except Exception:                                             # noqa: BLE001
+        logged_out = set()
+    try:
+        return any(a not in paused and a not in logged_out for a in store.enabled_wa_accounts())
     except Exception:                                             # noqa: BLE001
         return False
 

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 from webscraper import eta
 from webscraper import server as srv
-from webscraper.store import Store
+from webscraper.store import Store, now_iso
 from webscraper.lanes import STAGE_GATES
 
 log = logging.getLogger("webscraper.agent")
@@ -2454,6 +2454,11 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
         headless=int(bool(claimed.get("headless", True))),
         priority=int(claimed.get("priority") or 0),                        # W122
         message="re-run requested from the CRM",
+        # W154 (CRM T1047): `_fail_unstarted` measures START_GRACE_SEC from `created_at`. A mirror
+        # row is created once and re-used by every later re-run of the same cloud job, so the
+        # SECOND re-run of DELL's #22547 (2026-10-07 10:54) was failed "did not start within 5 min"
+        # 30 s after it was claimed — the clock was still the 10:48 one. A re-run is a fresh start.
+        created_at=now_iso(),
     )
     # W59: the WhatsApp lane has its own window choice, and it is tri-state — NULL means
     # "use the agent's WA_VERIFY_HEADLESS". create_job takes a fixed column list, so it
