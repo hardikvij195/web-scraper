@@ -18,3 +18,13 @@ def test_release_rule(monkeypatch):
     monkeypatch.setenv("LANE_ONE_JOB_PER_LANE", "0")
     assert not due(S.LANE_WHATSAPP, True, False, 999), "old W144 behaviour: wait on the gate"
     assert S.LANE_BUSY_RELEASE_SEC == 30.0
+
+
+def test_release_message_names_the_real_reason():
+    """W166: no holder + no WhatsApp account = 'no WhatsApp session', never 'busy with job #?'."""
+    m = S.release_message(S.LANE_WHATSAPP, "?", False)
+    assert m.startswith("parked by the lane rule (W155") and "no WhatsApp session on this machine" in m and "#?" not in m
+    m2 = S.release_message(S.LANE_ENRICHMENT, "?", True)
+    assert "no free slot" in m2 and m2.startswith("parked by the lane rule")
+    m3 = S.release_message(S.LANE_WHATSAPP, "22534", True)
+    assert "busy with job #22534" in m3 and "(W155, released before it started)" in m3
