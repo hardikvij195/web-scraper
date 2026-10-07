@@ -113,3 +113,5 @@ Mac becomes pickable the moment its agent runs once.
 ## Reboot survival (W173)
 
 4. Survive an unattended reboot (W173 / T1046): the logon task only fires once someone signs in, so a laptop that Windows Update reboots stays at the login screen with the agent OFFLINE. Run once per agent laptop, elevated: `powershell -ExecutionPolicy Bypass -File scripts\enable-autologon.ps1` (Sysinternals Autologon, password kept as an LSA secret; `-Check` reports, `-Disable` reverts). Keep BitLocker on.
+5. Never sleep under the agent (W175): `powershell -ExecutionPolicy Bypass -File scripts\set-agent-power.ps1` once per laptop, elevated (never sleep/hibernate on AC or battery, lid close = do nothing, NIC power management off; `-Check` reports). DELL 2026-10-07 16:40-16:59 was simply suspended.
+

@@ -1235,3 +1235,5 @@ as "offline" in the CRM rather than silently running from the wrong folder;
 running run-agent-loop by hand clears the sentinel and revives it.
 
 - [x] W173 — reboot survival: `scripts/enable-autologon.ps1` (auto-logon via Sysinternals Autologon; `-Check`/`-Disable`) — root cause of T1046: AtLogOn task + no auto-logon → agent OFFLINE after Windows Update reboots (MI 2026-10-07 16:32)
+- [x] W175 - power hardening: `scripts/set-agent-power.ps1` (never sleep/hibernate, lid do nothing, NIC power mgmt off; `-Check`) - DELL suspended 16:40-16:59 2026-10-07 while the CRM showed OFFLINE
+

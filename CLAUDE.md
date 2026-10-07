@@ -141,3 +141,5 @@ no-Maps jobs then), and websites crawl alongside Maps / WhatsApp whenever nobody
 websites slot (W76 is a priority, not a block). Machine-wide concurrency is still bounded by the slots.
 
 - W173 (T1046 root cause, 2026-10-07): agents never relaunch after an UNATTENDED reboot because the 'HVT Lead Finder Agent' task is AtLogOn/interactive (Chrome needs a desktop) and auto-logon is off → `scripts/enable-autologon.ps1` once per laptop (Sysinternals Autologon, LSA secret). Not a code bug.
+- W175 (2026-10-07): DELL OFFLINE 16:40-16:59 = the laptop SUSPENDED (agent log: 'asleep/suspended for ~417s', DNS unreachable) despite W149 keep-awake (idle timer only; lid/battery/hibernate policies win) -> `scripts/set-agent-power.ps1` once per laptop. Not a code bug.
+
