@@ -267,6 +267,23 @@ def unstartable_release_due(lane: str | None, wa_account: bool, is_cloud_job: bo
     return is_cloud_job and lane == LANE_WHATSAPP and not wa_account and waited_sec >= limit
 
 
+#: W155 (CRM T1047, 2026-10-07): under the one-job-per-lane rule (W153) a CLAIMED lane-only cloud job
+#: whose next lane is held by another job on this machine is handed back to the CRM after this many
+#: seconds instead of sitting here "running" and unstarted (MAC #22509 11:07: a re-enrich whose
+#: websites were done — the CRM offered it as a websites job, its only lane left was WhatsApp, held by
+#: #22562 — so the card read "3 running" while one of them did nothing). Same text as the W153 park:
+#: `lead_gen_requeue_orphans()` re-queues it and the claim side gives it to a machine with that lane free.
+LANE_BUSY_RELEASE_SEC = 30.0
+
+
+def lane_busy_release_due(lane: str | None, is_cloud_job: bool, needs_maps: bool, waited_sec: float,
+                          limit: float = LANE_BUSY_RELEASE_SEC) -> bool:
+    """True when a queued cloud job waiting for a held enrichment / WhatsApp gate should go back to
+    the CRM (W155): lane-only (no Maps), the rule is on, and it has waited `limit` seconds."""
+    return (is_cloud_job and not needs_maps and lane in (LANE_ENRICHMENT, LANE_WHATSAPP)
+            and lanes_mod.one_job_per_lane() and waited_sec >= limit)
+
+
 def max_inflight_jobs() -> int:
     """W144: a CRASH GUARD only — the most jobs this process will hold in flight at once, so a
     runaway queue can never open fifty Chromes. Scheduling is by LANE (`may_start_job`: Maps =
@@ -469,6 +486,7 @@ class Worker(threading.Thread):
         self._last_mem_note = 0.0
         #: W150: local job id -> when it was first refused for lack of a usable WhatsApp account.
         self._wa_unstartable: dict[int, float] = {}
+        self._lane_wait_since: dict[int, float] = {}                 # W155
         #: W151: memory shedding clock — since when RAM has been above the shed line, last shed.
         self._mem_high_since: float | None = None
         self._last_shed_at = 0.0
@@ -529,6 +547,18 @@ class Worker(threading.Thread):
 
     def _lane_free(self, lane: str) -> int:
         return max(0, self._lane_cap(lane) - self._lane_busy(lane))
+
+    def _lane_holder_label(self, store: Store, lane: str) -> str:
+        """W155: the CRM job id (cloud_id) of the job holding `lane`'s gate, else its local id."""
+        gate = lanes_mod.STAGE_GATES.get(lane)
+        ids = gate.holder_ids() if gate is not None else []
+        if not ids:
+            return "?"
+        try:
+            row = store.get_job(ids[0])
+            return str(row["cloud_id"] or ids[0]) if row is not None else str(ids[0])
+        except Exception:                                         # noqa: BLE001
+            return str(ids[0])
 
     @staticmethod
     def _next_lane(store: Store, row: Any) -> str | None:
@@ -703,10 +733,21 @@ class Worker(threading.Thread):
                             cid_local = int(cand["id"])
                             is_cloud = cand["cloud_id"] is not None
                             first = self._wa_unstartable.setdefault(cid_local, time.monotonic())
+                            since = self._lane_wait_since.setdefault(cid_local, time.monotonic())
                             if unstartable_release_due(nl, wa_account, is_cloud, time.monotonic() - first):
                                 self._wa_unstartable.pop(cid_local, None)
+                                self._lane_wait_since.pop(cid_local, None)
                                 msg = ("WhatsApp verify skipped — no WhatsApp accounts usable on this machine right now "
                                        "(W150: released after %ds so a machine with a live session takes it)" % int(WA_UNSTARTABLE_RELEASE_SEC))
+                                store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
+                                store.log(cid_local, "job", msg, "warn")
+                                log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
+                            elif lane_busy_release_due(nl, is_cloud, job_needs_discovery(cand), time.monotonic() - since):
+                                # W155: one job per lane — hand it back rather than hold it unstarted.
+                                self._wa_unstartable.pop(cid_local, None)
+                                self._lane_wait_since.pop(cid_local, None)
+                                msg = lanes_mod.PARK_MSG.format(lane=nl, holder=self._lane_holder_label(store, nl)) \
+                                    .replace("(W153)", "(W155, released before it started)")
                                 store.update_job(cid_local, phase="failed", status="failed", message=msg, stop_requested=1)
                                 store.log(cid_local, "job", msg, "warn")
                                 log.warning("job #%s (cloud #%s) released: %s", cid_local, cand["cloud_id"], msg)
@@ -714,6 +755,7 @@ class Worker(threading.Thread):
                                 self._wa_unstartable.pop(cid_local, None)
                             continue                  # its lane is full (or no WA account) — leave it queued
                         self._wa_unstartable.pop(int(cand["id"]), None)
+                        self._lane_wait_since.pop(int(cand["id"]), None)
                         job, lane = cand, nl
                         break
                 finally:

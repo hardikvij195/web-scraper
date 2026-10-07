@@ -700,7 +700,14 @@ class Lane(threading.Thread):
 
     def _park(self, gate: "StageGate") -> None:
         holders = gate.holder_ids()
-        msg = PARK_MSG.format(lane=self.key, holder=holders[0] if holders else "?")
+        holder: object = holders[0] if holders else "?"
+        try:                                                      # W155: the CRM's id, not the local one
+            row = self.store.get_job(int(holder)) if self.store and holders else None
+            if row is not None and row["cloud_id"]:
+                holder = row["cloud_id"]
+        except Exception:                                         # noqa: BLE001
+            pass
+        msg = PARK_MSG.format(lane=self.key, holder=holder)
         log.warning("job #%s: %s", self.job_id, msg)
         try:
             if self.store:
