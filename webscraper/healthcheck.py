@@ -266,6 +266,107 @@ def _autostart() -> dict:
         return _check(False, f"autostart check failed: {e}")
 
 
+#: W177: HKLM Winlogon key `scripts/enable-autologon.ps1` (W173) writes to.
+_WINLOGON_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+_LID_TEXT = {0: "do nothing", 1: "sleep", 2: "hibernate", 3: "shut down"}
+
+
+def _winlogon() -> dict:
+    """W177: `{'auto': '1'|'0'|'', 'user': str}` straight from the registry (winreg, no
+    PowerShell — this runs on every heartbeat). Empty values when the key cannot be read."""
+    out = {"auto": "", "user": ""}
+    try:
+        import winreg  # type: ignore[import-not-found]
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _WINLOGON_KEY) as k:
+            for field, name in (("auto", "AutoAdminLogon"), ("user", "DefaultUserName")):
+                try:
+                    out[field] = str(winreg.QueryValueEx(k, name)[0]).strip()
+                except OSError:
+                    pass
+    except Exception:                                             # noqa: BLE001
+        pass
+    return out
+
+
+def _win_task_present() -> bool:
+    """W177: is the AtLogOn scheduled task registered? (exit 0 from schtasks /query)."""
+    try:
+        r = subprocess.run(["schtasks", "/Query", "/TN", _WIN_TASK], capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
+def _powercfg(sub: str, setting: str) -> tuple[int | None, int | None]:
+    """W177: `(ac, dc)` of a power setting on the active scheme, parsed from
+    `powercfg /query SCHEME_CURRENT <sub> <setting>` (`Current AC/DC Power Setting Index: 0x...`).
+    None for a side powercfg does not report — a desktop has no LIDACTION at all."""
+    ac = dc = None
+    try:
+        r = subprocess.run(["powercfg", "/query", "SCHEME_CURRENT", sub, setting],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            m = re.search(r"Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)", r.stdout)
+            if m:
+                ac = int(m.group(1), 16)
+            m = re.search(r"Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)", r.stdout)
+            if m:
+                dc = int(m.group(1), 16)
+    except Exception:                                             # noqa: BLE001
+        pass
+    return ac, dc
+
+
+def _reboot_survival() -> dict:
+    """W177 (T1046 / W173 / W175): will this laptop come back on its own after an unattended
+    reboot, and stay awake under the agent? Reports — never changes — auto-logon, the AtLogOn
+    agent task, sleep / hibernate timeouts (AC + DC) and the lid-close action, so the CRM shows
+    whether `scripts/enable-autologon.ps1` + `scripts/set-agent-power.ps1` were actually applied
+    (the owner ran them un-elevated on DELL/ASUS 2026-10-07 and nobody could tell)."""
+    if platform.system() != "Windows":
+        return _check(True, "n/a (not Windows)", optional=True)
+    fix = "run scripts\\enable-autologon.ps1 + scripts\\set-agent-power.ps1 as Administrator"
+    try:
+        def _secs(v: int | None) -> str:
+            return "n/a" if v is None else "never" if v == 0 else f"{v}s"
+
+        w = _winlogon()
+        auto_ok = w["auto"] == "1" and bool(w["user"])
+        task_ok = _win_task_present()
+        sl_ac, sl_dc = _powercfg("SUB_SLEEP", "STANDBYIDLE")
+        hb_ac, hb_dc = _powercfg("SUB_SLEEP", "HIBERNATEIDLE")
+        lid_ac, lid_dc = _powercfg("SUB_BUTTONS", "LIDACTION")
+        # 0 = never; a side powercfg does not report (None) is not a timer that can fire.
+        sleep_ok = not (sl_ac or sl_dc)
+        hib_ok = not (hb_ac or hb_dc)
+        lid_ok = not (lid_ac or lid_dc)                           # None/None = desktop without a lid -> ok
+
+        parts = [f"auto-logon {'ON' if auto_ok else 'OFF'}",
+                 f"task {'OK' if task_ok else 'MISSING'}",
+                 f"sleep AC {_secs(sl_ac)}/DC {_secs(sl_dc)}"]
+        if not hib_ok:
+            parts.append(f"hibernate AC {_secs(hb_ac)}/DC {_secs(hb_dc)}")
+        if lid_ac is None and lid_dc is None:
+            parts.append("lid n/a")
+        else:
+            lid_v = max(lid_ac or 0, lid_dc or 0)
+            parts.append(f"lid {_LID_TEXT.get(lid_v, str(lid_v))}")
+        scripts: list[str] = []
+        if not auto_ok:
+            scripts.append("scripts\\enable-autologon.ps1")
+        if not task_ok:
+            scripts.append("scripts\\install-agent-autostart.ps1")
+        if not (sleep_ok and hib_ok and lid_ok):
+            scripts.append("scripts\\set-agent-power.ps1")
+        ok = not scripts
+        detail = " · ".join(parts)
+        if not ok:
+            detail += f" — run {' + '.join(scripts)} as Administrator"
+        return _check(ok, detail, fix, optional=True)
+    except Exception as e:                                        # noqa: BLE001
+        return _check(False, f"reboot-survival check failed: {e}", fix, optional=True)
+
+
 def _memory() -> dict:
     """W122: total/available RAM in MB — stdlib only, no psutil. Never raises; missing
     fields come back None so the CRM can show 'unknown' instead of a stale number."""
@@ -413,6 +514,7 @@ def run_checks() -> dict:
         "disk": _disk(),
         "fd_limit": _fd_limit(),
         "autostart": _autostart(),
+        "reboot_survival": _reboot_survival(),
     }
     required_ok = all(c["ok"] for c in checks.values() if not c.get("optional"))
     return {

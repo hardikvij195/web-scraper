@@ -142,4 +142,5 @@ websites slot (W76 is a priority, not a block). Machine-wide concurrency is stil
 
 - W173 (T1046 root cause, 2026-10-07): agents never relaunch after an UNATTENDED reboot because the 'HVT Lead Finder Agent' task is AtLogOn/interactive (Chrome needs a desktop) and auto-logon is off → `scripts/enable-autologon.ps1` once per laptop (Sysinternals Autologon, LSA secret). Not a code bug.
 - W175 (2026-10-07): DELL OFFLINE 16:40-16:59 = the laptop SUSPENDED (agent log: 'asleep/suspended for ~417s', DNS unreachable) despite W149 keep-awake (idle timer only; lid/battery/hibernate policies win) -> `scripts/set-agent-power.ps1` once per laptop. Not a code bug.
+- W177 (2026-10-07): `healthcheck.reboot_survival` (Windows; optional) reports auto-logon (winreg), the agent task, sleep / hibernate AC+DC and the lid action from `powercfg` — read-only, so the CRM Setup tab shows whether W173/W175 were actually applied (the owner ran both scripts un-elevated on DELL/ASUS). Non-Windows = `n/a`.
 
