@@ -4,8 +4,9 @@
 # secret by Sysinternals Autologon), hardens the power plan (never sleep/hibernate, lid does nothing), and
 # prints the final state. Use -Check to only print the state.
 #
-#   one-liner (any PowerShell, any agent laptop):
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command '$r=@("C:\hv-technologies\web-scraper","D:\1 - Repos\hv-technologies\web-scraper","D:\5 - Repositories\Hv Technologies\web-scraper")|?{Test-Path $_}|select -First 1; cd $r; git pull --ff-only; .\scripts\fix-reboot.ps1'
+#   one-liner (paste DIRECTLY into any PowerShell window; do not wrap it in powershell -Command '...':
+#   Windows strips the nested quotes and the parser fails with "Missing argument in parameter list"):
+#   $r=@("C:\hv-technologies\web-scraper","D:\1 - Repos\hv-technologies\web-scraper","D:\5 - Repositories\Hv Technologies\web-scraper")|?{Test-Path $_}|select -First 1; cd $r; git pull --ff-only; powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fix-reboot.ps1
 param([switch]$Check)
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
