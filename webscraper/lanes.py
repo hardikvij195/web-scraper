@@ -309,6 +309,18 @@ class StageGate:
                 noted_at = now
             time.sleep(self.POLL_SEC)
 
+    def could_take(self, job_id: int) -> bool:
+        """W153: would `acquire(job_id)` return at once? (a free slot, and nobody ahead of it)."""
+        with self._cond:
+            if job_id in self._holders:
+                return True
+            free = self.slots - len(self._holders)
+            return free > 0 and (job_id not in self._queue or self._queue.index(job_id) < free)
+
+    def holder_ids(self) -> list[int]:
+        with self._cond:
+            return sorted(self._holders)
+
     def busy(self) -> int:
         """W144: jobs whose lane is active on this gate or queued for it (holders + queue). A lane
         that gave its slot back while idle (W136 `_slot_idle`) is in neither — it is not busy."""
@@ -377,10 +389,26 @@ def _device_env(name: str) -> str | None:
     return os.getenv(f"{name}__{DEVICE_NAME.upper()}") if DEVICE_NAME else None
 
 
+#: W153 (CRM T1047, owner 2026-10-07: "each lane 1 job should run on each system and then it should be
+#: queued back — logically you cannot run 2 WA jobs at the same time; same for Google Maps and
+#: webscraping"). ON by default: every stage gate has ONE slot (Maps already is one tab), lanes never
+#: round-robin (W135 yield off), and a job whose only remaining lane is held by another job is PARKED —
+#: it ends with `PARK_MSG` and the CRM re-queues it (resumed over the saved leads) instead of sitting
+#: "running" on the machine behind that lane. `LANE_ONE_JOB_PER_LANE=0` restores the W135/W144 behaviour.
+def one_job_per_lane() -> bool:
+    return (os.getenv("LANE_ONE_JOB_PER_LANE", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+PARK_MSG = ("parked by the lane rule (W153): the {lane} lane on this machine is busy with job #{holder} — "
+            "re-queued, resumes when a {lane} lane is free")
+
+
 def enrich_slots() -> int:
     """W135: jobs whose enrichment lane may run at once on this machine. CRM setting
     `enrich_slots__<device>` (default 2, clamped 1..3); `LANE_SLOTS_ENRICHMENT` in .env
-    is the local override."""
+    is the local override. W153: always 1 under the one-job-per-lane rule."""
+    if one_job_per_lane():
+        return 1
     raw = os.getenv("LANE_SLOTS_ENRICHMENT") or _device_env("ENRICH_SLOTS")
     try:
         n = int(raw) if raw else 2
@@ -392,7 +420,9 @@ def enrich_slots() -> int:
 def wa_slots() -> int:
     """W135: jobs whose WhatsApp lane may run at once. CRM setting `wa_slots__<device>`
     (clamped >= 1); default = `_wa_parallel()` (min of `wa_parallel__<device>` and the
-    linked accounts is applied by the lane itself per batch)."""
+    linked accounts is applied by the lane itself per batch). W153: always 1 under the rule."""
+    if one_job_per_lane():
+        return 1
     raw = os.getenv("LANE_SLOTS_WHATSAPP") or _device_env("WA_SLOTS")
     if raw:
         try:
@@ -600,6 +630,8 @@ class Lane(threading.Thread):
         gate = STAGE_GATES.get(self.key)
         if gate is None:
             return True
+        if one_job_per_lane():
+            return True                                  # W153: one job runs a lane to its end, no turns
         if self._slice_n < YIELD_UNITS.get(self.key, 20) and time.monotonic() - t0 < YIELD_AFTER_SEC:
             return True
         done_in_turn = self._slice_n
@@ -653,6 +685,48 @@ class Lane(threading.Thread):
         self._slice_t0 = None
         self.note(f"{why} — handing the {self.key} slot to the next job in line meanwhile")
 
+    # -- W153 (CRM T1047): one job per lane — a job that would only WAIT here is parked -------
+    def _park_due(self, gate: "StageGate") -> bool:
+        """True when this lane cannot take the gate now AND no other lane of this job is still
+        working — the job would sit "running" on this machine doing nothing but queueing behind
+        another job's lane. Parking it hands it back to the CRM (resumed over the saved leads)."""
+        if not one_job_per_lane() or gate.could_take(self.job_id):
+            return False
+        other_done = getattr(self.ctl, "other_lanes_done", None)
+        try:
+            return bool(other_done(self)) if other_done is not None else False
+        except Exception:                                         # noqa: BLE001
+            return False
+
+    def _park(self, gate: "StageGate") -> None:
+        holders = gate.holder_ids()
+        msg = PARK_MSG.format(lane=self.key, holder=holders[0] if holders else "?")
+        log.warning("job #%s: %s", self.job_id, msg)
+        try:
+            if self.store:
+                self.store.update_job(self.job_id, stop_requested=1, message=msg)
+                self.store.log(self.job_id, "job", msg, "warn")
+        except Exception:                                         # noqa: BLE001
+            log.warning("job #%s: could not record the park", self.job_id, exc_info=True)
+
+    def _acquire(self, gate: "StageGate") -> bool:
+        """`gate.acquire` that also gives up — and parks the job — when `_park_due` becomes true
+        while waiting. False = stopped or parked (the caller ends the lane R_STOPPED either way)."""
+        parked = {"v": False}
+
+        def stop_or_park() -> bool:
+            if self.stopped():
+                return True
+            if self._park_due(gate):
+                parked["v"] = True
+                return True
+            return False
+        if gate.acquire(self.job_id, stop_or_park, lambda m: self.note(m)):
+            return True
+        if parked["v"] and not self.stopped():
+            self._park(gate)
+        return False
+
     def _slot_resume(self) -> bool:
         """Call once a batch is in hand. Takes a slot back if `_slot_idle` gave it up
         (FIFO behind whoever asked earlier). False only when the job was stopped meanwhile."""
@@ -660,7 +734,7 @@ class Lane(threading.Thread):
         gate = STAGE_GATES.get(self.key)
         if gate is None or not self._slot_parked:
             return True
-        if not gate.acquire(self.job_id, self.stopped, lambda m: self.note(m)):
+        if not self._acquire(gate):                              # W153: parks instead of waiting
             return False
         self._slot_parked = False
         self._slice_n = 0
@@ -688,7 +762,7 @@ class Lane(threading.Thread):
                 # W122: wait my turn for this stage's shared slot(s) before touching the
                 # DB as "running" — a job N+1 whose enrichment/WhatsApp is merely queued
                 # behind job N's must not show as started.
-                if not gate.acquire(self.job_id, self.stopped, lambda m: self.note(m)):
+                if not self._acquire(gate):                      # W153: parks instead of waiting
                     self.reason = R_STOPPED
                     return
                 gate_acquired = True
@@ -1368,6 +1442,10 @@ class Pipeline:
         never asked for discovery, or discovery has ended — so the Worker can let the
         next job's discovery start."""
         return not self.discovery.enabled() or self.discovery.done.is_set()
+
+    def other_lanes_done(self, lane: "Lane") -> bool:
+        """W153: is `lane` the only lane of this job still alive? (the others disabled or ended)"""
+        return all(l is lane or not l.enabled() or l.done.is_set() for l in self.lanes)
 
     def enrichment_finished(self) -> bool:
         # A job with enrichment switched off still feeds WhatsApp: discovery writes the
