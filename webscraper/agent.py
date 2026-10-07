@@ -239,6 +239,9 @@ def _device_name() -> str:
 
 #: Computed once — the hostname does not change while the agent runs.
 DEVICE_NAME = _device_name()
+# W181b: exported so `chrome_args.device_name()` (per-device diet flags) never has to import
+# this module from inside a Chrome launch — the old import-only path failed silently on MAC.
+__import__("os").environ["HVT_AGENT_DEVICE"] = DEVICE_NAME
 
 
 def _running_git() -> str:
@@ -2032,6 +2035,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 if new:
                     _remember_device_name(new)
                     DEVICE_NAME = new
+                    __import__("os").environ["HVT_AGENT_DEVICE"] = new   # W181b
                     ok, result = True, f"now reporting as {new}"
                 else:
                     result = "empty name"

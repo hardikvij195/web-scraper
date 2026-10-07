@@ -55,6 +55,9 @@ data/           gitignored: leads.db, browser profiles, exports
   `is_closed()` — `maps.PageCrashes` closes the dead tab, opens a new one in the same context and retries
   the same place/tile once; the context is recycled after `MAPS_CRASH_RELAUNCH_AFTER` crashes and the lane
   fails only after `MAPS_CRASH_MAX` crashes in a row. A crashed place is never `skipped` on its first crash.
+  W181b: the per-device diet switches (`<FLAG>__<DEVICE>`) resolve the device via `HVT_AGENT_DEVICE` (exported
+  by `agent.py`) > `data/device_name` > the lazy `webscraper.agent` import (import failure = one WARNING, never
+  silent); every Chrome launch logs the decision with its inputs (`[device= per-device= generic=]`).
 - New field -> `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()`, `EXPORT_COLS`. Parsing in `extractors.py`
   with a test; Playwright only in `maps.py`.
 - Every scraper change is measured with `python scripts/regress-sites.py` against `docs/test-sites.md`.

@@ -30,7 +30,7 @@ from webscraper.extractors import (
 )
 from webscraper.geocode import GeoHit, geocode_location
 from webscraper.models import Place
-from webscraper.chrome_args import flag_enabled, lean_args, merge_args
+from webscraper.chrome_args import flag_enabled, flag_inputs, lean_args, merge_args
 from webscraper.browser_recovery import (RESTORE_BUBBLE_ARGS, Relauncher, close_blank_pages,
                                          is_closed, mark_profile_clean)
 from webscraper.store import Store, now_iso
@@ -666,6 +666,18 @@ def block_assets_enabled() -> bool:
     return flag_enabled("MAPS_BLOCK_ASSETS")                      # W181: `MAPS_BLOCK_ASSETS__<DEVICE>` wins
 
 
+def block_assets_decision() -> bool:
+    """W181b: the W169 asset-diet decision for one launch, logged WITH its inputs (device /
+    per-device / generic env values) — 2 - MAC kept blocking after the per-device `0`
+    arrived and nothing in the log said which input had won."""
+    on = block_assets_enabled()
+    if on:
+        log.info("Maps assets blocked: images/media/fonts (W169) %s", flag_inputs("MAPS_BLOCK_ASSETS"))
+    else:
+        log.info("Maps assets NOT blocked (W181 switch off) %s", flag_inputs("MAPS_BLOCK_ASSETS"))
+    return on
+
+
 def should_block_asset(resource_type: str | None, url: str) -> bool:
     """Pure decision behind the route: block image / media / font, keep document, script,
     stylesheet, xhr, fetch and everything else."""
@@ -686,12 +698,11 @@ def _asset_route(route) -> None:
 def _open_context(pw, launch_kwargs: dict):
     log.info("launching %s Chrome (profile %s)…", "headless" if launch_kwargs.get("headless") else "headed", launch_kwargs.get("user_data_dir"))
     c = pw.chromium.launch_persistent_context(**launch_kwargs)
-    if block_assets_enabled():
+    if block_assets_decision():                                   # W181b: logs the inputs too
         # W169 (CRM T1047): images/fonts/media add nothing we read. Keyed on Playwright's
         # resource type (a CDN tile with no extension is still dropped) with the old URL regex
         # as the fallback; stylesheets stay — the panel layout (and our hooks) depend on them.
         c.route("**/*", _asset_route)
-        log.info("Maps assets blocked: images/media/fonts (W169)")
     pg = c.pages[0] if c.pages else c.new_page()
     close_blank_pages(c, keep=pg)   # T397
     pg.set_default_timeout(20000)
