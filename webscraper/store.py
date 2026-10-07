@@ -331,7 +331,12 @@ class Store:
                          ("wa_numbers", "TEXT")):      # JSON [{number, source, verdict, checks}] (W26/W99)
             if col not in have:
                 self.conn.execute(f"ALTER TABLE places ADD COLUMN {col} {typ}")
-        self.conn.execute("UPDATE places SET detail_status='done' WHERE detail_status IS NULL")
+                if col == "detail_status":
+                    # W172: this backfill used to run on EVERY Store() construction — a full-table UPDATE
+                    # (no index on detail_status) that took the write lock while the lanes were streaming,
+                    # so a worker tick died with "database is locked" (DELL, 2026-10-07 16:04). Existing
+                    # rows only ever need it once: the moment the column is created.
+                    self.conn.execute("UPDATE places SET detail_status='done' WHERE detail_status IS NULL")
         # `changed_at` bumps on EVERY update to a place (enrichment verdict, socials, WA
         # result), so the agent can stream updates to the CRM mid-job instead of only new
         # rows — the CRM showed "64 / 248" while the agent had enriched 116 (job #14). The
