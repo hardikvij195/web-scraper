@@ -51,7 +51,10 @@ data/           gitignored: leads.db, browser profiles, exports
 - **Chrome profiles are ours to kill** (T397): `Relauncher(profile_dir=)` evicts the holder,
   `close_blank_pages`, `mark_profile_clean` + `RESTORE_BUBBLE_ARGS`. Crash recovery = `browser_recovery`.
   W120: Maps contexts are recycled every N places/tiles (`Relauncher.recycle`) because a long-lived
-  tab grows past 1 GB.
+  tab grows past 1 GB. W180: `Page.goto: Page crashed` (renderer death, MAC under RAM pressure) is NOT
+  `is_closed()` — `maps.PageCrashes` closes the dead tab, opens a new one in the same context and retries
+  the same place/tile once; the context is recycled after `MAPS_CRASH_RELAUNCH_AFTER` crashes and the lane
+  fails only after `MAPS_CRASH_MAX` crashes in a row. A crashed place is never `skipped` on its first crash.
 - New field -> `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()`, `EXPORT_COLS`. Parsing in `extractors.py`
   with a test; Playwright only in `maps.py`.
 - Every scraper change is measured with `python scripts/regress-sites.py` against `docs/test-sites.md`.
@@ -93,12 +96,14 @@ data/           gitignored: leads.db, browser profiles, exports
 | `WA_RESYNC_LONG_WAIT_SEC` | `900` | W143: episode-3 re-sync recovery — kill the profile's Chrome + lock files, relaunch, wait ONE sync this long; episode 4 flags the account `needs_relink` |
 | `WA_RECYCLE_BACKOFF_CHECKS` | `400` | W143: after a boot whose sync took > 60 s, hold the W131 recycle for this many checks (heavy-history account); 0 = off |
 | `AGENT_LOOP_WATCHDOG_SEC` | `600` | W142: no CRM heartbeat for this long (and not just offline) -> flag jobs, kill our Chromes, `os._exit(3)`; the supervisor loop relaunches. 0 = off |
-| `CHROME_LEAN_ARGS` | `1` | W169 (CRM T1047): Chrome RAM diet on every launch (`chrome_args.lean_args`: no site-per-process / IsolateOrigins / BackForwardCache, `--renderer-process-limit=2`, no sync / component update / background networking, V8 heap cap). `0` = stock args |
+| `CHROME_LEAN_ARGS` | `1` | W169 (CRM T1047): Chrome RAM diet on every launch (`chrome_args.lean_args`: no site-per-process / IsolateOrigins / BackForwardCache, `--renderer-process-limit=2`, no sync / component update / background networking, V8 heap cap). `0` = stock args. W181: per-device form `CHROME_LEAN_ARGS__<DEVICE>` supported (wins over the generic; CRM `lead_gen_settings` key `chrome_lean_args__<device>`) |
 | `CHROME_JS_HEAP_MB[__MAPS/__WA/__ENRICH]` | `256` / `512` (wa) | W169: `--js-flags=--max-old-space-size`; 0 = no cap |
-| `MAPS_BLOCK_ASSETS` | `1` | W169: Maps tabs abort image / media / font requests by resource type (CSS kept); `0` = load everything |
+| `MAPS_BLOCK_ASSETS` | `1` | W169: Maps tabs abort image / media / font requests by resource type (CSS kept); `0` = load everything. W181: per-device form `MAPS_BLOCK_ASSETS__<DEVICE>` supported (wins over the generic) |
 | `MAPS_RELAUNCH_LOWMEM_DIVISOR` | `2` | W169: on <= 8.5 GB total RAM the W120 DEFAULT cadences are divided by this (40->20 places, 20->10 tiles); an explicit `MAPS_RELAUNCH*` is never touched |
 | `WA_LOWMEM_HIDDEN_PCT` | `85` | W169: a `visible` WhatsApp window opens `hidden` (off-screen + minimised real Chrome) when RAM used% is at/above this at open time; never promoted to headless; 0 = off |
 | `WA_REPROBE_FORCE_MIN` | `20` | W170: the W152 relink re-probe skips while RAM >= `WA_HOLD_MEM_PCT` (88 %, the WhatsApp lane's own W162 gate — no longer the 80 % enrichment gate); a flag deferred this many minutes is probed anyway, once, so it can never stay stuck (MI 2026-10-07); 0 = never force |
+| `MAPS_CRASH_MAX` | `5` | W180: Maps page crashes IN A ROW (no place/tile opened in between) after which the discovery lane fails as before (`lane failed: Page.goto: Page crashed`); below that the dead tab is replaced and the same place/tile retried once |
+| `MAPS_CRASH_RELAUNCH_AFTER` | `3` | W180: page crashes since the last relaunch after which the whole Maps context is recycled (W120 path) instead of just the tab — a crashing renderer usually means the context is unhealthy |
 
 ## Lead Finder Cloud (vercel-app)
 

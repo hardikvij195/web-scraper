@@ -1817,7 +1817,9 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # T793: per-machine memory knobs, same live-refresh path
                             "WA_RELAUNCH__", "MAPS_RELAUNCH__", "ENRICH_IDLE__",
                             # W135 (CRM T1011): stage-gate slots per machine
-                            "ENRICH_SLOTS__", "WA_SLOTS__")
+                            "ENRICH_SLOTS__", "WA_SLOTS__",
+                            # W181: per-machine Chrome diet switches (read at the next launch)
+                            "MAPS_BLOCK_ASSETS__", "CHROME_LEAN_ARGS__")
 
 #: How often the main loop re-fetches cloud config for the knobs above.
 CONFIG_REFRESH_SEC = 300.0

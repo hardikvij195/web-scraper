@@ -42,8 +42,31 @@ STEALTH_SENSITIVE = ("--disable-component-update", "--disable-extensions")
 _OFF = ("0", "false", "no", "off")
 
 
+def device_upper() -> str:
+    """The agent's device name upper-cased (`2 - MAC`); '' outside the agent."""
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        return ""
+    return (DEVICE_NAME or "").upper()
+
+
+def flag_enabled(name: str, default: str = "1") -> bool:
+    """W181: an on/off env flag with a per-device form — `<NAME>__<DEVICE UPPER>` (a CRM
+    `lead_gen_settings` key, applied to every machine) > `<NAME>` > `default`. MAC's Maps
+    renderer crashes under the W169 diet while the Windows laptops are fine, so the owner
+    can turn `CHROME_LEAN_ARGS` / `MAPS_BLOCK_ASSETS` off for ONE machine."""
+    dev = device_upper()
+    raw = os.getenv(f"{name}__{dev}") if dev else None
+    if raw is None or not str(raw).strip():
+        raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        raw = default
+    return str(raw).strip().lower() not in _OFF
+
+
 def enabled() -> bool:
-    return (os.getenv("CHROME_LEAN_ARGS") or "1").strip().lower() not in _OFF
+    return flag_enabled("CHROME_LEAN_ARGS")
 
 
 def js_heap_mb(kind: str) -> int:

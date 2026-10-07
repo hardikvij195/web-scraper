@@ -30,7 +30,7 @@ from webscraper.extractors import (
 )
 from webscraper.geocode import GeoHit, geocode_location
 from webscraper.models import Place
-from webscraper.chrome_args import lean_args, merge_args
+from webscraper.chrome_args import flag_enabled, lean_args, merge_args
 from webscraper.browser_recovery import (RESTORE_BUBBLE_ARGS, Relauncher, close_blank_pages,
                                          is_closed, mark_profile_clean)
 from webscraper.store import Store, now_iso
@@ -540,6 +540,100 @@ def _first_line(e: BaseException) -> str:
     """A Playwright error's message is the reason plus a multi-line call log; the log and
     the `skip` event want just the reason (`Page.goto: net::ERR_ABORTED at https://…`)."""
     return (str(e).strip().splitlines() or [""])[0][:200]
+
+
+# W180 (2 - MAC, 2026-10-07, 20 crashes 16:49-18:11): `Page.goto: Page crashed` is the Chrome
+# RENDERER dying (macOS, RAM 69-83 %) — the context is alive, so `is_closed()` says no and the
+# W103 path treated it as a navigation error: retry on the SAME dead page (crashes again),
+# skip the place, and five such places in a row ended the lane (`lane failed: Page.goto: Page
+# crashed`, #22571 at 341/729, #22574 at 175/546). A crashed page can never be reused: replace
+# the tab, retry the same place/tile once, relaunch the context after a few crashes.
+MAPS_CRASH_MAX_DEFAULT = 5
+MAPS_CRASH_RELAUNCH_AFTER_DEFAULT = 3
+
+
+def is_page_crashed(e: BaseException) -> bool:
+    """True for a renderer crash (`Page crashed` / `Target crashed`) — the browser still runs."""
+    m = str(e).lower()
+    return "page crashed" in m or "target crashed" in m
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int((os.getenv(name) or str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def maps_crash_max() -> int:
+    """Consecutive page crashes (no place/tile in between) that fail the lane as before."""
+    return _env_int("MAPS_CRASH_MAX", MAPS_CRASH_MAX_DEFAULT)
+
+
+def maps_crash_relaunch_after() -> int:
+    """Crashes since the last relaunch after which the whole context is recycled (W120 path)."""
+    return _env_int("MAPS_CRASH_RELAUNCH_AFTER", MAPS_CRASH_RELAUNCH_AFTER_DEFAULT)
+
+
+class PageCrashes:
+    """W180: per-lane crash bookkeeping around one `Relauncher`. `recover(e, where)` replaces
+    the dead tab — a fresh page in the same context; the whole context via `Relauncher.recycle`
+    every `MAPS_CRASH_RELAUNCH_AFTER` crashes (a crashing renderer usually means the context is
+    unhealthy), `Relauncher.recover` when the context turns out dead too — and returns the new
+    `(ctx, page)`. It re-raises `e` unchanged once `MAPS_CRASH_MAX` crashes happened in a row,
+    so the lane fails with today's text. `ok()` after a place/tile that worked resets the
+    streak; `total` feeds the lane's end-of-run summary."""
+
+    def __init__(self, rl: Relauncher, emit: Callable[[str, dict], None], where: str) -> None:
+        self.rl = rl
+        self.emit = emit
+        self.where = where
+        self.total = 0
+        self.streak = 0
+        self.since_relaunch = 0
+
+    def ok(self) -> None:
+        self.streak = 0
+
+    def recover(self, e: BaseException, where: str) -> tuple:
+        self.total += 1
+        self.streak += 1
+        self.since_relaunch += 1
+        if self.streak >= maps_crash_max():
+            log.error("Maps page crashed %d times in a row (%s) — giving up on the lane: %s",
+                      self.streak, where, _first_line(e))
+            raise e
+        ctx, page = self.rl.current
+        relaunch = self.since_relaunch >= maps_crash_relaunch_after()
+        if relaunch:
+            self.since_relaunch = 0
+            try:
+                ctx, page = self.rl.recycle(f"{where} after {self.total} page crashes (W180)")
+            except Exception as e2:                                   # noqa: BLE001
+                log.warning("recycle failed (%s) — taking the crash path", _first_line(e2))
+                if not self.rl.recover(where):
+                    raise e
+                ctx, page = self.rl.current
+        else:
+            try:
+                try:
+                    page.close()
+                except Exception:                                     # noqa: BLE001 — it is dead, that is the point
+                    pass
+                page = ctx.new_page()
+                page.set_default_timeout(20000)
+                self.rl.page = page
+            except Exception:                                         # noqa: BLE001 — the context is gone too
+                if not self.rl.recover(where):
+                    raise e
+                ctx, page = self.rl.current
+        log.warning("Maps page crashed — reopened the tab and continuing (W180, crash %d this lane%s): %s",
+                    self.total, ", context relaunched" if relaunch else "", _first_line(e))
+        self.emit("page_crashed", {"where": self.where, "count": self.total, "relaunched": relaunch,
+                                   "error": _first_line(e)})
+        return ctx, page
+
+
 #: The opener's own persistent Chrome profile, beside the collector's (`settings.profile_dir`).
 OPENER_PROFILE_NAME = "browser-profile-open"
 
@@ -569,7 +663,7 @@ _ASSET_URL_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$
 
 
 def block_assets_enabled() -> bool:
-    return (os.getenv("MAPS_BLOCK_ASSETS") or "1").strip().lower() not in ("0", "false", "no", "off")
+    return flag_enabled("MAPS_BLOCK_ASSETS")                      # W181: `MAPS_BLOCK_ASSETS__<DEVICE>` wins
 
 
 def should_block_asset(resource_type: str | None, url: str) -> bool:
@@ -689,6 +783,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
     merged: set[str] = set()
     budget_hit = False
     cap_logged = {"v": False}
+    crashes: PageCrashes | None = None                            # W180
 
     def budget_left() -> int:
         """W147 (CRM T1027): `max_places` is a JOB-WIDE cap on unique places saved (all keywords,
@@ -720,6 +815,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
             rl = Relauncher(lambda: _open_context(pw, kw), profile_dir=settings.profile_dir,
                             on_restart=lambda where, n: emit("browser_restart", {"where": where, "attempt": n}))
             ctx, page = rl.open()
+            crashes = PageCrashes(rl, emit, "collector")       # W180
             try:
                 zoom: float | None = None
                 if radius_km and (center or location):
@@ -856,6 +952,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                     # jobs #81/#103/#125/#147/#213 each lost the rest of their tiles on 2026-09-14.
                     cards = None
                     timeouts = 0
+                    crash_retried = False     # W180: one retry of this tile on a fresh page
                     while True:
                         try:
                             page.goto(search_url(qy, location, center=c, zoom=tile_zoom),
@@ -866,8 +963,25 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                 page, want,
                                 on_progress=lambda n: emit("links", {"count": len(merged) + n,
                                                                      "tile": s_i, "tiles": len(steps)}))
+                            crashes.ok()
                             break
                         except PWError as e:
+                            if is_page_crashed(e):
+                                # W180: the renderer died, not the browser — replace the tab and
+                                # retry THIS tile once; a second crash fails the tile like a
+                                # timeout does (band-end requeue), never the whole collection.
+                                ctx, page = crashes.recover(e, f"tile {s_i}/{len(steps)}")
+                                if not crash_retried:
+                                    crash_retried = True
+                                    continue
+                                first_line = _first_line(e)
+                                fail_streak += 1
+                                if fail_streak >= MAX_TILE_FAILS:
+                                    raise
+                                emit("tile_failed", {"tile": s_i, "tiles": len(steps), "error": first_line})
+                                if key not in requeued:
+                                    band_failed.setdefault(band, []).append(steps[s_i - 1])
+                                break
                             if is_closed(e):
                                 if not rl.recover(f"tile {s_i}/{len(steps)}"):
                                     raise
@@ -991,7 +1105,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
         emit("collect_failed", {"error": f"{type(e).__name__}: {str(e)[:200]}"})
     finally:
         result.update(count=len(merged), skipped_far=skipped_far, skipped_known=skipped_known,
-                      budget_hit=budget_hit)
+                      budget_hit=budget_hit, page_crashes=crashes.total if crashes else 0)
         emit("links_done", {"count": len(merged), "skipped_far": skipped_far,
                             "skipped_known": skipped_known, "budget_hit": budget_hit})
         cstore.close()
@@ -1087,12 +1201,14 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
 
     saved = 0
     opened = 0
+    crashes: PageCrashes | None = None                            # W180
     try:
         with sync_playwright() as pw:
             kw = _launch_kwargs(opener_profile_dir(), headless)
             rl = Relauncher(lambda: _open_context(pw, kw), profile_dir=opener_profile_dir(),
                             on_restart=lambda where, n: emit_direct("browser_restart", {"where": where, "attempt": n}))
             ctx, page = rl.open()
+            crashes = PageCrashes(rl, emit_direct, "opener")      # W180
             try:
                 # Places whose panel this job has ALREADY read (an earlier area / run) — a
                 # second visit is reported as `dup`. Stubs are not "known" in that sense.
@@ -1144,6 +1260,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                     pacing.sleep_between()
                     place = None
                     nav_retried = False
+                    crash_retried = False     # W180: one retry of this place on a fresh page
                     try:
                         while place is None:
                             try:
@@ -1164,7 +1281,19 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                                 emit_direct("skip", {"href": href, "reason": "timeout"})
                                 break
                             except PWError as e:
-                                if is_closed(e):
+                                if is_page_crashed(e):
+                                    # W180: the renderer died (`Page.goto: Page crashed`, MAC under
+                                    # RAM pressure) — the context is alive, so `is_closed()` is
+                                    # false, and the W103 path below used to retry on the SAME
+                                    # dead page, skip the place and fail the lane after five.
+                                    # Replace the tab and retry THIS place once; only the retry's
+                                    # crash may skip it (W103 text). `PageCrashes.recover` raises
+                                    # the error unchanged after MAPS_CRASH_MAX crashes in a row.
+                                    ctx, page = crashes.recover(e, f"place {opened}")
+                                    if not crash_retried:
+                                        crash_retried = True
+                                        continue
+                                elif is_closed(e):
                                     # Same recovery as the collector: a dead browser costs this
                                     # one place, not the remaining list and not the places
                                     # already saved.
@@ -1182,7 +1311,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                                 # is already `opened`, the stub stays `pending`, and W98's stub
                                 # re-open hands it back later). Only a run of skipped places
                                 # ends the lane — that is a dead network, and it must surface.
-                                if not nav_retried:
+                                if not nav_retried and not crash_retried:
                                     nav_retried = True
                                     time.sleep(NAV_RETRY_SLEEP_SEC)
                                     continue
@@ -1200,6 +1329,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                     if place is None:
                         continue
                     nav_failures = 0
+                    crashes.ok()                                  # W180: a place opened, streak over
                     # feed card values fill whatever the panel didn't expose
                     if place.name is None and card.name:
                         place.name = card.name
@@ -1257,6 +1387,15 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
         if collector is not None:
             collector.join(timeout=120)
         drain()
+        # W180: the lane's end-of-run summary carries the crashes it survived (both tabs).
+        n_crashes = (crashes.total if crashes else 0) + int(cresult.get("page_crashes") or 0)
+        if n_crashes:
+            log.info("%d page crashes recovered this lane (W180)", n_crashes)
+            emit_direct("page_crashes_recovered", {"count": n_crashes})
+            try:
+                store.log(job_id, "discovery", f"{n_crashes} page crashes recovered (W180)", "info")
+            except Exception:                                     # noqa: BLE001
+                pass
     if cresult.get("error") is not None and saved == 0:
         # The search itself failed (captcha on the results page, dead browser) and there
         # was nothing to open: surface it as the lane error it is, not a silent "done".
