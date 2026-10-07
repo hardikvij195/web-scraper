@@ -91,3 +91,33 @@ def test_wa_free_false_while_an_inflight_job_still_has_numbers(monkeypatch, tmp_
     monkeypatch.setenv("LANE_ONE_JOB_PER_LANE", "0")
     w._inflight = {1: _Pipe(1)}
     assert w._wa_lane_claimed(_St({1: 40})) is False           # old W144 semantics untouched
+
+
+# ── W167 ────────────────────────────────────────────────────────────────────────────
+def test_lane_claimed_covers_enrichment_too(monkeypatch):
+    monkeypatch.delenv("LANE_ONE_JOB_PER_LANE", raising=False)
+    import threading
+
+    class _Lane:
+        def __init__(self, done=False):
+            self.done = threading.Event()
+            if done: self.done.set()
+        def enabled(self): return True
+
+    class _Pipe:
+        def __init__(self, job_id):
+            self.job_id = job_id
+            self.whatsapp = _Lane(); self.enrichment = _Lane()
+
+    class _St:
+        def __init__(self, enr, wa): self.enr, self.wa = enr, wa
+        def count_pending_enrichment(self, jid): return self.enr
+        def count_wa_pending(self, jid): return self.wa
+
+    w = S.Worker.__new__(S.Worker)
+    w._lock = threading.Lock()
+    w._inflight = {1: _Pipe(1)}
+    assert w._lane_claimed(_St(12, 0), S.LANE_ENRICHMENT) is True
+    assert w._lane_claimed(_St(0, 0), S.LANE_ENRICHMENT) is False
+    assert w._lane_claimed(_St(0, 7), S.LANE_WHATSAPP) is True
+    assert w._lane_claimed(_St(5, 5), S.LANE_DISCOVERY) is False

@@ -563,6 +563,27 @@ class Worker(threading.Thread):
             return 1
         return lanes_mod.enrich_slots() if lane == LANE_ENRICHMENT else lanes_mod.wa_slots()
 
+    def _lane_claimed(self, store: Store, lane: str) -> bool:
+        """W167 (CRM T1047): generalisation of `_wa_lane_claimed` to both stage lanes — MI 13:21 ran
+        #22565's WhatsApp lane (1,700 numbers left) AND the pinned WhatsApp-only #22536 at the same gate,
+        alternating whenever the first released its slot between batches. A lane is spoken for while any
+        in-flight job's lane of that kind is alive with work left, slot or no slot."""
+        if not lanes_mod.one_job_per_lane() or lane not in (LANE_ENRICHMENT, LANE_WHATSAPP):
+            return False
+        with self._lock:
+            pipes = [p for p in self._inflight.values() if p is not None]
+        for p in pipes:
+            ln = getattr(p, "whatsapp" if lane == LANE_WHATSAPP else "enrichment", None)
+            if ln is None or not ln.enabled() or ln.done.is_set():
+                continue
+            try:
+                left = store.count_wa_pending(p.job_id) if lane == LANE_WHATSAPP else store.count_pending_enrichment(p.job_id)
+                if int(left) > 0:
+                    return True
+            except Exception:                                     # noqa: BLE001
+                continue
+        return False
+
     def _wa_lane_claimed(self, store: Store) -> bool:
         """W164 (CRM T1047): under the one-job-per-lane rule the WhatsApp lane is spoken for while ANY
         in-flight job still has numbers to check, even when that lane holds no slot right now (idle
@@ -670,6 +691,7 @@ class Worker(threading.Thread):
         pending_by = {LANE_DISCOVERY: 0, LANE_ENRICHMENT: 0, LANE_WHATSAPP: 0}
         account = False
         wa_claimed = False                                            # W164
+        enr_claimed = False                                           # W167
         try:
             s = Store()
             try:
@@ -684,6 +706,7 @@ class Worker(threading.Thread):
                         pending_by[ln] += 1
                 account = wa_account_usable(s)
                 wa_claimed = self._wa_lane_claimed(s)             # W164
+                enr_claimed = self._lane_claimed(s, LANE_ENRICHMENT)  # W167
             finally:
                 s.close()
         except Exception:                                         # noqa: BLE001
@@ -698,7 +721,7 @@ class Worker(threading.Thread):
             # job (inflight <= guard), so the CRM still offers discovery work at the guard.
             maps_free = ((not blocked) and inflight <= guard
                          and busy[LANE_DISCOVERY] == 0 and pending_by[LANE_DISCOVERY] == 0)
-            enrich_free = ok and cap[LANE_ENRICHMENT] - busy[LANE_ENRICHMENT] - pending_by[LANE_ENRICHMENT] > 0
+            enrich_free = ok and not enr_claimed and cap[LANE_ENRICHMENT] - busy[LANE_ENRICHMENT] - pending_by[LANE_ENRICHMENT] > 0   # W167
             wa_free = (ok and account and not wa_claimed                                 # W164
                        and cap[LANE_WHATSAPP] - busy[LANE_WHATSAPP] - pending_by[LANE_WHATSAPP] > 0)
             return {"pipelining": True,
@@ -763,6 +786,11 @@ class Worker(threading.Thread):
                     wa_account = wa_account_usable(store)
                     enr_free = self._lane_free(LANE_ENRICHMENT)
                     wa_free = self._lane_free(LANE_WHATSAPP)
+                    # W167: a lane an in-flight job still has work for is not free, even between batches
+                    if enr_free and self._lane_claimed(store, LANE_ENRICHMENT):
+                        enr_free = 0
+                    if wa_free and self._lane_claimed(store, LANE_WHATSAPP):
+                        wa_free = 0
                     # First queued job whose window is open and whose next lane has room; jobs
                     # outside their window show 'waiting'. The CRM queues highest-priority-first.
                     for cand in store.queued_jobs():
