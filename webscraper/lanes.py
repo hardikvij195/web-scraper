@@ -324,7 +324,7 @@ class StageGate:
                 holder = next(iter(self._holders), None)
             now = time.monotonic()
             if noted_at is None or now - noted_at >= self.NOTE_EVERY_SEC:
-                on_wait(f"waiting for the {self.key} slot — held by job #{holder}")
+                on_wait(f"waiting for the {self.key} slot — held by job #{abs(holder) if isinstance(holder, int) else holder}")
                 noted_at = now
             time.sleep(self.POLL_SEC)
 
@@ -725,8 +725,10 @@ class Lane(threading.Thread):
     def _park(self, gate: "StageGate") -> None:
         holders = gate.holder_ids()
         holder: object = holders[0] if holders else "?"
+        if holders and holders[0] < 0:                            # W161: re-verify holder = -cloud_id
+            holder = -holders[0]
         try:                                                      # W155: the CRM's id, not the local one
-            row = self.store.get_job(int(holder)) if self.store and holders else None
+            row = self.store.get_job(int(holder)) if self.store and holders and holders[0] > 0 else None
             if row is not None and row["cloud_id"]:
                 holder = row["cloud_id"]
         except Exception:                                         # noqa: BLE001

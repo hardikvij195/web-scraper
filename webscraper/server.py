@@ -554,6 +554,9 @@ class Worker(threading.Thread):
         ids = gate.holder_ids() if gate is not None else []
         if not ids:
             return "?"
+        # W161: a WhatsApp re-verify (agent.py, no local row) holds the gate as `-cloud_id`.
+        if ids[0] < 0:
+            return str(-ids[0])
         try:
             row = store.get_job(ids[0])
             return str(row["cloud_id"] or ids[0]) if row is not None else str(ids[0])
