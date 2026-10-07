@@ -33,6 +33,7 @@ from typing import Any, Callable
 from webscraper.browser_recovery import (RELAUNCH_SETTLE_SEC, Relauncher, close_blank_pages,
                                          is_closed, is_profile_busy, kill_profile_holder,
                                          mark_profile_clean, reap_orphan_browsers)
+from webscraper.chrome_args import lean_args, merge_args
 from webscraper.config import _bool, settings
 
 log = logging.getLogger("webscraper.browser_fetch")
@@ -392,7 +393,8 @@ class BrowserFetcher:
 
     def _opener(self, pw: Any) -> Callable[[], tuple[Any, Any]]:
         proxy = _proxy_arg(self._proxy)
-        args = list(LAUNCH_ARGS)
+        # W169: + the Chrome RAM diet, minus the two flags IGNORE_DEFAULT_ARGS strips as tells.
+        args = merge_args(LAUNCH_ARGS, lean_args("enrich"))
         if not STEALTH:
             args.append(AUTOMATION_FLAG)
 

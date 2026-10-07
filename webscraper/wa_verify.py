@@ -22,6 +22,7 @@ Ban risk is never zero - use a spare number, not your main business WhatsApp.
 """
 from __future__ import annotations
 
+import os
 import re
 
 import logging
@@ -34,6 +35,7 @@ from typing import Any, Callable
 from playwright.sync_api import Error as PWError, Page, TimeoutError as PWTimeout, sync_playwright
 
 from webscraper import browser_recovery as _br
+from webscraper.chrome_args import lean_args, merge_args
 from webscraper.browser_recovery import (MAX_RELAUNCH, RESTORE_BUBBLE_ARGS, Relauncher,
                                          is_closed, mark_profile_clean)
 from webscraper.config import settings
@@ -675,7 +677,8 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
         # W116 (CRM T648): Chrome reopens a profile at the window position it last had. A profile
         # that ever ran "hidden" was parked at -32000,-32000, so the QR window came up off-screen on
         # 5 - MI (only a sliver at the left edge, QR unscannable). Pin it on screen explicitly.
-        args=["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS, *ON_SCREEN_ARGS]),
+        args=merge_args(["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS,
+                         *ON_SCREEN_ARGS], lean_args("wa"))),
         profile_dir(name), "wa-login")
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -1378,11 +1381,43 @@ def wa_window_mode() -> str:
 _WINDOW_FELL_BACK: set[str] = set()
 
 
+def lowmem_hidden_pct() -> float:
+    """W169: used-RAM % at which a `visible` WhatsApp window opens `hidden` instead; 0 = never."""
+    try:
+        return max(0.0, float((os.getenv("WA_LOWMEM_HIDDEN_PCT") or "85").strip()))
+    except ValueError:
+        return 85.0
+
+
+def pick_window_mode(configured: str, used_pct: float | None, threshold: float) -> str:
+    """Pure: `visible` becomes `hidden` at/above the threshold (a parked + minimised window
+    skips compositing and lets Chrome drop its tile memory). `hidden` / `headless` stay as
+    configured; headless Chromium never rendered WhatsApp Web (W65/W88), so never promote to it."""
+    if configured != "visible" or used_pct is None or threshold <= 0 or used_pct < threshold:
+        return configured
+    return "hidden"
+
+
+def window_mode_under_pressure(configured: str, name: str | None = None) -> str:
+    if configured != "visible":
+        return configured
+    try:
+        from webscraper import healthcheck
+        used = healthcheck._memory().get("used_pct")
+    except Exception:                                             # noqa: BLE001
+        return configured
+    mode = pick_window_mode(configured, used, lowmem_hidden_pct())
+    if mode != configured:
+        log.info("[%s] RAM %.0f%% used — WhatsApp window opens hidden instead of visible (W169)", name, used)
+    return mode
+
+
 def _launch_kwargs(mode: str, name: str | None = None) -> dict[str, Any]:
     """Playwright launch options for a mode. Hidden/headless use the installed Chrome —
     that is what made both render where headless Chromium never did. `name` picks the
     profile's own browser (W93)."""
-    base = ["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS]
+    # W169: + the shared Chrome RAM diet (`chrome_args.lean_args("wa")`, 512 MB V8 heap).
+    base = merge_args(["--disable-blink-features=AutomationControlled", *RESTORE_BUBBLE_ARGS], lean_args("wa"))
     ch = _chrome_channel(name)
     if mode == "headless" and not ch:
         # Bundled Chromium never renders WhatsApp Web headless (W65): without an installed
@@ -1430,6 +1465,7 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
         # that the per-machine DEFAULT and adds hidden / headless (real Chrome) — a mode
         # that failed to render once on this account falls back to visible for the run.
         mode = "visible" if name in _WINDOW_FELL_BACK else wa_window_mode()
+        mode = window_mode_under_pressure(mode, name)                 # W169
         if mode != "visible":
             log.info("[%s] WhatsApp window mode: %s", name, mode)
         ctx = pw.chromium.launch_persistent_context(

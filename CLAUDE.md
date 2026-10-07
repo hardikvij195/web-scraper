@@ -21,6 +21,7 @@ webscraper/
   store.py      sqlite3: jobs, places, job_links, wa_checks; _migrate(); exports
   wa_verify.py  WhatsApp Web check per number, account rotation
   healthcheck.py  `python -m webscraper doctor`
+  chrome_args.py  W169: the shared lean Chrome flag list (`lean_args(kind)` / `merge_args`) for every launch
 vercel-app/     Lead Finder Cloud SaaS (web-scraper-leads.vercel.app), own Supabase gfgkcnjxvxlusplwmvae
 scripts/        bump-version.py, regress-sites.py, install-agent.{sh,ps1} (the CRM "Install agent" button)
 data/           gitignored: leads.db, browser profiles, exports
@@ -88,6 +89,11 @@ data/           gitignored: leads.db, browser profiles, exports
 | `WA_RESYNC_LONG_WAIT_SEC` | `900` | W143: episode-3 re-sync recovery — kill the profile's Chrome + lock files, relaunch, wait ONE sync this long; episode 4 flags the account `needs_relink` |
 | `WA_RECYCLE_BACKOFF_CHECKS` | `400` | W143: after a boot whose sync took > 60 s, hold the W131 recycle for this many checks (heavy-history account); 0 = off |
 | `AGENT_LOOP_WATCHDOG_SEC` | `600` | W142: no CRM heartbeat for this long (and not just offline) -> flag jobs, kill our Chromes, `os._exit(3)`; the supervisor loop relaunches. 0 = off |
+| `CHROME_LEAN_ARGS` | `1` | W169 (CRM T1047): Chrome RAM diet on every launch (`chrome_args.lean_args`: no site-per-process / IsolateOrigins / BackForwardCache, `--renderer-process-limit=2`, no sync / component update / background networking, V8 heap cap). `0` = stock args |
+| `CHROME_JS_HEAP_MB[__MAPS/__WA/__ENRICH]` | `256` / `512` (wa) | W169: `--js-flags=--max-old-space-size`; 0 = no cap |
+| `MAPS_BLOCK_ASSETS` | `1` | W169: Maps tabs abort image / media / font requests by resource type (CSS kept); `0` = load everything |
+| `MAPS_RELAUNCH_LOWMEM_DIVISOR` | `2` | W169: on <= 8.5 GB total RAM the W120 DEFAULT cadences are divided by this (40->20 places, 20->10 tiles); an explicit `MAPS_RELAUNCH*` is never touched |
+| `WA_LOWMEM_HIDDEN_PCT` | `85` | W169: a `visible` WhatsApp window opens `hidden` (off-screen + minimised real Chrome) when RAM used% is at/above this at open time; never promoted to headless; 0 = off |
 
 ## Lead Finder Cloud (vercel-app)
 

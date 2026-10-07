@@ -30,6 +30,7 @@ from webscraper.extractors import (
 )
 from webscraper.geocode import GeoHit, geocode_location
 from webscraper.models import Place
+from webscraper.chrome_args import lean_args, merge_args
 from webscraper.browser_recovery import (RESTORE_BUBBLE_ARGS, Relauncher, close_blank_pages,
                                          is_closed, mark_profile_clean)
 from webscraper.store import Store, now_iso
@@ -471,15 +472,57 @@ def _per_device(name: str, generic: str, default: str) -> int:
         return int(default)
 
 
+#: W169 (CRM T1047): a machine with this much RAM or less (8 GB laptops: ~7.9-8.5 GB reported)
+#: recycles the Maps contexts twice as often when nobody set a cadence — the tab's growth per
+#: place is the same on every machine, the headroom is not.
+LOWMEM_TOTAL_MB = 8500.0
+_TOTAL_MB_CACHE: list = []
+
+
+def lowmem_divisor() -> int:
+    try:
+        return max(1, int((os.getenv("MAPS_RELAUNCH_LOWMEM_DIVISOR") or "2").strip()))
+    except ValueError:
+        return 2
+
+
+def total_memory_mb() -> float | None:
+    """`healthcheck._memory()['total_mb']`, read once per process (it never changes)."""
+    if not _TOTAL_MB_CACHE:
+        try:
+            from webscraper import healthcheck
+            _TOTAL_MB_CACHE.append(healthcheck._memory().get("total_mb"))
+        except Exception:                                         # noqa: BLE001
+            _TOTAL_MB_CACHE.append(None)
+    return _TOTAL_MB_CACHE[0]
+
+
+def lowmem_cadence(n: int, total_mb: float | None, overridden: bool, divisor: int = 2) -> int:
+    """Pure: the W120 default `n`, divided by `divisor` on a low-RAM machine. An explicit
+    cadence (per-device CRM setting or the generic env) is never touched; 0 (= off) stays 0."""
+    if overridden or n <= 0 or total_mb is None or total_mb > LOWMEM_TOTAL_MB or divisor <= 1:
+        return n
+    return max(1, n // divisor)
+
+
+def _cadence_overridden(generic: str) -> bool:
+    return bool(os.getenv(f"MAPS_RELAUNCH__{_device_upper()}") or os.getenv(generic))
+
+
 def opener_relaunch_every() -> int:
-    return _per_device("MAPS_RELAUNCH", "MAPS_RELAUNCH_EVERY_PLACES", "40")
+    n = _per_device("MAPS_RELAUNCH", "MAPS_RELAUNCH_EVERY_PLACES", "40")
+    return lowmem_cadence(n, total_memory_mb(), _cadence_overridden("MAPS_RELAUNCH_EVERY_PLACES"),
+                          lowmem_divisor())
 
 
 def collect_relaunch_every() -> int:
     # The tile cadence follows the same per-device knob at half the value (a tile is cheaper
     # than a place panel), so one CRM setting tunes both loops on a RAM-bound laptop.
     n = _per_device("MAPS_RELAUNCH", "MAPS_RELAUNCH_EVERY_TILES", "20")
-    return max(1, n // 2) if os.getenv(f"MAPS_RELAUNCH__{_device_upper()}") else n
+    if os.getenv(f"MAPS_RELAUNCH__{_device_upper()}"):
+        return max(1, n // 2)
+    return lowmem_cadence(n, total_memory_mb(), _cadence_overridden("MAPS_RELAUNCH_EVERY_TILES"),
+                          lowmem_divisor())
 
 
 def recycle_due(count: int, every: int) -> bool:
@@ -511,19 +554,50 @@ def _launch_kwargs(profile_dir: Path, headless: bool) -> dict:
     kw: dict = dict(
         user_data_dir=str(profile_dir), headless=headless, locale="en-IN",
         viewport={"width": 1366, "height": 850},
-        args=["--disable-blink-features=AutomationControlled", "--lang=en-IN", *RESTORE_BUBBLE_ARGS],
+        # W169: + the shared Chrome RAM diet (`chrome_args.lean_args`; CHROME_LEAN_ARGS=0 = off).
+        args=merge_args(["--disable-blink-features=AutomationControlled", "--lang=en-IN",
+                         *RESTORE_BUBBLE_ARGS], lean_args("maps")),
     )
     if settings.maps_proxy:
         kw["proxy"] = {"server": settings.maps_proxy}
     return kw
 
 
+#: W169: resource types the Maps tabs never need (`MAPS_BLOCK_ASSETS=0` keeps everything).
+BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+_ASSET_URL_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I)
+
+
+def block_assets_enabled() -> bool:
+    return (os.getenv("MAPS_BLOCK_ASSETS") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def should_block_asset(resource_type: str | None, url: str) -> bool:
+    """Pure decision behind the route: block image / media / font, keep document, script,
+    stylesheet, xhr, fetch and everything else."""
+    return (resource_type or "").lower() in BLOCKED_RESOURCE_TYPES or bool(_ASSET_URL_RE.search(url or ""))
+
+
+def _asset_route(route) -> None:
+    try:
+        req = route.request
+        if should_block_asset(req.resource_type, req.url):
+            route.abort()
+        else:
+            route.continue_()
+    except Exception:                                             # noqa: BLE001
+        pass                                                      # the page is closing
+
+
 def _open_context(pw, launch_kwargs: dict):
     log.info("launching %s Chrome (profile %s)…", "headless" if launch_kwargs.get("headless") else "headed", launch_kwargs.get("user_data_dir"))
     c = pw.chromium.launch_persistent_context(**launch_kwargs)
-    # images/fonts/media add nothing we read — skipping them cuts bandwidth ~80%
-    c.route(re.compile(r"\.(png|jpe?g|gif|webp|svg|woff2?|ttf|mp4|webm)(\?|$)", re.I),
-            lambda route: route.abort())
+    if block_assets_enabled():
+        # W169 (CRM T1047): images/fonts/media add nothing we read. Keyed on Playwright's
+        # resource type (a CDN tile with no extension is still dropped) with the old URL regex
+        # as the fallback; stylesheets stay — the panel layout (and our hooks) depend on them.
+        c.route("**/*", _asset_route)
+        log.info("Maps assets blocked: images/media/fonts (W169)")
     pg = c.pages[0] if c.pages else c.new_page()
     close_blank_pages(c, keep=pg)   # T397
     pg.set_default_timeout(20000)
