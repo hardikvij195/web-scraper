@@ -1169,6 +1169,16 @@ class Worker(threading.Thread):
                 user_stopped = store.stop_requested(job_id)
                 final = "stopped" if user_stopped else "done"
                 note = pipe.summary()
+                # W156 (CRM T1047): a job PARKED by W151 (memory) or W153 (lane rule) carries its park
+                # text in `message`; `agent.py` reports `message` to the CRM and `lead_gen_requeue_orphans()`
+                # matches on it. Writing the lane summary over it here is why MAC's #22556 reached the CRM
+                # as "discovery: completed · enrichment: completed · whatsapp: stopped" (never re-queued).
+                try:
+                    prev = str((store.get_job(job_id) or {})["message"] or "")
+                except Exception:                                 # noqa: BLE001
+                    prev = ""
+                if user_stopped and prev.startswith("parked by"):
+                    note = f"{prev} · {note}"
                 store.update_job(job_id, phase=final, status=final, message=note)
                 store.log(job_id, "job", f"job {final} — {note}")
 
