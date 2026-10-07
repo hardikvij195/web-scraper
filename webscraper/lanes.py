@@ -204,8 +204,27 @@ def _wait_for_relink_inner(lane: "Lane", store: Store, err: Exception) -> bool |
         if lane.stopped():
             return R_STOPPED
         if reprobe > 0 and not probed_ok and _relink_now() >= next_probe:
+            first_probe = next_probe == wait_t0
             next_probe = _relink_now() + reprobe
             probed_ok = _reprobe_flagged(lane, store)
+            # W159 (CRM T1047): a job with NOTHING else running (its Maps / websites lanes are done or
+            # disabled) must not sit "running" for 15 min on a machine whose WhatsApp is unlinked —
+            # DELL held #81 / #125 / #213 that way at 11:36 while 5 more queued behind them. The W110
+            # wait is for a session that dropped MID-job while other lanes still feed numbers; a
+            # lane-only job ends `wa_no_session` right after the first probe says "still no session"
+            # and the CRM moves its WhatsApp pass to a machine that has one (T1024). Default on; the
+            # pre-W159 behaviour needs `WA_NO_SESSION_GIVE_UP_SEC=0` (wait for ever) as before.
+            if first_probe and not probed_ok and give_up > 0 and one_job_per_lane():
+                other_done = getattr(lane.ctl, "other_lanes_done", None)
+                try:
+                    lane_only = bool(other_done(lane)) if other_done is not None else False
+                except Exception:                                 # noqa: BLE001
+                    lane_only = False
+                if lane_only and not store.wa_relinked_since(since):
+                    lane.note("no WhatsApp session on this machine and nothing else left to do here — "
+                              "handing the WhatsApp pass back to the CRM now instead of waiting "
+                              f"{int(give_up // 60)} min (W159)", "warn")
+                    return R_WA_NO_SESSION
         if probed_ok or store.wa_relinked_since(since):
             lane.note("WhatsApp account linked — WhatsApp lane resuming", "info")
             if gate is not None and not gate.acquire(lane.job_id, lane.stopped, lambda m: lane.note(m)):
