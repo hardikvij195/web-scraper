@@ -94,6 +94,7 @@ data/           gitignored: leads.db, browser profiles, exports
 | `MAPS_BLOCK_ASSETS` | `1` | W169: Maps tabs abort image / media / font requests by resource type (CSS kept); `0` = load everything |
 | `MAPS_RELAUNCH_LOWMEM_DIVISOR` | `2` | W169: on <= 8.5 GB total RAM the W120 DEFAULT cadences are divided by this (40->20 places, 20->10 tiles); an explicit `MAPS_RELAUNCH*` is never touched |
 | `WA_LOWMEM_HIDDEN_PCT` | `85` | W169: a `visible` WhatsApp window opens `hidden` (off-screen + minimised real Chrome) when RAM used% is at/above this at open time; never promoted to headless; 0 = off |
+| `WA_REPROBE_FORCE_MIN` | `20` | W170: the W152 relink re-probe skips while RAM >= `WA_HOLD_MEM_PCT` (88 %, the WhatsApp lane's own W162 gate — no longer the 80 % enrichment gate); a flag deferred this many minutes is probed anyway, once, so it can never stay stuck (MI 2026-10-07); 0 = never force |
 
 ## Lead Finder Cloud (vercel-app)
 

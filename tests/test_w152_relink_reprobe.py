@@ -65,7 +65,7 @@ def test_relink_wait_resumes_when_the_probe_sees_the_chat_list(monkeypatch):
     monkeypatch.setattr(L, "_relink_now", _Clock(step=1.0))
     probes: list[str] = []
     monkeypatch.setattr(L, "_account_status", lambda name: probes.append(name) or "logged_in")
-    monkeypatch.setattr(E, "browser_fallback_allowed", lambda: True)
+    monkeypatch.setattr(L, "memory_high_for_whatsapp", lambda: False)   # W170 gate
     lane, store = _flagged(_relink_lane(), ["main"], None)
     gate = L.STAGE_GATES["whatsapp"]
     assert gate.acquire(1, lambda: False, lambda m: None)
@@ -86,7 +86,7 @@ def test_relink_wait_reprobes_on_the_interval_then_gives_up(monkeypatch):
     monkeypatch.setattr(L, "_relink_now", _Clock(step=50.0))   # each poll = 50 s
     probes: list[str] = []
     monkeypatch.setattr(L, "_account_status", lambda name: probes.append(name) or "logged_out")
-    monkeypatch.setattr(E, "browser_fallback_allowed", lambda: True)
+    monkeypatch.setattr(L, "memory_high_for_whatsapp", lambda: False)   # W170 gate
     lane, store = _flagged(_relink_lane(), ["main"], None)
     out = L._wait_for_relink(lane, store, RuntimeError("WhatsApp account(s) need a fresh QR relink: main"))
     assert out == L.R_WA_NO_SESSION
@@ -97,10 +97,11 @@ def test_relink_wait_reprobes_on_the_interval_then_gives_up(monkeypatch):
 def test_reprobe_skips_high_memory_and_open_logins(monkeypatch):
     lane, store = _flagged(_relink_lane(), ["main"], None)
     monkeypatch.setattr(L, "_account_status", lambda name: pytest.fail("must not probe"))
-    monkeypatch.setattr(E, "browser_fallback_allowed", lambda: False)   # W151: >= 80 % RAM
+    monkeypatch.setattr(L, "_REPROBE_DEFERRED_SINCE", None)
+    monkeypatch.setattr(L, "memory_high_for_whatsapp", lambda: True)   # W170: >= WA_HOLD_MEM_PCT (88 %)
     assert L._reprobe_flagged(lane, store) is False
     assert any("memory is high" in n for n in lane.notes), lane.notes
-    monkeypatch.setattr(E, "browser_fallback_allowed", lambda: True)
+    monkeypatch.setattr(L, "memory_high_for_whatsapp", lambda: False)
     from webscraper import wa_verify as wv
     monkeypatch.setattr(wv, "login_in_progress", lambda name=None: True)  # the owner is scanning
     assert L._reprobe_flagged(lane, store) is False
@@ -108,7 +109,7 @@ def test_reprobe_skips_high_memory_and_open_logins(monkeypatch):
 
 def test_reprobe_errors_never_end_the_wait(monkeypatch):
     lane, store = _flagged(_relink_lane(), ["main"], None)
-    monkeypatch.setattr(E, "browser_fallback_allowed", lambda: True)
+    monkeypatch.setattr(L, "memory_high_for_whatsapp", lambda: False)   # W170 gate
 
     def boom(name):
         raise RuntimeError("chrome exploded")

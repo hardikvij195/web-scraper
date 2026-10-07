@@ -93,7 +93,8 @@ WA_SYNC_GIVE_UP = 12
 #: the restart their sessions were fine, the owner's Start session showed the chat list with no QR,
 #: yet three WhatsApp lanes had already waited 15 min each and ended `wa_no_session`. A probe that
 #: sees the chat list stamps `logged_in` (which clears the flag — Store.set_wa_status) and the lane
-#: resumes by itself. Skipped while a login window is open for that account or RAM is >= 80 %.
+#: resumes by itself. Skipped while a login window is open for that account or RAM is >= WA_HOLD_MEM_PCT
+#: (W170: 88 %, the WhatsApp lane's own gate; forced anyway after WA_REPROBE_FORCE_MIN minutes).
 WA_RELINK_REPROBE_SEC = 300.0
 
 
@@ -110,20 +111,55 @@ def _account_status(name: str) -> str:
     return wa_verify.account_status(name)
 
 
+#: W170 (2026-10-07, MI): the re-probe used the W151 enrichment gate (80 % RAM) while the WhatsApp lane
+#: itself runs under the looser W162 gate (`WA_HOLD_MEM_PCT`, 88 %). Maps held MI at 84-87 % for hours,
+#: so every 5-min re-probe was skipped, the (false) NEEDS RELINK flag never cleared, the lane sat idle
+#: and the job's WA pass gave up. Now the re-probe uses the lane's own gate, and a flag deferred for
+#: >= `WA_REPROBE_FORCE_MIN` minutes (default 20) is probed anyway, once, so it can never stay stuck.
+WA_REPROBE_FORCE_MIN = 20.0
+
+#: monotonic stamp of the first memory-skipped re-probe in this deferral episode; None = not deferred.
+_REPROBE_DEFERRED_SINCE: float | None = None
+
+
+def wa_reprobe_force_min() -> float:
+    try:
+        return max(0.0, float(os.getenv("WA_REPROBE_FORCE_MIN", str(WA_REPROBE_FORCE_MIN)) or WA_REPROBE_FORCE_MIN))
+    except ValueError:
+        return WA_REPROBE_FORCE_MIN
+
+
 def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
-    """W152: probe every `needs_relink` account; True when one showed its chat list (link is fine)."""
+    """W152: probe every `needs_relink` account; True when one showed its chat list (link is fine).
+
+    W170: memory gate = the WhatsApp lane's own (`memory_high_for_whatsapp`, 88 %), not the 80 %
+    enrichment gate; a probe deferred for >= WA_REPROBE_FORCE_MIN minutes runs regardless."""
+    global _REPROBE_DEFERRED_SINCE
     names = list(getattr(store, "flagged_wa_accounts", lambda: [])() or [])
     if not names:
         return False
     wa_verify = None
     try:
         from webscraper import wa_verify
-        from webscraper.enrich import browser_fallback_allowed
-        if not browser_fallback_allowed():                      # W151: no extra Chrome above 80 % RAM
-            lane.note("WhatsApp relink re-probe skipped — memory is high on this machine; trying again later", "info")
-            return False
-    except Exception:                                             # noqa: BLE001 — no reading: probe anyway
+    except Exception:                                             # noqa: BLE001
         pass
+    try:
+        mem_high = bool(memory_high_for_whatsapp())
+    except Exception:                                             # noqa: BLE001 — no reading: probe anyway
+        mem_high = False
+    if mem_high:
+        now = _relink_now()
+        if _REPROBE_DEFERRED_SINCE is None:
+            _REPROBE_DEFERRED_SINCE = now
+        deferred_min = (now - _REPROBE_DEFERRED_SINCE) / 60.0
+        force_min = wa_reprobe_force_min()
+        if force_min <= 0 or deferred_min < force_min:
+            lane.note(f"WhatsApp relink re-probe skipped — memory is high on this machine (RAM >= "
+                      f"{int(wa_hold_mem_pct())}%); trying again later", "info")
+            return False
+        lane.note(f"WhatsApp relink re-probe forced after {int(deferred_min)} min — the flag must not stay "
+                  "stuck behind the memory gate", "info")
+    _REPROBE_DEFERRED_SINCE = None                                # a probe runs: reset the deferral clock
     ok = False
     for name in names:
         try:
