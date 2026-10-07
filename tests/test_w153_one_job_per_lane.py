@@ -187,4 +187,15 @@ def test_pipeline_other_lanes_done(tmp_path: Path):
     assert pipe.other_lanes_done(pipe.whatsapp) is False          # enrichment still to run
     pipe.enrichment.done.set()
     assert pipe.other_lanes_done(pipe.whatsapp) is True
-    assert pipe.other_lanes_done(pipe.enrichment) is False        # WhatsApp lane still alive
+    # W160: an alive WhatsApp lane that holds NO slot (idle, waiting for numbers) is not working
+    assert pipe.other_lanes_done(pipe.enrichment) is True
+    gate = L.STAGE_GATES["whatsapp"]
+    assert gate.acquire(job_id, lambda: False, lambda m: None)   # now it IS verifying numbers
+    assert pipe.other_lanes_done(pipe.enrichment) is False
+    gate.release(job_id)
+    # Maps alive (enabled, not ended) always counts as working — no gate to hold
+    full = L.Pipeline(job_id, {"do_enrich": 1, "do_research": 0, "do_wa_verify": 1, "country": "IN"},
+                      lambda lane: L.R_COMPLETED, store_factory=lambda: Store(path))
+    assert full.discovery.enabled() and full.other_lanes_done(full.enrichment) is False
+    full.discovery.done.set()
+    assert full.other_lanes_done(full.enrichment) is True

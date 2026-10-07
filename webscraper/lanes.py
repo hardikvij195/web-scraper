@@ -1470,8 +1470,21 @@ class Pipeline:
         return not self.discovery.enabled() or self.discovery.done.is_set()
 
     def other_lanes_done(self, lane: "Lane") -> bool:
-        """W153: is `lane` the only lane of this job still alive? (the others disabled or ended)"""
-        return all(l is lane or not l.enabled() or l.done.is_set() for l in self.lanes)
+        """W153: is `lane` the only lane of this job still WORKING? A lane counts as working while it
+        is enabled and not ended AND — W160 (CRM T1047) — it is Maps, or it holds its stage slot.
+        DELL 11:36: #1071 / #6992 / #6995 (Maps done) queued for the websites slot for 13 min because
+        their WhatsApp lane was "alive" — idle, waiting for numbers the websites lane could not
+        produce, holding no slot. Nothing was working; the job should have parked. A lane queued
+        for its gate (not holding) is not working either; the park text names the holder."""
+        for l in self.lanes:
+            if l is lane or not l.enabled() or l.done.is_set():
+                continue
+            if l.key == "discovery":
+                return False                              # Maps runs without a gate: alive = working
+            gate = STAGE_GATES.get(l.key)
+            if gate is not None and gate.holds(self.job_id):
+                return False
+        return True
 
     def enrichment_finished(self) -> bool:
         # A job with enrichment switched off still feeds WhatsApp: discovery writes the
