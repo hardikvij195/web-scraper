@@ -1381,8 +1381,29 @@ _LOOP_WD: dict = {"ok": time.monotonic(), "attempt": 0.0, "err": 0.0, "cloud": N
 LOOP_WATCHDOG_POLL_SEC = 30.0
 
 
+def _alive_path() -> "Path":
+    from webscraper.config import ROOT
+    return ROOT / "data" / "agent.alive"
+
+
+def _touch_alive() -> None:
+    """W182 (T1078, DELL 2026-10-08 19:00): touch `data/agent.alive` on every successful CRM
+    poll. `scripts/agent-autostart.vbs` reads its mtime: a `run-agent-loop.bat` cmd.exe that is
+    alive but whose agent has not polled for 30 min (the loop hung in `git pull`/`pip` on a
+    half-dead network after a watchdog `os._exit(3)`) is killed and relaunched instead of
+    blocking every relaunch for ever. Best effort — never let a disk hiccup fail the poll."""
+    try:
+        p = _alive_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.touch()
+    except Exception:                                             # noqa: BLE001
+        log.debug("could not touch agent.alive", exc_info=True)
+
+
 def _loop_wd_mark(key: str) -> None:
     _LOOP_WD[key] = time.monotonic()
+    if key == "ok":
+        _touch_alive()
 
 
 def _watchdog_should_restart(now: float, last_ok: float, last_attempt: float, last_err: float,

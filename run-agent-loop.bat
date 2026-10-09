@@ -29,7 +29,12 @@ if exist "data\agent.stop" (
 )
 REM Self-update before every start (2026-08-26) - fast-forward only, never blocks;
 REM offline just runs what is on disk. A restart is therefore also an upgrade.
-git pull --ff-only -q >> "data\agent.log" 2>&1 && "%PY%" -m pip install -q -r requirements.txt >> "data\agent.log" 2>&1
+REM W182 (T1078, DELL 2026-10-08): a half-dead network left `git pull` waiting for ever (no
+REM timeout, and a credential prompt with no console blocks too) and the autostart guard saw
+REM this cmd.exe and never relaunched. Never prompt; give up when the transfer stalls.
+set "GIT_TERMINAL_PROMPT=0"
+git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 pull --ff-only -q >> "data\agent.log" 2>&1 && "%PY%" -m pip install -q --timeout 30 --retries 2 -r requirements.txt >> "data\agent.log" 2>&1
+echo [%date% %time%] loop: git/pip step done >> "data\agent.log"
 echo [%date% %time%] starting agent >> "data\agent.log"
 "%PY%" -m webscraper agent --crm --poll 5 >> "data\agent.log" 2>&1
 echo [%date% %time%] agent exited (code %errorlevel%) - restarting in 15s >> "data\agent.log"

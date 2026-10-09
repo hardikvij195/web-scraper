@@ -48,8 +48,10 @@ while true; do
   # the Mac still ran the commit it was installed from. Fast-forward only, never blocks:
   # offline or a diverged tree just runs whatever is on disk. `agent exited` → restart
   # is therefore also "upgrade" — the CRM can bounce an agent to update it.
-  if git pull --ff-only -q 2>>data/agent.log; then
-    "$PY" -m pip install -q -r requirements.txt >>data/agent.log 2>&1 || true
+  # W182 (T1078): never prompt for credentials, give up on a stalled transfer (DELL's loop hung
+  # in `git pull` for 14 h on a half-dead network and blocked every relaunch).
+  if GIT_TERMINAL_PROMPT=0 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 pull --ff-only -q 2>>data/agent.log; then
+    "$PY" -m pip install -q --timeout 30 --retries 2 -r requirements.txt >>data/agent.log 2>&1 || true
   fi
   echo "[$(date '+%d-%m-%Y %H.%M.%S')] starting agent ($(git rev-parse --short HEAD 2>/dev/null))" >> data/agent.log
   "$PY" -m webscraper agent --crm --poll 5 >> data/agent.log 2>&1
