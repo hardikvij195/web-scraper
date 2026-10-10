@@ -351,6 +351,26 @@ class CrmCloud:
         r.raise_for_status()
         return r.json()
 
+    def claim_verdict(self, jid: int) -> tuple[dict | None, str | None]:
+        """W184 (CRM T1104): `claim` that keeps the CRM's refusal text — `(row, None)` when the CRM
+        gave (or re-gave) this machine the job, `(None, error)` on 404/409 (`job is for X`, `kept off`,
+        `job is done`, `claimed by another agent`, …). Raises when the CRM can't be reached."""
+        extra: dict = {}
+        if self.capacity_fn is not None:
+            try:
+                extra["capacity"] = self.capacity_fn()
+            except Exception:                                     # noqa: BLE001
+                log.debug("capacity() failed", exc_info=True)
+        r = self._post(crm_payload("claim", job_id=jid, **extra))
+        if r.status_code in (404, 409):
+            try:
+                err = str((r.json() or {}).get("error") or "")
+            except Exception:                                     # noqa: BLE001
+                err = ""
+            return None, err or f"HTTP {r.status_code}"
+        r.raise_for_status()
+        return r.json(), None
+
     def progress(self, jid: int, phase: str | None, progress: dict) -> ProgressReply:
         """Cancelled / reassigned (W114, CRM T624) status from the CRM."""
         r = self._post(crm_payload("progress", job_id=jid, phase=phase, progress=progress))
@@ -1002,6 +1022,37 @@ def _close_browsers(reason: str = "agent exiting") -> None:
             pass
 
 
+def resume_verdict(device: str, *, row: dict | None = None, error: str | None = None) -> tuple[str, str]:
+    """W184 (CRM T1104): pure — may this machine resume a local job left mid-run? Fed by
+    `CrmCloud.claim_verdict`: `row` = the CRM handed the job (back) to us, `error` = its 409/404 text.
+    Returns `("resume" | "drop" | "ask", why)`; "ask" = can't tell from the claim (the CRM says
+    "claimed by another agent" for a fresh row, which may be ours) — fall back to the W114 progress ping.
+    ASUS kept resuming local #411 = CRM #22708 after the CRM had re-queued it / kept ASUS off it."""
+    if row is not None:
+        owner = str(row.get("agent_device") or "")
+        status = str(row.get("status") or "")
+        if owner and device and owner != device:
+            return "drop", f"CRM gave it to {owner}"
+        if status and status not in ("claimed", "running"):
+            return "drop", f"CRM job is {status}"
+        return "resume", ""
+    err = (error or "").strip()
+    low = err.lower()
+    if not err:
+        return "resume", ""
+    if "claimed by another agent" in low:
+        return "ask", err
+    if low.startswith("job is for "):
+        return "drop", f"CRM gave it to {err[len('job is for '):].strip()}"
+    if "kept off" in low:
+        return "drop", "CRM kept this machine off it (T1101)"
+    if low.startswith("job is "):
+        return "drop", f"CRM job is {err[len('job is '):].strip()}"
+    if "no such job" in low:
+        return "drop", "CRM job no longer exists"
+    return "drop", f"CRM re-queued it and kept this machine off it — {err}"
+
+
 def _requeue_orphans(store: Store, kind: str, cloud: "Cloud | CrmCloud | None" = None) -> int:
     """Put jobs the last agent died mid-run back on the Worker's queue.
 
@@ -1028,6 +1079,25 @@ def _requeue_orphans(store: Store, kind: str, cloud: "Cloud | CrmCloud | None" =
         "AND COALESCE(stop_requested,0)=0", (kind,)).fetchall()
     resumed = 0
     for r in rows:
+        # W184 (CRM T1104): does this machine still own the CRM job? A plain progress ping would
+        # stamp a re-queued (unowned) row `running` again, so ask with a claim first: the CRM hands a
+        # re-queued job back only if it may run here (pin / T1101 keep-off / lane gates), and refuses
+        # with the reason otherwise. CRM unreachable = resume as before.
+        claim_verdict = getattr(cloud, "claim_verdict", None) if cloud is not None else None
+        if claim_verdict is not None:
+            try:
+                c_row, c_err = claim_verdict(int(r["cloud_id"]))
+                verdict, why = resume_verdict(DEVICE_NAME, row=c_row, error=c_err)
+            except Exception:                                     # noqa: BLE001
+                log.debug("W184: could not ask the CRM who owns job #%s", r["cloud_id"], exc_info=True)
+                verdict, why = "resume", ""
+            if verdict == "drop":
+                msg = f"dropped local job #{r['id']} (CRM #{r['cloud_id']}): {why} (W184)"
+                store.update_job(int(r["id"]), phase="stopped", status="stopped", stop_requested=1,
+                                 note="synced", message=f"not resumed: {why} (W184)")
+                store.log(int(r["id"]), "job", msg, "warn")
+                log.warning(msg)
+                continue
         if cloud is not None:
             try:
                 reply = cloud.progress(int(r["cloud_id"]), r["phase"], _local_progress(r, store))
@@ -1852,7 +1922,9 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # W181: per-machine Chrome diet switches (read at the next launch)
                             "MAPS_BLOCK_ASSETS__", "CHROME_LEAN_ARGS__",
                             # W183: Chrome Job Object RAM cap (read at the next launch)
-                            "CHROME_JOB_MEM_MB")
+                            "CHROME_JOB_MEM_MB",
+                            # W184: per-machine WhatsApp OFF switch (`wa_off__<device>`)
+                            "WA_OFF")
 
 #: How often the main loop re-fetches cloud config for the knobs above.
 CONFIG_REFRESH_SEC = 300.0
@@ -2030,6 +2102,10 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 label = (cmd.get("arg") or "main").strip() or "main"
                 log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
                 # W142: a running job no longer blocks the login — the lane pauses this account.
+                from webscraper.lanes import wa_off as _wa_off_fn
+                if _wa_off_fn():
+                    log.warning("wa_login %r while WhatsApp is switched off on this machine (wa_off, W184) — "
+                                "linking by hand; jobs still send WhatsApp checks elsewhere", label)
                 ok = wa_verify.login(label, busy=getattr(srv.worker, "current_job", None) is not None)
                 result = (f"linked {label}" if ok
                           else wa_verify.LAST_LOGIN_RESULT.get(label) or "timed out waiting for the QR scan (2 min)")
@@ -2752,6 +2828,9 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             # W108: never a second re-verify while one runs (its progress can go stale during
             # a long sync wait, and a stale job is claimable again by this same device).
             if _reverify_busy() is not None or held:
+                continue
+            from webscraper.lanes import wa_off as _wa_off_fn
+            if _wa_off_fn():                         # W184: a re-verify is pure WhatsApp — never here
                 continue
             if cloud.claim(cj["id"]) is None:
                 continue

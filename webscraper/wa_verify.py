@@ -620,6 +620,9 @@ def login(name: str, *, busy: bool = False) -> bool:
     within the boot window is treated as broken — and nothing linked ever looks like
     that.
     """
+    if _wa_off():                                                 # W184: a hand-run relink still works
+        log.warning("wa_login %r: WhatsApp is switched off on this machine (wa_off, W184) — opening the "
+                    "login window anyway; no job uses WhatsApp here until wa_off is cleared", name)
     if busy:
         return with_lane_paused(name, lambda: login(name))
     Store().add_wa_account(name)
@@ -740,6 +743,18 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
         ctx.close()
 
 
+class WaOff(RuntimeError):
+    """W184: WhatsApp is switched off on this machine (`WA_OFF` / `WA_OFF__<DEVICE>`)."""
+
+
+def _wa_off() -> bool:
+    try:
+        from webscraper.lanes import wa_off
+        return wa_off()
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
 def account_status(name: str) -> str:
     """Probe a profile: 'logged_in' | 'logged_out' | 'unknown'.
 
@@ -750,6 +765,9 @@ def account_status(name: str) -> str:
     `disabled` flag was once set by. Only a page that actually showed the link-device
     screen counts as logged out; anything else leaves the last known answer alone.
     """
+    if _wa_off():                                                 # W184: no WhatsApp Chrome here
+        log.info("WhatsApp probe for %r skipped — WhatsApp is switched off on this machine (wa_off, W184)", name)
+        return "unknown"
     mark_profile_clean(profile_dir(name))
     with sync_playwright() as pw:
         # W88: the installed Chrome in new-headless mode — headless CHROMIUM never rendered
@@ -808,6 +826,8 @@ def verify_places(
     Rotates across enabled accounts, respects each account's daily cap, paces checks.
     Returns counts: {yes, no, unknown, checked, capped, no_number}.
     """
+    if _wa_off():                                                 # W184: never launch WhatsApp Chrome here
+        raise WaOff("WhatsApp is switched off on this machine (wa_off, W184)")
     from webscraper.store import wa_candidates
     on_progress = on_progress or (lambda pk, s, num=None, source=None: None)
     should_stop = should_stop or (lambda: False)
@@ -1500,6 +1520,8 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
     needing to know how the browser was built. One Relauncher per account: a flaky account
     must not spend the relaunch budget of the others.
     """
+    if _wa_off():                                                 # W184: covers the Relauncher recovery path too
+        raise WaOff("WhatsApp is switched off on this machine (wa_off, W184)")
     if name in open_ctx:
         return open_ctx[name][1]
 

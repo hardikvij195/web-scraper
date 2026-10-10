@@ -137,6 +137,8 @@ def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
     W170: memory gate = the WhatsApp lane's own (`memory_high_for_whatsapp`, 88 %), not the 80 %
     enrichment gate; a probe deferred for >= WA_REPROBE_FORCE_MIN minutes runs regardless."""
     global _REPROBE_DEFERRED_SINCE
+    if wa_off():                                                  # W184: no WhatsApp Chrome on this machine
+        return False
     names = list(getattr(store, "flagged_wa_accounts", lambda: [])() or [])
     if not names:
         return False
@@ -471,6 +473,28 @@ def _device_env(name: str) -> str | None:
     except Exception:                                             # noqa: BLE001
         DEVICE_NAME = ""
     return os.getenv(f"{name}__{DEVICE_NAME.upper()}") if DEVICE_NAME else None
+
+
+#: W184 (CRM T1104): the per-machine WhatsApp OFF switch. ASUS (8 GB) froze solid three times straight
+#: after the agent launched the WhatsApp Chrome for its unlinked `main`. `WA_OFF__<DEVICE>` (CRM
+#: `lead_gen_settings` key `wa_off__<device>`) wins over the generic `WA_OFF`; truthy = on. On = this
+#: machine never launches a WhatsApp Chrome (verify, probe, re-verify, W152 re-probe, recovery), reports
+#: `wa_free: 0`, and a job's WhatsApp lane ends `wa_no_session` so the CRM moves that pass elsewhere.
+#: A hand-run `wa_login` still works (with a warning).
+WA_OFF_MSG = "WhatsApp is switched off on this machine (wa_off) — WhatsApp checks go to another machine (W184)"
+
+_TRUTHY = ("1", "true", "yes", "on", "y")
+
+
+def parse_wa_off(per_device: str | None, generic: str | None) -> bool:
+    """W184: pure — the per-device value wins when set (even "0"), else the generic one."""
+    raw = per_device if per_device is not None and per_device.strip() != "" else generic
+    return (raw or "").strip().lower() in _TRUTHY
+
+
+def wa_off() -> bool:
+    """W184: True when WhatsApp is switched off on this machine (`WA_OFF__<DEVICE>` > `WA_OFF`)."""
+    return parse_wa_off(_device_env("WA_OFF"), os.getenv("WA_OFF"))
 
 
 #: W153 (CRM T1047, owner 2026-10-07: "each lane 1 job should run on each system and then it should be
@@ -1253,6 +1277,30 @@ class WhatsAppLane(Lane):
                 except Exception:                                 # noqa: BLE001
                     pass
 
+    def _wa_off_end(self, store: Store) -> str:
+        """W184: WhatsApp is switched off on this machine. Give the WhatsApp slot back, let the job's
+        other lanes finish (they keep feeding numbers that stay pending), then end `wa_no_session` with
+        the leftover in the counters — the CRM's `auto-heal: wa failover` moves the pass to another
+        machine, exactly as for a machine with no session. Never opens a WhatsApp Chrome."""
+        self.note(WA_OFF_MSG, "warn")
+        gate = STAGE_GATES.get(self.key)
+        if gate is not None:
+            gate.release(self.job_id)
+        other_done = getattr(self.ctl, "other_lanes_done", None)
+        while other_done is not None:
+            if self.stopped():
+                return R_STOPPED
+            try:
+                if other_done(self):
+                    break
+            except Exception:                                     # noqa: BLE001
+                break
+            time.sleep(WA_RELINK_POLL_SEC)
+        done_n = store.count_wa_done(self.job_id)
+        store.update_job(self.job_id, wa_verify_done=done_n,
+                         wa_verify_total=done_n + store.count_wa_pending(self.job_id))
+        return R_WA_NO_SESSION
+
     def _work(self) -> str | None:
         from webscraper import wa_verify
 
@@ -1260,6 +1308,8 @@ class WhatsAppLane(Lane):
         assert store is not None
         checked = 0
         decided = 0                                                 # W143: yes/no only
+        if wa_off():
+            return self._wa_off_end(store)
         t0 = time.monotonic()
         mem_note_at = 0.0
         while True:

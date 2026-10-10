@@ -129,7 +129,15 @@ def _wa_session() -> dict:
     except Exception:                                             # noqa: BLE001 — no store yet
         pass
 
+    try:
+        from webscraper.lanes import wa_off as _wa_off_fn
+        _off = _wa_off_fn()
+    except Exception:                                             # noqa: BLE001
+        _off = False
+
     def _label(a: str) -> str:
+        if _off:                                                  # W184: CRM reads "not WA-usable", no to-do
+            return f"{a}: WhatsApp switched OFF on this machine (wa_off) — checks go to another machine"
         # The CRM parses this text: `lead_gen_wa_usable` strips `NOT linked|NEEDS RELINK` then tests
         # ~* 'linked'; the agents table turns NEEDS RELINK into an owner to-do. So the W171 benched
         # label must contain neither "linked" (nor "unlinked") nor "NEEDS RELINK" — the machine then
@@ -144,7 +152,8 @@ def _wa_session() -> dict:
         when = f" {_ago(at)}" if at else ""
         return f"{a}: {'linked' if st == 'logged_in' else 'NOT linked' if st == 'logged_out' else 'unchecked'}{when}"
 
-    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in" and a not in relink and a not in stuck]
+    linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in" and a not in relink and a not in stuck
+              and not _off]
     detail = "WhatsApp accounts — " + ("; ".join(_label(a) for a in live) if live else "none")
     # Only a profile we have SEEN logged in counts as ok; unchecked stays a warning
     # rather than a green tick, because "we never looked" is not "it works".

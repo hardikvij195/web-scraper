@@ -155,6 +155,15 @@ def _job_areas(job: Any) -> list[dict[str, Any]]:
 
 
 # ── worker ────────────────────────────────────────────────────────────────────
+def _wa_off_safe() -> bool:
+    """W184: `lanes.wa_off()` that never raises."""
+    try:
+        from webscraper.lanes import wa_off
+        return wa_off()
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
 def _refresh_wa_status(store, when: str) -> None:
     """Ask each WhatsApp profile whether it is still linked, and record the answer.
 
@@ -166,6 +175,9 @@ def _refresh_wa_status(store, when: str) -> None:
     Never raises. A machine with no Playwright, no profile or no network still runs its
     job; it just leaves the tab saying "unchecked", which is the honest answer.
     """
+    if _wa_off_safe():                                            # W184: no WhatsApp Chrome on this machine
+        log.info("WhatsApp probe skipped (%s) — WhatsApp is switched off on this machine (wa_off, W184)", when)
+        return
     try:
         from webscraper import wa_verify
         from webscraper.config import settings
@@ -483,7 +495,9 @@ def wa_account_usable(store: Store) -> bool:
     """W144: can a WhatsApp lane start on this machine right now? An account that is linked,
     enabled, not `needs_relink` (W143) / `sync_stuck` (W171) — both via `enabled_wa_accounts` — and not
     paused by a CRM command
-    (W142 `_PAUSED`)."""
+    (W142 `_PAUSED`). W184: never while WhatsApp is switched off on this machine (`wa_off`)."""
+    if _wa_off_safe():
+        return False
     try:
         from webscraper import wa_verify
         paused = wa_verify._PAUSED
@@ -800,6 +814,7 @@ class Worker(threading.Thread):
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,
                     "maps_free": maps_free, "enrich_free": enrich_free, "wa_free": wa_free,
+                    "wa_off": _wa_off_safe(),                         # W184
                     "lanes_free": maps_free or enrich_free or wa_free,
                     "lane_slots": {
                         LANE_DISCOVERY: {"busy": busy[LANE_DISCOVERY], "cap": 1},
