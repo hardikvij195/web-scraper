@@ -222,6 +222,134 @@ def _list_processes() -> list[tuple[int, str]]:
         return []
 
 
+# -- W183 (CRM T1101, 2026-10-11): leftover Playwright drivers + Chrome nobody owns ------------
+#: this checkout (`.../web-scraper`) — every match below is anchored on it, so the user's own
+#: Chrome / node (no path under this root on their command line) is never touched.
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+
+def _norm(s: str) -> str:
+    return (s or "").lower().replace("\\", "/")
+
+
+def stray_kind(cmd: str, root: Path | str = ROOT_DIR) -> str | None:
+    """Pure: "driver" for a Playwright node driver running out of THIS checkout (its venv /
+    site-packages: `node ...playwright/driver/package/cli.js run-driver`), "chrome" for a Chrome on
+    one of this checkout's `data/` profile dirs, else None. Case-insensitive, both slash styles."""
+    c = _norm(cmd)
+    r = _norm(str(root)).rstrip("/")
+    if not r or r not in c:
+        return None
+    if "node" in c and "playwright" in c and ("cli.js" in c or "run-driver" in c):
+        return "driver"
+    if f"--user-data-dir={r}/data/" in c or f'--user-data-dir="{r}/data/' in c:
+        return "chrome"
+    return None
+
+
+def descends_from(pid: int, ancestor: int, parents: dict[int, int], max_depth: int = 16) -> bool:
+    """Pure: `ancestor` is `pid` or up its parent chain in `parents` (pid -> ppid)."""
+    cur = pid
+    for _ in range(max_depth):
+        if cur == ancestor:
+            return True
+        nxt = parents.get(cur)
+        if not nxt or nxt <= 1 or nxt == cur:
+            return False
+        cur = nxt
+    return False
+
+
+def is_owner_cmd(cmd: str) -> bool:
+    """Pure: a live `python -m webscraper ...` (the agent, `serve`, a manual `wa-login`) — the
+    Chromes / drivers under it are owned, never strays."""
+    c = _norm(cmd)
+    return "python" in c and ("-m webscraper" in c or "webscraper/cli.py" in c or "webscraper/__main__" in c)
+
+
+def stray_pids(table: Iterable[tuple[int, int, str]], me: int, root: Path | str = ROOT_DIR) -> dict[str, list[int]]:
+    """Pure: {"driver": [...], "chrome": [...]} — our drivers / Chromes that no live webscraper process
+    owns (not descended from `me` nor from any other live `python -m webscraper`): what a previous
+    agent left behind after a hard exit. `table` = (pid, ppid, cmd)."""
+    rows = list(table)
+    parents = {int(p): int(pp or 0) for p, pp, _ in rows}
+    owners = {int(me)} | {int(p) for p, _pp, c in rows if is_owner_cmd(c)}
+    out: dict[str, list[int]] = {"driver": [], "chrome": []}
+    for pid, _pp, cmd in rows:
+        if pid in owners:
+            continue
+        kind = stray_kind(cmd, root)
+        if kind and not any(descends_from(int(pid), o, parents) for o in owners):
+            out[kind].append(int(pid))
+    return out
+
+
+def _process_table() -> list[tuple[int, int, str]]:
+    """(pid, ppid, command line) of every process; [] when the listing fails (W183)."""
+    try:
+        out: list[tuple[int, int, str]] = []
+        if sys.platform == "win32":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" }"],
+                capture_output=True, text=True, timeout=20)
+            for line in r.stdout.splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                    out.append((int(parts[0]), int(parts[1]), parts[2].strip()))
+            return out
+        r = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                out.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else ""))
+        return out
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def reap_strays(reason: str = "agent start") -> int:
+    """W183: kill leftover Playwright drivers and Chromes on our profile dirs that the live agent
+    (this process) does not own. Runs at agent start and after every job. Never raises; returns the
+    number killed (logged)."""
+    try:
+        found = stray_pids(_process_table(), os.getpid())
+    except Exception:                                             # noqa: BLE001
+        return 0
+    n = 0
+    for kind in ("chrome", "driver"):
+        for pid in found[kind]:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                n += 1
+            except (OSError, subprocess.SubprocessError):
+                pass
+    if n:
+        log.warning("W183: killed %d leftover process(es) not owned by this agent (%d Chrome, %d Playwright driver) — %s",
+                    n, len(found["chrome"]), len(found["driver"]), reason)
+    return n
+
+
+# -- W183: RAM-pressure recycle request (the Worker asks; Maps loops honour it at their next unit) --
+_RECYCLE_GEN = [0]
+
+
+def request_recycle(reason: str = "") -> None:
+    _RECYCLE_GEN[0] += 1
+    log.warning("W183: asking every Maps browser to recycle (%s)", reason or "memory pressure")
+
+
+def _cap(profile_dir: Path | None, what: str) -> None:
+    try:
+        from webscraper.job_objects import cap_browser
+        cap_browser(profile_dir, what)
+    except Exception:                                             # noqa: BLE001
+        log.debug("W183 cap hook failed", exc_info=True)
+
+
 def profile_in_use(profile_dir: Path) -> bool:
     """W142: is some Chrome on `profile_dir` right now — a live lock holder, or any process
     whose command line names the directory (Windows has no SingletonLock symlink)?"""
@@ -251,7 +379,7 @@ def launch_evicting(open_fn: Callable[[], Any], profile_dir: Path, what: str = "
     second refusal, propagate. Only OUR profiles are ever passed here. `Relauncher.open()` and
     every WhatsApp launch go through this."""
     try:
-        return open_fn()
+        out = open_fn()
     except Exception as e:                                        # noqa: BLE001
         if not is_profile_busy(e):
             raise
@@ -259,7 +387,9 @@ def launch_evicting(open_fn: Callable[[], Any], profile_dir: Path, what: str = "
                     Path(profile_dir).name, f" ({what})" if what else "")
         (evict or kill_profile_holder)(Path(profile_dir), "profile busy on launch")
         (settle or wait_profile_free)(Path(profile_dir), EVICT_WAIT_SEC)
-        return open_fn()
+        out = open_fn()
+    _cap(Path(profile_dir), what)                                 # W183: Job Object RAM cap (win32 only)
+    return out
 
 
 def kill_profile_holder(profile_dir: Path, reason: str = "") -> bool:
@@ -374,6 +504,12 @@ class Relauncher:
         self.attempts = 0
         self.ctx: Any = None
         self.page: Any = None
+        self._recycle_gen = _RECYCLE_GEN[0]
+
+    def recycle_requested(self) -> bool:
+        """W183: the Worker asked every browser to recycle (RAM >= 90 % for 2 min) since this
+        context was opened. Callers check it next to their planned-recycle cadence."""
+        return self._recycle_gen != _RECYCLE_GEN[0]
 
     @property
     def current(self) -> tuple[Any, Any]:
@@ -387,6 +523,7 @@ class Relauncher:
             self.ctx, self.page = self._open_fn()
         else:
             self.ctx, self.page = launch_evicting(self._open_fn, self._profile_dir, "relaunch")
+        self._recycle_gen = _RECYCLE_GEN[0]
         close_blank_pages(self.ctx, keep=self.page)
         return self.current
 

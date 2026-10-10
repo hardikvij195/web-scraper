@@ -411,7 +411,13 @@ class BrowserFetcher:
                 kw["proxy"] = proxy
             if user_agent:
                 kw["user_agent"] = user_agent
-            return pw.chromium.launch_persistent_context(**kw)
+            ctx = pw.chromium.launch_persistent_context(**kw)
+            try:                                                  # W183: Job Object RAM cap (win32 only)
+                from webscraper.browser_recovery import _cap
+                _cap(self._profile_dir(), "enrichment")
+            except Exception:                                     # noqa: BLE001
+                pass
+            return ctx
 
         def _open() -> tuple[Any, Any]:
             use_chrome = USE_REAL_CHROME

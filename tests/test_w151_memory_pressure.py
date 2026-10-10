@@ -91,25 +91,40 @@ def shed_worker(tmp_path, monkeypatch):
     return w, ids, clock, mem, stopped
 
 
-def test_sustained_high_memory_parks_the_newest_lane_only_job(shed_worker):
+def test_sustained_high_memory_recycles_then_parks_the_newest_job(shed_worker):
+    """W183 (CRM T1101): >= 90 % held 2 min -> recycle first; still high 2 min later -> park the
+    NEWEST running job; one action per 2 min; recycle again before the next park."""
     w, ids, clock, mem, stopped = shed_worker
+    from webscraper import browser_recovery as br
+    g = br._RECYCLE_GEN[0]
     mem(95)
     w._shed_if_memory_high()                      # first sighting only starts the clock
+    clock["t"] += 60
+    w._shed_if_memory_high()                      # 60 s: still inside the 2-min hold
+    assert all(not stopped(j)[0] for j in ids) and br._RECYCLE_GEN[0] == g
+    clock["t"] += 65
+    w._shed_if_memory_high()                      # 125 s -> recycle, nobody parked
+    assert br._RECYCLE_GEN[0] == g + 1
     assert all(not stopped(j)[0] for j in ids)
-    clock["t"] += 10
-    w._shed_if_memory_high()                      # 10 s: still inside the hold window
+    clock["t"] += 30
+    w._shed_if_memory_high()                      # cooldown: nothing
     assert all(not stopped(j)[0] for j in ids)
-    clock["t"] += 25
-    w._shed_if_memory_high()                      # 35 s above the line -> park ONE job
-    flags = [stopped(j)[0] for j in ids]
-    assert flags == [False, False, True]          # the enrichment job (newest lane-only), not Maps, not WhatsApp
-    assert "parked by the memory guard" in (stopped(ids[2])[1] or "")
-    clock["t"] += 5
-    w._shed_if_memory_high()                      # cooldown: no second victim right away
+    clock["t"] += 100
+    w._shed_if_memory_high()                      # still high after the recycle -> park the newest
     assert [stopped(j)[0] for j in ids] == [False, False, True]
-    clock["t"] += 130
-    w._shed_if_memory_high()                      # still high after the cooldown -> next lane-only job
+    msg = stopped(ids[2])[1] or ""
+    assert msg.startswith("parked by the memory guard") and "(W183)" in msg
+    clock["t"] += 125
+    w._shed_if_memory_high()                      # next action recycles again
+    assert br._RECYCLE_GEN[0] == g + 2 and [stopped(j)[0] for j in ids] == [False, False, True]
+    clock["t"] += 125
+    w._shed_if_memory_high()                      # then the next-newest job
     assert [stopped(j)[0] for j in ids] == [False, True, True]
+    clock["t"] += 125
+    w._shed_if_memory_high()
+    clock["t"] += 125
+    w._shed_if_memory_high()                      # the last running job is never parked
+    assert stopped(ids[0])[0] is False
 
 
 def test_memory_dropping_below_the_line_resets_the_clock(shed_worker):
@@ -122,6 +137,8 @@ def test_memory_dropping_below_the_line_resets_the_clock(shed_worker):
     clock["t"] += 20
     mem(95)
     w._shed_if_memory_high()                      # 40 s since the FIRST sighting but only 0 s since this one
+    clock["t"] += 100
+    w._shed_if_memory_high()                      # W183: 140 s since the first sighting, 100 s since this one
     assert all(not stopped(j)[0] for j in ids)
 
 

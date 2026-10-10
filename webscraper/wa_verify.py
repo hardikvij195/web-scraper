@@ -1521,6 +1521,7 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             user_data_dir=str(profile_dir(name)),
             locale="en", viewport={"width": 1100, "height": 820},
             **_launch_kwargs(mode, name))
+        _br._cap(profile_dir(name), "WhatsApp")                   # W183: Job Object RAM cap (win32 only)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             if mode == "hidden":

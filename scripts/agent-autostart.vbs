@@ -15,7 +15,7 @@
 ' every poll, so its log stays fresh and it is NOT restarted (same rule as agent.py's watchdog).
 Option Explicit
 Const STALE_MIN = 30
-Dim sh, fso, root, wmi, procs, p, loopPids, aliveFile, logFile, aliveAge, logAge, killed
+Dim sh, fso, root, wmi, procs, p, loopPids, aliveFile, logFile, aliveAge, logAge, killed, strayKilled
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 root = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
@@ -42,7 +42,10 @@ If Len(loopPids) > 0 Then
   If logAge < 0 Or logAge < STALE_MIN Then WScript.Quit 0
   ' Stale: kill the loop(s), every python agent, then fall through and relaunch.
   killed = KillStale(loopPids)
-  AppendLog logFile, "[" & Now & "] autostart: loop stale (alive " & AgeText(aliveAge) & " ago, log " & logAge & "m ago) - killed PID " & killed & " and relaunched"
+  ' W183 (CRM T1101, 2026-10-11): the dead agent's Chromes (on OUR data\ profile dirs) and its
+  ' Playwright node drivers survived the python kill and kept eating RAM on the 8 GB machines.
+  strayKilled = KillOurBrowsers()
+  AppendLog logFile, "[" & Now & "] autostart: loop stale (alive " & AgeText(aliveAge) & " ago, log " & logAge & "m ago) - killed PID " & killed & ", " & strayKilled & " leftover Chrome/driver process(es) (W183), and relaunched"
 End If
 
 sh.CurrentDirectory = root
@@ -97,6 +100,30 @@ Function KillStale(pidList)
   Next
   If Len(out) > 0 Then out = Left(out, Len(out) - 1)
   KillStale = out
+End Function
+
+Function KillOurBrowsers()
+  ' W183: chrome.exe whose command line names THIS root's data\ folder (our profile dirs only -
+  ' the user's own Chrome never carries this path) and node.exe running Playwright out of THIS
+  ' root (the venv's playwright driver). Returns how many were terminated.
+  Dim q, child, n, cl
+  n = 0
+  Set q = wmi.ExecQuery("SELECT ProcessId, Name, CommandLine FROM Win32_Process WHERE Name = 'chrome.exe' OR Name = 'node.exe'")
+  For Each child In q
+    If Not IsNull(child.CommandLine) Then
+      cl = child.CommandLine
+      If (InStr(1, cl, root & "\data\", vbTextCompare) > 0 And InStr(1, cl, "--user-data-dir=", vbTextCompare) > 0) _
+         Or (LCase(child.Name) = "node.exe" And InStr(1, cl, root & "\", vbTextCompare) > 0 _
+             And InStr(1, cl, "playwright", vbTextCompare) > 0) Then
+        On Error Resume Next
+        child.Terminate
+        If Err.Number = 0 Then n = n + 1
+        Err.Clear
+        On Error GoTo 0
+      End If
+    End If
+  Next
+  KillOurBrowsers = n
 End Function
 
 Sub AppendLog(path, line)

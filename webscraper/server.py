@@ -343,9 +343,25 @@ def ram_inflight_cap(total_mb: float | None) -> int:
 #: W151: above this RAM use (held for MEMORY_SHED_HOLD_SEC) the worker PARKS its most recently
 #: started lane-only job so the machine never crosses into swap-thrash. The W129 start guard
 #: (85 %) only stops NEW starts; nothing shed load before.
-MEMORY_SHED_PCT = float(os.getenv("MEMORY_SHED_PCT", "92") or 92)
-MEMORY_SHED_HOLD_SEC = 30.0
+#: W183 (CRM T1101, 2026-10-11): 92 % / 30 s -> 90 % held 2 min, and the FIRST action of an episode is
+#: a browser recycle (`browser_recovery.request_recycle`, the W120 Maps path); only if RAM is still
+#: >= 90 % at the next action (2 min later) is the NEWEST running job parked. One action per 2 min,
+#: never the last running job.
+MEMORY_SHED_PCT = float(os.getenv("MEMORY_SHED_PCT", "90") or 90)
+MEMORY_SHED_HOLD_SEC = 120.0
 MEMORY_SHED_COOLDOWN_SEC = 120.0
+
+
+def shed_step(recycled: bool, started: list[tuple[int, str | None]]) -> tuple[str, int | None]:
+    """Pure W183 decision for one pressure action: ("recycle", None) first in an episode, then
+    ("park", newest job id); ("none", None) when nothing runs or only one job would be left to park."""
+    if not started:
+        return "none", None
+    if not recycled:
+        return "recycle", None
+    if len(started) < 2:
+        return "none", None
+    return "park", started[-1][0]
 
 
 def pick_shed_victim(started: list[tuple[int, str | None]]) -> int | None:
@@ -395,11 +411,31 @@ def memory_blocked() -> bool:
         return False
     if used is None:
         return False
-    try:
-        limit = float(os.getenv("MEMORY_START_MAX_PCT", "85") or "85")
-    except ValueError:
-        limit = 85.0
-    return used >= limit
+    return used >= memory_start_max_pct()
+
+
+#: W183 (CRM T1101, 2026-10-11): on a machine with <= this much RAM (the 8 GB ASUS / MI / MAC) the
+#: default start limit drops to MEMORY_START_LOWMEM_PCT — ASUS froze every ~40 min sitting at 70-84 %.
+#: Same threshold as `maps.LOWMEM_TOTAL_MB` (not imported: maps pulls in Playwright).
+LOWMEM_TOTAL_MB = 8500.0
+MEMORY_START_DEFAULT_PCT = 85.0
+MEMORY_START_LOWMEM_PCT = 75.0
+
+
+def start_limit_pct(raw: str | None, total_mb: float | None) -> float:
+    """Pure: an explicit `MEMORY_START_MAX_PCT` (env / cloud) wins; else 75 on <= 8.5 GB, 85 otherwise."""
+    if raw is not None and str(raw).strip():
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            pass
+    if total_mb and 0 < float(total_mb) <= LOWMEM_TOTAL_MB:
+        return MEMORY_START_LOWMEM_PCT
+    return MEMORY_START_DEFAULT_PCT
+
+
+def memory_start_max_pct() -> float:
+    return start_limit_pct(os.getenv("MEMORY_START_MAX_PCT"), (last_memory() or {}).get("total_mb"))
 
 
 def job_needs_discovery(row: Any) -> bool:
@@ -510,6 +546,7 @@ class Worker(threading.Thread):
         self._mem_high_since: float | None = None
         self._last_shed_at = 0.0
         self._shed_ids: set[int] = set()         # parked but not yet gone — never picked twice
+        self._shed_recycled = False              # W183: this pressure episode already recycled once
         #: W118 (CRM T765): set by the CRM agent (`run_agent`) to `CrmCloud.known_keys` —
         #: a local-only run (no `srv.worker.known_keys_fetcher`) or the old SaaS `Cloud`
         #: (no such method) both leave this `None`, so `unique_new` falls back to local-only.
@@ -642,11 +679,15 @@ class Worker(threading.Thread):
         return job_next_lane(row, enr, wa)
 
     def _shed_if_memory_high(self) -> None:
-        """W151: park one job when RAM stays above MEMORY_SHED_PCT for MEMORY_SHED_HOLD_SEC."""
+        """W151 / W183: RAM >= MEMORY_SHED_PCT held MEMORY_SHED_HOLD_SEC while jobs run -> recycle the
+        browsers first, then park the newest running job (one action per MEMORY_SHED_COOLDOWN_SEC,
+        never the last running job). The park text starts `parked by the memory guard` — what the
+        CRM's `lead_gen_requeue_orphans()` re-queues on."""
         used = (last_memory() or {}).get("used_pct")
         now = time.monotonic()
         if used is None or float(used) < MEMORY_SHED_PCT:
             self._mem_high_since = None
+            self._shed_recycled = False
             return
         if self._mem_high_since is None:
             self._mem_high_since = now
@@ -656,13 +697,31 @@ class Worker(threading.Thread):
         with self._lock:
             self._shed_ids &= set(self._inflight)                        # forget the ones that left
             started = [(jid, self._start_lane.get(jid)) for jid in self._inflight if jid not in self._shed_ids]
-        victim = pick_shed_victim(started) if len(started) + len(self._shed_ids) >= 2 else None
-        if victim is None:
+        action, victim = shed_step(getattr(self, "_shed_recycled", False), started)
+        if action == "none":
             return
         self._last_shed_at = now
+        try:
+            from webscraper.agent import DEVICE_NAME as dev
+        except Exception:                                         # noqa: BLE001
+            dev = ""
+        dev = dev or "this machine"
+        if action == "recycle":
+            self._shed_recycled = True
+            note = (f"RAM {float(used):.0f} % (>= {MEMORY_SHED_PCT:.0f} %) on {dev} for 2 min — "
+                    f"recycling the browsers to free memory (W183)")
+            try:
+                from webscraper.browser_recovery import request_recycle
+                request_recycle(note)
+            except Exception:                                     # noqa: BLE001
+                log.warning("memory shed: recycle request failed", exc_info=True)
+            self._job_log([jid for jid, _ in started], note)
+            return
+        self._shed_recycled = False                               # the next episode step recycles again
         self._shed_ids.add(victim)
-        msg = (f"parked by the memory guard (W151): {float(used):.0f}% RAM used on this machine — "
-               f"re-queued, resumes on another machine or here once memory frees")
+        msg = (f"parked by the memory guard: RAM ≥{MEMORY_SHED_PCT:.0f} % on {dev} (W183) — "
+               f"{float(used):.0f} % used after a browser recycle; re-queued, resumes on another machine "
+               f"or here once memory frees")
         try:
             store = Store()
             try:
@@ -670,9 +729,22 @@ class Worker(threading.Thread):
                 store.log(victim, "job", msg, "warn")
             finally:
                 store.close()
-            log.warning("memory %s%% >= %s%% for %ds — parking job #%s (W151)", used, MEMORY_SHED_PCT, int(MEMORY_SHED_HOLD_SEC), victim)
+            log.warning("memory %s%% >= %s%% for %ds after a recycle — parking the newest job #%s (W183)",
+                        used, MEMORY_SHED_PCT, int(MEMORY_SHED_HOLD_SEC), victim)
         except Exception:                                         # noqa: BLE001
             log.warning("memory shed: could not park job #%s", victim, exc_info=True)
+
+    @staticmethod
+    def _job_log(job_ids: list[int], msg: str) -> None:
+        try:
+            store = Store()
+            try:
+                for jid in job_ids:
+                    store.log(jid, "job", msg, "warn")
+            finally:
+                store.close()
+        except Exception:                                         # noqa: BLE001
+            log.debug("W183 job log failed", exc_info=True)
 
     def capacity(self) -> dict[str, Any]:
         """Sent to the CRM (`agent.py` CrmCloud `jobs`/`claim` payloads) so the Edge
@@ -788,7 +860,7 @@ class Worker(threading.Thread):
             if now - self._last_mem_note >= 300:
                 self._last_mem_note = now
                 mem = _cached_memory()
-                limit = os.getenv("MEMORY_START_MAX_PCT", "85") or "85"
+                limit = f"{memory_start_max_pct():g}"
                 log.warning("not starting a new job — memory %s%% used (limit %s%%)",
                             mem.get("used_pct"), limit)
         if room and not mem_blocked:
@@ -1298,6 +1370,14 @@ class Worker(threading.Thread):
                 self._start_lane.pop(job_id, None)
                 if self._disc_job == job_id:
                     self._disc_job = None
+            # W183 (CRM T1101): sweep Playwright drivers / Chromes on our profiles that no live
+            # webscraper process owns (off-thread: the Windows listing is a ~1 s CIM call).
+            try:
+                from webscraper.browser_recovery import reap_strays
+                threading.Thread(target=reap_strays, args=(f"after job #{job_id}",),
+                                 name="w183-reap", daemon=True).start()
+            except Exception:                                     # noqa: BLE001
+                pass
             store.close()
 
 

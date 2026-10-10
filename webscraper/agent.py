@@ -1230,6 +1230,13 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
     reaped = reap_orphan_browsers(known_profile_dirs(), "agent start")
     if reaped:
         log.warning("killed %d orphan Chrome(s) left by a previous agent process", reaped)
+    # W183 (CRM T1101, 2026-10-11): the lock-based reap above misses Playwright node drivers and
+    # Chromes whose lock is gone (Windows) — sweep by command line (anchored on this checkout).
+    try:
+        from webscraper.browser_recovery import reap_strays
+        reap_strays("agent start")
+    except Exception:                                             # noqa: BLE001
+        log.debug("W183 stray sweep failed", exc_info=True)
     orphans = _requeue_orphans(store, kind, cloud)
     if orphans:
         log.info("requeued %d job(s) left mid-run by a previous agent", orphans)
@@ -1843,7 +1850,9 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # W135 (CRM T1011): stage-gate slots per machine
                             "ENRICH_SLOTS__", "WA_SLOTS__",
                             # W181: per-machine Chrome diet switches (read at the next launch)
-                            "MAPS_BLOCK_ASSETS__", "CHROME_LEAN_ARGS__")
+                            "MAPS_BLOCK_ASSETS__", "CHROME_LEAN_ARGS__",
+                            # W183: Chrome Job Object RAM cap (read at the next launch)
+                            "CHROME_JOB_MEM_MB")
 
 #: How often the main loop re-fetches cloud config for the knobs above.
 CONFIG_REFRESH_SEC = 300.0

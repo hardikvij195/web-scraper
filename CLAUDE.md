@@ -58,6 +58,9 @@ data/           gitignored: leads.db, browser profiles, exports
   W181b: the per-device diet switches (`<FLAG>__<DEVICE>`) resolve the device via `HVT_AGENT_DEVICE` (exported
   by `agent.py`) > `data/device_name` > the lazy `webscraper.agent` import (import failure = one WARNING, never
   silent); every Chrome launch logs the decision with its inputs (`[device= per-device= generic=]`).
+  W183: `browser_recovery.reap_strays()` (agent start + after every job) and `scripts/agent-autostart.vbs`
+  kill Playwright node drivers / Chromes on this checkout's `data/` profiles that no live `python -m webscraper`
+  owns — matched on this root's path only, never the user's own Chrome.
 - New field -> `Place`, `PLACE_COLS`, `SCHEMA`, `_migrate()`, `EXPORT_COLS`. Parsing in `extractors.py`
   with a test; Playwright only in `maps.py`.
 - Every scraper change is measured with `python scripts/regress-sites.py` against `docs/test-sites.md`.
@@ -95,7 +98,9 @@ data/           gitignored: leads.db, browser profiles, exports
 | `WA_NO_SESSION_GIVE_UP_SEC` | `900` | W144 (CRM T1024): a WhatsApp lane with no linked account waits this long for a relink (W110), then ends `wa_no_session` so the job ends `incomplete` and the CRM moves its WhatsApp pass to a machine with a session; 0 = wait for ever |
 | `LANE_SLOTS_ENRICHMENT` | `2` | local override of jobs whose enrichment lane may run concurrently (W122 `StageGate`); W135: CRM `enrich_slots__<device>` (clamp 1..3) is the normal knob, refreshed live |
 | `LANE_SLOTS_WHATSAPP` | `_wa_parallel()` | local override of concurrent WhatsApp lanes; W135: CRM `wa_slots__<device>` (>=1). Lanes yield a slot every 20 businesses / 25 numbers / 5 min when another job waits (round-robin); W136: an idle lane releases its slot |
-| `MEMORY_START_MAX_PCT` | `85` | W129: Worker won't start a NEW job at/above this RAM used% (jobs already running keep going) |
+| `MEMORY_START_MAX_PCT` | `85` (`75` on <= 8.5 GB RAM) | W129: Worker won't start a NEW job at/above this RAM used% (jobs already running keep going). W183: the default drops to 75 on <= 8.5 GB machines (ASUS / MI / MAC); an explicit env / cloud value still wins |
+| `MEMORY_SHED_PCT` | `90` | W151/W183: RAM >= this for 2 min while jobs run -> first recycle the Maps browsers (`browser_recovery.request_recycle`), 2 min later still high -> park the NEWEST running job (`parked by the memory guard: RAM ≥90 % on <device> (W183)`, CRM re-queues it); one action per 2 min, never the last running job |
+| `CHROME_JOB_MEM_MB[__<DEVICE>]` | max(1200, 30 % of RAM) | W183 (Windows only): every Chrome tree (Maps, WhatsApp, enrichment fallback) goes into a Job Object with this committed-memory cap (`job_objects.py`, ctypes); over the cap Chrome dies and the normal crash/relaunch path brings it back (log `Chrome hit its RAM cap (N MB) — relaunching`). No kill-on-close (an agent crash must not kill WhatsApp mid-sync). 0 = off; refreshed with the cloud config |
 | `WA_RESYNC_LONG_WAIT_SEC` | `900` | W143: episode-3 re-sync recovery — kill the profile's Chrome + lock files, relaunch, wait ONE sync this long; episode 4 flags the account `needs_relink` |
 | `WA_RECYCLE_BACKOFF_CHECKS` | `400` | W143: after a boot whose sync took > 60 s, hold the W131 recycle for this many checks (heavy-history account); 0 = off |
 | `AGENT_LOOP_WATCHDOG_SEC` | `600` | W142: no CRM heartbeat for this long (and not just offline) -> flag jobs, kill our Chromes, `os._exit(3)`; the supervisor loop relaunches. 0 = off |

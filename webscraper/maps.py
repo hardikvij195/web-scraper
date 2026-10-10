@@ -695,9 +695,15 @@ def _asset_route(route) -> None:
         pass                                                      # the page is closing
 
 
+def _br_cap(profile_dir, what: str) -> None:
+    from webscraper.browser_recovery import _cap
+    _cap(profile_dir, what)
+
+
 def _open_context(pw, launch_kwargs: dict):
     log.info("launching %s Chrome (profile %s)…", "headless" if launch_kwargs.get("headless") else "headed", launch_kwargs.get("user_data_dir"))
     c = pw.chromium.launch_persistent_context(**launch_kwargs)
+    _br_cap(launch_kwargs.get("user_data_dir"), "Maps")         # W183: Job Object RAM cap (win32 only)
     if block_assets_decision():                                   # W181b: logs the inputs too
         # W169 (CRM T1047): images/fonts/media add nothing we read. Keyed on Playwright's
         # resource type (a CDN tile with no extension is still dropped) with the old URL regex
@@ -945,7 +951,7 @@ def _collect_links(*, store_path: Path, job_id: int, queries: list[str], locatio
                                               "tiles": len(steps), "reason": "enough"})
                         break
                     tiles_run += 1
-                    if recycle_due(tiles_run, collect_relaunch_every()):
+                    if recycle_due(tiles_run, collect_relaunch_every()) or rl.recycle_requested():  # W183
                         try:
                             ctx, page = rl.recycle(f"tile {s_i}/{len(steps)}")
                         except Exception as e:                        # noqa: BLE001
@@ -1258,7 +1264,7 @@ def run_scrape(store: Store, job_id: int, query: str, location: str | None, max_
                         store.mark_link_opened(job_id, card.key)
                     except Exception:                                 # noqa: BLE001
                         pass
-                    if recycle_due(opened, opener_relaunch_every()):
+                    if recycle_due(opened, opener_relaunch_every()) or rl.recycle_requested():  # W183
                         try:
                             ctx, page = rl.recycle(f"place {opened}")
                         except Exception as e:                        # noqa: BLE001
