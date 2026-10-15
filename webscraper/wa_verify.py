@@ -578,9 +578,7 @@ def unlink_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     if ok:
         # W142: an unlinked account stays out of the lanes' rotation (the next login re-enables it).
         try:
-            st = Store()
-            st.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
-            st.conn.commit()
+            Store().disable_wa_account(name, "unlinked")          # W185: logs the drop once
         except Exception:                                         # noqa: BLE001
             log.debug("[%s] could not mark disabled after unlink", name, exc_info=True)
     return ok, (f"{name}: {msg}" if ok else msg)
@@ -606,6 +604,16 @@ def delete_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
     if logged_out:
         return True, f"deleted {name} — logged out of WhatsApp and removed from this machine"
     return True, f"deleted {name} from this machine, but WhatsApp was NOT logged out: {msg}"
+
+
+def _disable_account(store, name: str, kind: str, detail: str = "") -> None:
+    """W185: `disabled=1` + a one-time drop event; a store without the W185 helper (test doubles)
+    gets the plain flag."""
+    if hasattr(store, "disable_wa_account"):
+        store.disable_wa_account(name, kind, detail)
+    else:
+        store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
+        store.conn.commit()
 
 
 def login(name: str, *, busy: bool = False) -> bool:
@@ -730,6 +738,10 @@ def _login_attempt(pw, name: str, browser: str | None = None) -> bool | None:
                 timeout=_LOGIN_TIMEOUT_MS)
             log.info("[%s] logged in - session saved to %s", name, profile_dir(name))
             Store().set_wa_status(name, "logged_in")               # W64
+            try:
+                Store().mark_wa_linked(name)                       # W185: a real QR scan restarts the count
+            except Exception:                                     # noqa: BLE001
+                log.warning("[%s] could not reset checks_since_link", name, exc_info=True)
             time.sleep(1.5)   # let WA flush the session to disk before we close
             return True
         except PWTimeout:
@@ -1059,8 +1071,7 @@ def verify_places(
                     store.log(job_id, "whatsapp", f"{name}: WhatsApp Web did not render on this machine — skipped this run, still linked", "warn")
                 continue
             if page is None:      # account logged out — disable it and try the next row
-                store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
-                store.conn.commit()
+                _disable_account(store, name, "logged_out", "session open found it logged out")   # W185
                 log.warning("[%s] logged out - disabled; run wa-login to re-link", name)
                 if account:
                     break         # W102: a pinned slice has no other account to move to
@@ -1099,8 +1110,7 @@ def verify_places(
             except WaNotLoggedIn:
                 # Session dropped mid-run, or a relaunch found the profile unlinked.
                 try:
-                    store.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
-                    store.conn.commit()
+                    _disable_account(store, name, "logged_out", "session dropped mid-run")   # W185
                 except sqlite3.Error:
                     # W113 (CRM T624): a lock here must not stop us ending the slice below —
                     # worst case the account gets re-tried once more before it is disabled.

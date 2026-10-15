@@ -158,7 +158,7 @@ def test_healthcheck_label_for_a_benched_account(monkeypatch, tmp_path: Path):
     chk = hc._wa_session()
     assert chk["ok"] is False, "a benched account is not a linked one for the ok flag"
     assert chk["detail"].startswith("WhatsApp accounts — main: STUCK SYNCING (WhatsApp Web on this machine never finished syncing since ")
-    assert chk["detail"].endswith("— session intact, auto-retry every 5 min, no action needed)")
+    assert chk["detail"].endswith("— session intact, auto-retry every 5 min, no action needed) · 0 checks since link")  # W185
     assert "linked" not in chk["detail"] and "NEEDS RELINK" not in chk["detail"]
     s.set_wa_status("main", "logged_in")                  # synced again
     chk = hc._wa_session()

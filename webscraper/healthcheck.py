@@ -117,9 +117,15 @@ def _wa_session() -> dict:
     seen: dict[str, tuple[str, str]] = {}
     relink: dict[str, str] = {}          # W143: account -> since when it needs a QR relink
     stuck: dict[str, str] = {}           # W171: account -> since when it is benched (linked, sync never finishes)
+    since: dict[str, int] = {}           # W185: account -> number checks since its last QR link
+    drops: list[dict] = []               # W185: newest session drops with the count they happened at
     try:
         from webscraper.store import Store
-        for row in Store().list_wa_accounts():
+        _st = Store()
+        drops = [{"name": e["name"], "at": e["at"], "kind": e["kind"], "checks": int(e["checks_since_link"] or 0)}
+                 for e in _st.wa_drop_events(10)]
+        for row in _st.list_wa_accounts():
+            since[str(row["name"])] = int(row.get("checks_since_link") or 0)
             if row.get("status"):
                 seen[str(row["name"])] = (str(row["status"]), str(row.get("status_at") or ""))
             if row.get("needs_relink"):
@@ -136,6 +142,11 @@ def _wa_session() -> dict:
         _off = False
 
     def _label(a: str) -> str:
+        # W185: the count goes AFTER the existing text — the CRM splits on ';' then the first ':',
+        # so it must never contain either.
+        return f"{_label0(a)} · {since.get(a, 0)} checks since link"
+
+    def _label0(a: str) -> str:
         if _off:                                                  # W184: CRM reads "not WA-usable", no to-do
             return f"{a}: WhatsApp switched OFF on this machine (wa_off) — checks go to another machine"
         # The CRM parses this text: `lead_gen_wa_usable` strips `NOT linked|NEEDS RELINK` then tests
@@ -143,7 +154,7 @@ def _wa_session() -> dict:
         # label must contain neither "linked" (nor "unlinked") nor "NEEDS RELINK" — the machine then
         # reads as not WA-usable without raising a to-do.
         if a in relink:                                           # W143 / W171: proof-based (QR screen seen)
-            return (f"{a}: NEEDS RELINK (since {_hhmm(relink[a])} — the phone removed this device; WhatsApp Web "
+            return (f"{a}: NEEDS RELINK (since {_hhmm(relink[a])} — the phone removed this device, WhatsApp Web "
                     "showed its QR screen, so scan a QR via Start session)")
         if a in stuck:                                            # W171
             return (f"{a}: STUCK SYNCING (WhatsApp Web on this machine never finished syncing since "
@@ -157,8 +168,11 @@ def _wa_session() -> dict:
     detail = "WhatsApp accounts — " + ("; ".join(_label(a) for a in live) if live else "none")
     # Only a profile we have SEEN logged in counts as ok; unchecked stays a warning
     # rather than a green tick, because "we never looked" is not "it works".
-    return _check(bool(linked), detail,
-                  "python -m webscraper wa-login <label>  (scan the QR once on this machine)", optional=True)
+    c = _check(bool(linked), detail,
+               "python -m webscraper wa-login <label>  (scan the QR once on this machine)", optional=True)
+    c["detail"] = detail[:1000]          # W185: several accounts + counts overflow the generic 200 chars
+    c["drops"] = drops
+    return c
 
 
 def _hhmm(iso: str) -> str:

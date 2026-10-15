@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS wa_accounts (
   day TEXT,
   disabled INTEGER NOT NULL DEFAULT 0
 );
+-- W185 (CRM T1247-b): one row per WhatsApp session transition — 'linked' (a QR scan finished) and
+-- every drop ('logged_out' | 'needs_relink' | 'sync_stuck' | 'unlinked' | 'deleted') — with the
+-- account's `checks_since_link` at that moment: "dropped after N checks since link".
+CREATE TABLE IF NOT EXISTS wa_events (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  at TEXT,
+  kind TEXT,
+  checks_since_link INTEGER,
+  detail TEXT
+);
 -- One row per phase per finished job: how long it took and how many units it handled.
 -- The ETA (W4) is a rolling average over these, NOT a hardcoded constant, so the number
 -- shown reflects this machine, this network and this delay setting. Kept forever — it is
@@ -444,7 +455,9 @@ class Store:
                          ("needs_relink", "INTEGER NOT NULL DEFAULT 0"), ("needs_relink_at", "TEXT"),
                          # W171: linked but WhatsApp Web on THIS machine never finishes syncing — benched,
                          # re-probed every 5 min, no QR / owner to-do (the MI false flag of 2026-10-07).
-                         ("sync_stuck", "INTEGER NOT NULL DEFAULT 0"), ("sync_stuck_at", "TEXT")):
+                         ("sync_stuck", "INTEGER NOT NULL DEFAULT 0"), ("sync_stuck_at", "TEXT"),
+                         # W185: number checks since the last QR link, and when that link was.
+                         ("checks_since_link", "INTEGER DEFAULT 0"), ("linked_at", "TEXT")):
             if col not in acols:
                 self.conn.execute(f"ALTER TABLE wa_accounts ADD COLUMN {col} {typ}")
         # W71: how many crawls a lead has had. Two failures is the cutoff (T441): the
@@ -1121,10 +1134,69 @@ class Store:
             self.conn.commit()
         self._write(f"wa_accounts {name}", _do)
 
+    # -- W185 (CRM T1247-b): checks since link + session drop events -----------------------
+
+    def _wa_flag(self, name: str, col: str) -> int | None:
+        """Current value of an int flag column of `name` (None = no row / no column)."""
+        try:
+            r = self.conn.execute(f"SELECT COALESCE({col},0) FROM wa_accounts WHERE name=?", (name,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return int(r[0]) if r else None
+
+    def _insert_wa_event(self, name: str, kind: str, detail: str = "") -> None:
+        """Insert one `wa_events` row (no commit) snapshotting the account's `checks_since_link`."""
+        try:
+            r = self.conn.execute("SELECT COALESCE(checks_since_link,0) FROM wa_accounts WHERE name=?",
+                                  (name,)).fetchone()
+            n = int(r[0]) if r else 0
+        except sqlite3.Error:                                     # pre-W185 schema
+            n = 0
+        self.conn.execute("INSERT INTO wa_events(name, at, kind, checks_since_link, detail) VALUES (?,?,?,?,?)",
+                          (name, now_iso(), kind, n, detail or ""))
+
+    def log_wa_event(self, name: str, kind: str, detail: str = "") -> None:
+        """W185: record a session transition ('linked' | 'logged_out' | 'needs_relink' | 'sync_stuck' |
+        'unlinked' | 'deleted') with the checks done since the last QR link."""
+        def _do() -> None:
+            self._insert_wa_event(name, kind, detail)
+            self.conn.commit()
+        self._write(f"wa_events {name} {kind}", _do)
+
+    def mark_wa_linked(self, name: str) -> None:
+        """W185: a QR scan just linked this account — restart its since-link counter and log 'linked'."""
+        def _do() -> None:
+            self._insert_wa_event(name, "linked")      # snapshot = checks the PREVIOUS link did
+            self.conn.execute("UPDATE wa_accounts SET checks_since_link=0, linked_at=? WHERE name=?",
+                              (now_iso(), name))
+            self.conn.commit()
+        self._write(f"wa_accounts linked {name}", _do)
+
+    def disable_wa_account(self, name: str, kind: str = "logged_out", detail: str = "") -> None:
+        """Set `disabled=1` (session logged out / unlinked); W185: logs `kind` only on the 0 -> 1
+        transition so a repeated set does not add duplicate rows."""
+        def _do() -> None:
+            if self._wa_flag(name, "disabled") == 0:
+                self._insert_wa_event(name, kind, detail)
+            self.conn.execute("UPDATE wa_accounts SET disabled=1 WHERE name=?", (name,))
+            self.conn.commit()
+        self._write(f"wa_accounts disable {name}", _do)
+
+    def wa_drop_events(self, limit: int = 10) -> list[dict[str, Any]]:
+        """W185: the newest non-'linked' wa_events, newest first."""
+        try:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT name, at, kind, checks_since_link FROM wa_events WHERE kind<>'linked' "
+                "ORDER BY id DESC LIMIT ?", (limit,))]
+        except sqlite3.Error:
+            return []
+
     def set_wa_needs_relink(self, name: str, flag: bool) -> None:
         """W143: flag / clear "WhatsApp Web never finished syncing — needs a QR relink". A flagged
         account is out of `pick_wa_account` / `enabled_wa_accounts`; a finished `wa_login` clears it."""
         def _do() -> None:
+            if flag and self._wa_flag(name, "needs_relink") == 0:          # W185: log the transition once
+                self._insert_wa_event(name, "needs_relink")
             self.conn.execute("UPDATE wa_accounts SET needs_relink=?, needs_relink_at=? WHERE name=?",
                               (1 if flag else 0, now_iso() if flag else None, name))
             self.conn.commit()
@@ -1135,6 +1207,8 @@ class Store:
         syncing on this machine. Benched = out of `pick_wa_account` / `enabled_wa_accounts`, in
         `flagged_wa_accounts` (re-probed every 5 min); any `logged_in` sighting or verdict clears it."""
         def _do() -> None:
+            if flag and self._wa_flag(name, "sync_stuck") == 0:            # W185: log the transition once
+                self._insert_wa_event(name, "sync_stuck")
             self.conn.execute("UPDATE wa_accounts SET sync_stuck=?, sync_stuck_at=? WHERE name=?",
                               (1 if flag else 0, now_iso() if flag else None, name))
             self.conn.commit()
@@ -1186,12 +1260,17 @@ class Store:
                     self.conn.execute("UPDATE wa_checks SET account=? WHERE account=?", (new, old))
                 except sqlite3.Error:                             # noqa: BLE001 — older schema
                     pass
+                self.conn.execute("UPDATE wa_events SET name=? WHERE name=?", (new, old))   # W185
             self.conn.commit()
         self._write(f"wa_accounts rename {old}->{new}", _do)
         return bool(result["rowcount"])
 
     def remove_wa_account(self, name: str) -> None:
+        # W185: the account's wa_events rows are KEPT (history: how long each link lasted) and a
+        # 'deleted' row is added; a later account re-added under the same name continues the log.
         def _do() -> None:
+            if self.conn.execute("SELECT 1 FROM wa_accounts WHERE name=?", (name,)).fetchone():
+                self._insert_wa_event(name, "deleted")
             self.conn.execute("DELETE FROM wa_accounts WHERE name=?", (name,))
             self.conn.commit()
         self._write(f"wa_accounts remove {name}", _do)
@@ -1235,7 +1314,8 @@ class Store:
     def bump_wa_account(self, name: str, today: str) -> None:
         def _do() -> None:
             self.conn.execute(
-                "UPDATE wa_accounts SET sent_today=sent_today+1, last_used_at=?, day=? WHERE name=?",
+                "UPDATE wa_accounts SET sent_today=sent_today+1, last_used_at=?, day=?, "
+                "checks_since_link=COALESCE(checks_since_link,0)+1 WHERE name=?",           # W185
                 (now_iso(), today, name))
             self.conn.commit()
         self._write(f"wa_accounts bump {name}", _do)
