@@ -1657,6 +1657,14 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
                 log.info("re-verify #%s stopped while waiting for the WhatsApp slot", jid)
         except Exception:                                         # noqa: BLE001
             log.exception("re-verify #%s crashed", jid)
+            # W189 (CRM T1235): tell the CRM, or the row reads 'running' until the stuck alert.
+            # 'error' is picked up by the CRM's re-queue; checked numbers are skipped on the re-run.
+            try:
+                _crm_retry(lambda: cloud.done(jid, "error", "re-verify crashed on this machine — "
+                                                            "re-queued; numbers already checked are skipped"),
+                           f"re-verify #{jid}: crash report")
+            except Exception:                                     # noqa: BLE001
+                log.warning("re-verify #%s: could not report the crash to the CRM", jid, exc_info=True)
         finally:
             if gate is not None:
                 gate.release(slot)
@@ -2639,7 +2647,8 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     n_checked = _n_checked()
     store.record_phase_rate(None, "verifying_wa", n_checked, time.monotonic() - started)
     if collected:
-        cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()])
+        _crm_retry(lambda: cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()]),
+                   f"re-verify #{jid}: final set_wa")
     capped = bool(res.get("capped")) if isinstance(res, dict) else False
     stopped = stop_ev.is_set()
     why = stop_why[0] or (_REVERIFY.get("why") if own is not None else None) or "parked"
@@ -2664,8 +2673,22 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     _jlog(f"{'leads-verify' if leads_verify else 're-verify'} finished: {n_checked} numbers checked across "
           f"{len(collected)} lead(s), {left} left" + (" — daily cap hit" if capped else ""),
           "warn" if capped else "info")
-    cloud.done(jid, "done", msg)
+    _crm_retry(lambda: cloud.done(jid, "done", msg), f"re-verify #{jid}: done")
     log.info("re-verify #%s: %d numbers checked%s", jid, n_checked, " (daily cap hit)" if capped else "")
+
+
+def _crm_retry(call: Callable[[], Any], what: str, tries: int = 4) -> Any:
+    """W189 (CRM T1235): a re-verify's closing CRM calls retry a network blip. #21525 on ASUS
+    (2026-10-15 23:39 IST) checked all 599 numbers, then one httpx read error on the final call
+    killed the thread: the row stayed 'running' and the stuck alert fired 11 min later."""
+    for i in range(tries):
+        try:
+            return call()
+        except httpx.HTTPError as e:
+            if i == tries - 1:
+                raise
+            log.warning("%s failed (%s) — retry %d/%d", what, e, i + 1, tries - 1)
+            time.sleep(5 * (i + 1))
 
 
 def _place_keys_json(cj: dict) -> str | None:
