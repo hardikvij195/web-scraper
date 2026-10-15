@@ -155,6 +155,15 @@ def _job_areas(job: Any) -> list[dict[str, Any]]:
 
 
 # ── worker ────────────────────────────────────────────────────────────────────
+def _paused_lanes_safe() -> frozenset:
+    """W186: `lanes.paused_lanes()` that never raises."""
+    try:
+        from webscraper.lanes import paused_lanes
+        return paused_lanes()
+    except Exception:                                             # noqa: BLE001
+        return frozenset()
+
+
 def _wa_off_safe() -> bool:
     """W184: `lanes.wa_off()` that never raises."""
     try:
@@ -811,10 +820,16 @@ class Worker(threading.Thread):
             enrich_free = ok and not enr_claimed and cap[LANE_ENRICHMENT] - busy[LANE_ENRICHMENT] - pending_by[LANE_ENRICHMENT] > 0   # W167
             wa_free = (ok and account and not wa_claimed                                 # W164
                        and cap[LANE_WHATSAPP] - busy[LANE_WHATSAPP] - pending_by[LANE_WHATSAPP] > 0)
+            # W186: a lane paused by hand on the CRM takes no new work.
+            lanes_paused = sorted(_paused_lanes_safe())
+            maps_free = maps_free and LANE_DISCOVERY not in lanes_paused
+            enrich_free = enrich_free and LANE_ENRICHMENT not in lanes_paused
+            wa_free = wa_free and LANE_WHATSAPP not in lanes_paused
             return {"pipelining": True,
                     "discovery_free": (self._disc_job is None) and not blocked,
                     "maps_free": maps_free, "enrich_free": enrich_free, "wa_free": wa_free,
                     "wa_off": _wa_off_safe(),                         # W184
+                    "lanes_paused": lanes_paused,                     # W186
                     "lanes_free": maps_free or enrich_free or wa_free,
                     "lane_slots": {
                         LANE_DISCOVERY: {"busy": busy[LANE_DISCOVERY], "cap": 1},
@@ -891,6 +906,14 @@ class Worker(threading.Thread):
                     enr_free = 0
                 if wa_free and self._lane_claimed(store, LANE_WHATSAPP):
                     wa_free = 0
+                # W186: a paused lane starts no new job here (the job stays queued locally)
+                _lp = _paused_lanes_safe()
+                if LANE_ENRICHMENT in _lp:
+                    enr_free = 0
+                if LANE_WHATSAPP in _lp:
+                    wa_free = 0
+                if LANE_DISCOVERY in _lp:
+                    disc_free = False
                 # First queued job whose window is open and whose next lane has room; jobs
                 # outside their window show 'waiting'. The CRM queues highest-priority-first.
                 for cand in store.queued_jobs():
@@ -1017,6 +1040,9 @@ class Worker(threading.Thread):
             def wait_if_paused(j=job_id) -> None:
                 """Block between places while the run window is closed (checked every 30 s)."""
                 s = disc["store"]
+                # W186: the Maps lane paused by hand on the CRM Systems page
+                lanes_mod.wait_while_paused(j, LANE_DISCOVERY, lambda: s.stop_requested(j),
+                                            lambda m: s.update_job(j, message=m))
                 paused = False
                 while not in_window(w_start, w_end) and not s.stop_requested(j):
                     if not paused:

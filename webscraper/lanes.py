@@ -497,6 +497,78 @@ def wa_off() -> bool:
     return parse_wa_off(_device_env("WA_OFF"), os.getenv("WA_OFF"))
 
 
+#: W186 (CRM T1247-c): manual per-machine lane pause from the CRM Systems page. `LANE_PAUSE__<DEVICE>`
+#: (CRM `lead_gen_settings` key `lane_pause__<device>`) wins over the generic `LANE_PAUSE`; value = a
+#: comma list of `maps,websites,whatsapp` ("none" / empty = nothing paused). A paused lane finishes the
+#: item / batch in hand, gives its stage slot back (W136: never hold a slot while idle) and waits; the
+#: job is NOT failed, parked or cancelled, the other lanes keep running, and the agent reports the lane
+#: as not free so the CRM sends it no new work. Unpausing resumes within one LANE_PAUSE refresh (~45 s).
+LANE_PAUSE_ALIASES = {"maps": "discovery", "google_maps": "discovery", "discovery": "discovery",
+                      "websites": "enrichment", "website": "enrichment", "web": "enrichment",
+                      "enrichment": "enrichment", "enrich": "enrichment",
+                      "whatsapp": "whatsapp", "wa": "whatsapp"}
+LANE_PAUSE_LABEL = {"discovery": "Maps", "enrichment": "Websites", "whatsapp": "WhatsApp"}
+PAUSE_POLL_SEC = 2.0
+PAUSE_NOTE_EVERY_SEC = 600.0
+
+#: W186: (job_id, lane key) pairs waiting in `wait_while_paused` right now — read by `lane_states`
+#: (-> "paused") and by the agent's stall watchdogs (a paused job is not stuck).
+PAUSED_NOW: set[tuple[int, str]] = set()
+
+
+def parse_lane_pause(per_device: str | None, generic: str | None) -> frozenset[str]:
+    """W186: pure — lane keys paused by the setting. Per-device wins when set (even "none")."""
+    raw = per_device if per_device is not None and per_device.strip() != "" else generic
+    out: set[str] = set()
+    for tok in re.split(r"[,;\s]+", (raw or "").strip().lower()):
+        k = LANE_PAUSE_ALIASES.get(tok.replace("-", "_"))
+        if k:
+            out.add(k)
+    return frozenset(out)
+
+
+def paused_lanes() -> frozenset[str]:
+    """W186: lane keys (`discovery` / `enrichment` / `whatsapp`) paused on this machine now."""
+    return parse_lane_pause(_device_env("LANE_PAUSE"), os.getenv("LANE_PAUSE"))
+
+
+def lane_paused(key: str) -> bool:
+    try:
+        return key in paused_lanes()
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
+def paused_jobs() -> set[int]:
+    """W186: job ids with at least one lane waiting on a manual pause."""
+    return {j for j, _k in list(PAUSED_NOW)}
+
+
+def wait_while_paused(job_id: int, key: str, stopped: Callable[[], bool],
+                      note: Callable[[str], None]) -> bool:
+    """W186: block while lane `key` is paused on this machine. True = carry on (not paused /
+    resumed), False = the job was stopped meanwhile. Holds no stage slot — callers release first."""
+    if not lane_paused(key):
+        return True
+    label = LANE_PAUSE_LABEL.get(key, key)
+    note(f"{label} lane paused on this machine (W186) — the job waits here and carries on when the "
+         "lane is resumed on the CRM Systems page")
+    PAUSED_NOW.add((job_id, key))
+    last = time.monotonic()
+    try:
+        while lane_paused(key):
+            if stopped():
+                return False
+            if time.monotonic() - last >= PAUSE_NOTE_EVERY_SEC:
+                last = time.monotonic()
+                note(f"{label} lane still paused on this machine (W186)")
+            time.sleep(PAUSE_POLL_SEC)
+    finally:
+        PAUSED_NOW.discard((job_id, key))
+    note(f"{label} lane resumed (W186)")
+    return True
+
+
 #: W153 (CRM T1047, owner 2026-10-07: "each lane 1 job should run on each system and then it should be
 #: queued back — logically you cannot run 2 WA jobs at the same time; same for Google Maps and
 #: webscraping"). ON by default: every stage gate has ONE slot (Maps already is one tab), lanes never
@@ -798,6 +870,19 @@ class Lane(threading.Thread):
         self._slice_t0 = None
         self.note(f"{why} — handing the {self.key} slot to the next job in line meanwhile")
 
+    def _pause_wait(self) -> bool:
+        """W186: wait while this lane is paused on this machine, holding no stage slot. False only
+        when the job was stopped meanwhile. A slot given up here is taken back by `_slot_resume`."""
+        if not lane_paused(self.key):
+            return True
+        gate = STAGE_GATES.get(self.key)
+        if gate is not None and gate.holds(self.job_id):
+            gate.release(self.job_id)
+            self._slot_parked = True
+            self._slice_n = 0
+            self._slice_t0 = None
+        return wait_while_paused(self.job_id, self.key, self.stopped, lambda m: self.note(m))
+
     # -- W153 (CRM T1047): one job per lane — a job that would only WAIT here is parked -------
     def _park_due(self, gate: "StageGate") -> bool:
         """True when this lane cannot take the gate now AND no other lane of this job is still
@@ -880,6 +965,9 @@ class Lane(threading.Thread):
                 # A re-run reuses the row, so yesterday's `scrape_started_at` would
                 # otherwise make a switched-off lane read as still running.
                 self.store.lane_disabled(self.job_id, self.key)
+                return
+            if not self._pause_wait():                           # W186: paused before it started
+                self.reason = R_STOPPED
                 return
             if gate is not None:
                 # W122: wait my turn for this stage's shared slot(s) before touching the
@@ -1064,6 +1152,8 @@ class EnrichmentLane(Lane):
                          enrich_total=seen + store.count_pending_enrichment(self.job_id))
         while True:
             if self.stopped():
+                return R_STOPPED
+            if not self._pause_wait():                                  # W186
                 return R_STOPPED
             batch = store.pending_enrichment(self.job_id, ENRICH_BATCH)
             if batch and scope_mode == "wa_missing":
@@ -1314,6 +1404,8 @@ class WhatsAppLane(Lane):
         mem_note_at = 0.0
         while True:
             if self.stopped():
+                return R_STOPPED
+            if not self._pause_wait():                                  # W186
                 return R_STOPPED
             if not self.ctl.discovery_finished() and memory_high_for_whatsapp():
                 # W162: three Chromes do not fit — WhatsApp waits for Maps, numbers stay queued.
@@ -1588,13 +1680,15 @@ def alive_lanes(job_id: int) -> list[str]:
 def lane_states(job_id: int) -> dict[str, str]:
     """W135: per live lane: `running` (holds its stage slot / no gate), `queued` (waiting
     for a slot — including a W135 yield), `idle` (W136: gave its slot up while it has
-    nothing to do) — read by `agent._cloud_phase`."""
+    nothing to do), `paused` (W186: manual lane pause) — read by `agent._cloud_phase`."""
     out: dict[str, str] = {}
     p = _PIPELINES.get(job_id)
     lanes_by_key = {l.key: l for l in p.lanes} if p is not None else {}
     for key in alive_lanes(job_id):
         g = STAGE_GATES.get(key)
-        if g is not None and g.waiting_on(job_id):
+        if (job_id, key) in PAUSED_NOW:
+            out[key] = "paused"                                   # W186
+        elif g is not None and g.waiting_on(job_id):
             out[key] = "queued"
         elif g is not None and getattr(lanes_by_key.get(key), "_slot_parked", False):
             out[key] = "idle"

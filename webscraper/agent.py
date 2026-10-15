@@ -656,7 +656,7 @@ def _cloud_phase(row: Any) -> str:
         return "enriching"
     if states.get("whatsapp") == "running":
         return "verifying_wa"
-    if all(v in ("queued", "idle") for v in states.values()):
+    if all(v in ("queued", "idle", "paused") for v in states.values()):   # W186: paused = waiting
         return "waiting"
     return phase
 
@@ -778,6 +778,15 @@ def _lanes_all_ok(store, jid: int) -> bool:
     return bool(ran) and all(l.get("ok") for l in ran)
 
 
+def _job_lane_paused(job_id: int) -> bool:
+    """W186: does `job_id` have a lane waiting on a manual lane pause right now?"""
+    try:
+        from webscraper.lanes import paused_jobs
+        return job_id in paused_jobs()
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
 def _fail_stalled(cloud: "Cloud | CrmCloud", store: Store, kind: str) -> None:
     """Stop a job that has stopped moving, and report why.
 
@@ -801,6 +810,10 @@ def _fail_stalled(cloud: "Cloud | CrmCloud", store: Store, kind: str) -> None:
         # final status in a moment. Stopping the job here turned finished runs into
         # Error rows on the CRM (#1619, #1634, 2026-09-09).
         if _lanes_all_ended(store, jid):
+            _STALL_SEEN.pop(jid, None)
+            continue
+        if _job_lane_paused(jid):
+            # W186: a lane paused by hand on the CRM is a wait, not a stall — restart the clock.
             _STALL_SEEN.pop(jid, None)
             continue
         try:
@@ -885,7 +898,7 @@ def _restart_if_all_stalled(store: Store, kind: str, now: float | None = None) -
     except Exception:                                             # noqa: BLE001
         return False
     live = [int(r["id"]) for r in rows if alive_lanes(int(r["id"]))]
-    if not live or RELINK_WAITERS:
+    if not live or RELINK_WAITERS or any(_job_lane_paused(j) for j in live):   # W186: paused = waiting
         _GLOBAL_STALL[0] = None
         return False
     ids = [int(r["id"]) for r in rows]
@@ -1924,7 +1937,14 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # W183: Chrome Job Object RAM cap (read at the next launch)
                             "CHROME_JOB_MEM_MB",
                             # W184: per-machine WhatsApp OFF switch (`wa_off__<device>`)
-                            "WA_OFF")
+                            "WA_OFF",
+                            # W186: per-machine manual lane pause (`lane_pause__<device>`)
+                            "LANE_PAUSE")
+
+#: W186: the lane-pause knob alone is re-read this often (the CRM switch should bite within ~1 min;
+#: the other knobs keep the 5-min cadence).
+LANE_PAUSE_REFRESH_SEC = 45.0
+_last_pause_refresh = [0.0]
 
 #: How often the main loop re-fetches cloud config for the knobs above.
 CONFIG_REFRESH_SEC = 300.0
@@ -1940,9 +1960,14 @@ def _refresh_cloud_config(cloud: "CrmCloud", *, force: bool = False) -> None:
     (came from the cloud at agent start) — a local `.env`/process value keeps winning,
     same rule as the one-time apply. A fetch failure never breaks the caller's loop."""
     now = time.monotonic()
+    pause_only = False
     if not force and (now - _last_config_refresh[0]) < CONFIG_REFRESH_SEC:
-        return
-    _last_config_refresh[0] = now
+        if now - _last_pause_refresh[0] < LANE_PAUSE_REFRESH_SEC:
+            return
+        pause_only = True                                         # W186: only LANE_PAUSE* this time
+    else:
+        _last_config_refresh[0] = now
+    _last_pause_refresh[0] = now
     try:
         cfg = cloud.config()
     except httpx.HTTPError as e:
@@ -1951,9 +1976,12 @@ def _refresh_cloud_config(cloud: "CrmCloud", *, force: bool = False) -> None:
     except Exception as e:                                        # noqa: BLE001
         log.warning("config refresh failed (keeping current values): %s", e)
         return
+    _apply_lane_pause_removed(cfg)
     for k, v in cfg.items():
         env = k.upper()
         if not v or not env.startswith(_CONFIG_REFRESH_PREFIXES):
+            continue
+        if pause_only and not env.startswith("LANE_PAUSE"):
             continue
         if env not in _CLOUD_ENV:
             # A knob the CRM did not have at agent start (a key added today, e.g.
@@ -1966,6 +1994,17 @@ def _refresh_cloud_config(cloud: "CrmCloud", *, force: bool = False) -> None:
             log.info("config: %s changed by cloud refresh (%r -> %r)", env, os.environ.get(env), v)
             os.environ[env] = v
     _apply_stage_slots()
+
+
+def _apply_lane_pause_removed(cfg: dict) -> None:
+    """W186: a cloud-owned LANE_PAUSE* var whose row was deleted on the CRM (an empty value deletes
+    the row) is cleared here — the refresh otherwise only ever sets names, so an unpause by deletion
+    would never reach a running agent. A local `.env` value (not in `_CLOUD_ENV`) stays."""
+    present = {str(k).upper() for k, v in cfg.items() if v}
+    for env in [e for e in _CLOUD_ENV if e.startswith("LANE_PAUSE") and e not in present]:
+        if os.environ.get(env):
+            log.info("config: %s removed on the CRM — lane pause cleared", env)
+            os.environ[env] = ""
 
 
 def _apply_stage_slots() -> None:
