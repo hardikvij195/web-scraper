@@ -96,3 +96,41 @@ def test_a_failed_slice_does_not_sink_the_others(setup, monkeypatch):
     agent._reverify_wa(cloud, s, 1, leads_verify=True)
     assert [c["account"] for c in calls] == ["a2"]
     assert cloud.done_calls == [("done", None)]
+
+
+def test_w187_dead_session_hands_its_share_to_the_spare_account(setup, monkeypatch):
+    """W187 (PC 2026-10-15): stale `main` logged out at once, poco_biz never ran, half the leads were lost."""
+    s, rows, calls = setup
+    monkeypatch.setattr("webscraper.lanes._wa_parallel", lambda: 2)   # a1 + a2 start, a3 is the spare
+    real = wa_verify.verify_places
+
+    def a1_logs_out(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+        if account == "a1":
+            st.set_wa_needs_relink("a1", True)                          # the account drops, nothing checked
+            return {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}
+        return real(st, rows, on_progress, should_stop, job_id, headless, account)
+
+    monkeypatch.setattr(wa_verify, "verify_places", a1_logs_out)
+    cloud = FakeCloud(rows)
+    agent._reverify_wa(cloud, s, 1, leads_verify=True)
+    assert sorted(c["account"] for c in calls) == ["a2", "a3"]
+    keys = [k for c in calls for k in c["keys"]]
+    assert sorted(keys) == sorted(r["place_key"] for r in rows)        # nothing lost, nothing twice
+
+
+def test_w187_no_spare_finishes_the_rest_on_a_surviving_account(setup, monkeypatch):
+    s, rows, calls = setup
+    monkeypatch.setattr("webscraper.lanes._wa_parallel", lambda: 3)   # all three in use, no spare
+    real = wa_verify.verify_places
+
+    def a1_logs_out(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+        if account == "a1":
+            st.set_wa_needs_relink("a1", True)
+            return {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}
+        return real(st, rows, on_progress, should_stop, job_id, headless, account)
+
+    monkeypatch.setattr(wa_verify, "verify_places", a1_logs_out)
+    agent._reverify_wa(FakeCloud(rows), s, 1, leads_verify=True)
+    keys = [k for c in calls for k in c["keys"]]
+    assert sorted(keys) == sorted(r["place_key"] for r in rows)
+    assert "a1" not in [c["account"] for c in calls]

@@ -2381,21 +2381,54 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
     slices = [targets[i::len(accounts)] for i in range(len(accounts))]
     results: list[dict] = []
     errors: list[BaseException] = []
+    # W187 (CRM T1247, PC 2026-10-15): a slice whose account dies (logged out / needs relink /
+    # stuck syncing) used to drop its whole share of the job for this run, and a linked account
+    # left out of `accounts` never got used — PC ran `main` (stale profile, logged out at once)
+    # + oneplus_biz while poco_biz sat idle and half the leads went unchecked. Now the rest of a
+    # dead slice moves to a spare enabled account, or, with none left, onto a surviving one after.
+    done_pks: set[str] = set()
+    lock = threading.Lock()
+    spare = [a for a in store.enabled_wa_accounts() if a not in accounts]
+    leftovers: list[dict] = []
+
+    def onp_tracked(pk: str, *a: Any, **k: Any) -> None:
+        with lock:
+            done_pks.add(pk)
+        onp(pk, *a, **k)
+
+    def stopped() -> bool:
+        return bool(should_stop and should_stop())
 
     def run_slice(rows: list[dict], name: str) -> None:
-        st = Store(store.path)
-        _SLICE_STORE.st = st
-        try:
-            results.append(wa_verify.verify_places(st, rows, on_progress=onp, should_stop=should_stop,
-                                                   job_id=None, account=name))
-        except BaseException as e:                                # noqa: BLE001
-            errors.append(e)
-            log.warning("re-verify slice %s failed: %s", name, e)
-        finally:
+        while rows:
+            st = Store(store.path)
+            _SLICE_STORE.st = st
             try:
-                st.close()
-            except Exception:                                     # noqa: BLE001
-                pass
+                results.append(wa_verify.verify_places(st, rows, on_progress=onp_tracked, should_stop=should_stop,
+                                                       job_id=None, account=name))
+            except BaseException as e:                            # noqa: BLE001
+                errors.append(e)
+                log.warning("re-verify slice %s failed: %s", name, e)
+            finally:
+                try:
+                    alive = name in st.enabled_wa_accounts()
+                except Exception:                                 # noqa: BLE001
+                    alive = True
+                try:
+                    st.close()
+                except Exception:                                 # noqa: BLE001
+                    pass
+            if stopped() or alive:
+                return            # finished, or stopped for a reason a new account would not fix (cap)
+            with lock:
+                left = [r for r in rows if r.get("place_key") not in done_pks]
+                nxt = spare.pop(0) if (left and spare) else None
+                if left and nxt is None:
+                    leftovers.extend(left)
+            if nxt is None:
+                return
+            log.warning("re-verify: %s dropped with %d place(s) left — handing them to %s", name, len(left), nxt)
+            rows, name = left, nxt
 
     ts = [threading.Thread(target=run_slice, args=(sl, accounts[i]), name=f"reverify-wa-{i}", daemon=True)
           for i, sl in enumerate(slices) if sl]
@@ -2403,6 +2436,13 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
         t.start()
     for t in ts:
         t.join()
+    if leftovers and not stopped():
+        healthy = store.enabled_wa_accounts()
+        if healthy:
+            rest = list(leftovers)
+            leftovers.clear()
+            log.warning("re-verify: %d place(s) from dropped session(s) — finishing them on %s", len(rest), healthy[0])
+            run_slice(rest, healthy[0])
     if errors and not results:
         raise errors[0]
     out = {k: sum(int(r.get(k, 0) or 0) for r in results)
