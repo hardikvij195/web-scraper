@@ -1113,10 +1113,13 @@ class Store:
             except Exception:                                     # noqa: BLE001 — already there
                 pass
         def _do() -> None:
-            self.conn.execute(
-                "INSERT INTO wa_accounts(name, added_at, status, status_at) VALUES (?,?,?,?) "
-                "ON CONFLICT(name) DO UPDATE SET status=excluded.status, status_at=excluded.status_at",
-                (name, now_iso(), status, now_iso()))
+            # W190 (CRM T1240): UPDATE only — a status sighting must never create an account. The
+            # per-job refresh (server.py) walks the profile FOLDERS, and a deleted account whose
+            # folder survived the rmtree (a Chrome still held it) came back as an enabled row and
+            # took one of the two session slots on 1 - PC (`main`, 2026-10-16). `login()` adds the
+            # row before any status is written, so a fresh account is never lost here.
+            self.conn.execute("UPDATE wa_accounts SET status=?, status_at=? WHERE name=?",
+                              (status, now_iso(), name))
             if status == "logged_in":
                 # W152 (CRM T1037): the chat list on screen IS the proof the link is fine. ASUS / MI /
                 # DELL were flagged `needs_relink` while RAM-thrashing (W143 episode 4 — the sync never
@@ -1290,10 +1293,13 @@ class Store:
         return sum(max(0, cap - int(r[0])) for r in rows)
 
     def enabled_wa_accounts(self) -> list[str]:
-        """Accounts a lane may open: enabled, not `needs_relink` (W143), not `sync_stuck` (W171)."""
+        """Accounts a lane may open: enabled, not `needs_relink` (W143), not `sync_stuck` (W171).
+        W190: the ones last SEEN logged out sort LAST — they stay in the list (an enabled,
+        logged-out account is what the lane waits on for a relink, T601) but a re-verify's
+        `accounts[:n_par]` no longer spends a session slot on one while a linked account idles."""
         return [r[0] for r in self.conn.execute(
             "SELECT name FROM wa_accounts WHERE disabled=0 AND COALESCE(needs_relink,0)=0 "
-            "AND COALESCE(sync_stuck,0)=0 ORDER BY name")]
+            "AND COALESCE(sync_stuck,0)=0 ORDER BY (COALESCE(status,'')='logged_out'), name")]
 
     def pick_wa_account(self, cap: int, today: str, exclude: set[str] | None = None) -> str | None:
         """Enabled account with remaining cap today, least-recently-used first (rotation).
@@ -1306,9 +1312,12 @@ class Store:
         if exclude:
             where += " AND name NOT IN (" + ",".join("?" for _ in exclude) + ")"
             args = args + tuple(sorted(exclude))
+        # W190: an account last SEEN logged out is picked only when no other one is left — it then
+        # opens to the QR screen, is disabled, and the lane goes into its relink wait as before.
         row = self.conn.execute(
             f"SELECT name FROM wa_accounts WHERE {where} "
-            "ORDER BY last_used_at IS NULL DESC, last_used_at ASC LIMIT 1", args).fetchone()
+            "ORDER BY (COALESCE(status,'')='logged_out'), last_used_at IS NULL DESC, last_used_at ASC LIMIT 1",
+            args).fetchone()
         return row[0] if row else None
 
     def bump_wa_account(self, name: str, today: str) -> None:

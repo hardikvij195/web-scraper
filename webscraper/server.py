@@ -173,6 +173,28 @@ def _wa_off_safe() -> bool:
         return False
 
 
+def _drop_orphan_wa_profile(path: Path) -> None:
+    """W190 (CRM T1240): remove a WhatsApp profile folder that has no `wa_accounts` row — the
+    leftover of a delete / reset whose rmtree lost to a Chrome holding the files. Skipped while
+    a login for that label is open (the row is added before the window, so this is belt and
+    braces). Never raises; a folder Chrome still holds is retried on the next refresh."""
+    try:
+        from webscraper import wa_verify
+        if wa_verify.login_in_progress(path.name):
+            return
+    except Exception:                                             # noqa: BLE001
+        pass
+    try:
+        from webscraper.browser_recovery import kill_profile_holder
+        kill_profile_holder(path, "orphan wa profile")
+    except Exception:                                             # noqa: BLE001
+        pass
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
+    log.info("WhatsApp profile %r has no account row (deleted earlier) — folder %s (W190)",
+             path.name, "removed" if not path.exists() else "still held by a Chrome, retry on the next refresh")
+
+
 def _refresh_wa_status(store, when: str) -> None:
     """Ask each WhatsApp profile whether it is still linked, and record the answer.
 
@@ -200,13 +222,23 @@ def _refresh_wa_status(store, when: str) -> None:
         # taken as read and only stale profiles are probed.
         fresh_before = datetime.now(timezone.utc) - timedelta(minutes=20)
         seen_at: dict[str, datetime] = {}
+        rows: set[str] | None = None          # W190: None = the listing failed, treat nothing as orphan
         try:
+            rows = set()
             for row in store.list_wa_accounts():
+                rows.add(str(row["name"]))
                 if row.get("status") and row.get("status_at"):
                     seen_at[str(row["name"])] = datetime.fromisoformat(str(row["status_at"]))
         except Exception:                                         # noqa: BLE001
-            pass
+            rows = None
         for acc in sorted(p.name for p in d.iterdir() if p.is_dir()):
+            if rows is not None and acc not in rows:
+                # W190 (CRM T1240): a folder with no `wa_accounts` row is a deleted account's leftover
+                # (`reset_account`'s rmtree lost to a Chrome still holding it). Probing it used to
+                # re-create the row — enabled — and the next re-verify burned a session slot on it
+                # (1 - PC `main`, 2026-10-16). Remove the folder instead; never probe it.
+                _drop_orphan_wa_profile(d / acc)
+                continue
             if not (d / acc / "Default").exists():
                 continue                      # never completed a login; nothing to probe
             last = seen_at.get(acc)
