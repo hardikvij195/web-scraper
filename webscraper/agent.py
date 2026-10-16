@@ -2456,6 +2456,7 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
     out = {k: sum(int(r.get(k, 0) or 0) for r in results)
            for k in ("yes", "no", "unknown", "checked", "no_number")}
     out["capped"] = any(bool(r.get("capped")) for r in results)
+    out["dropped"] = len(leftovers)   # W191: places a dead session left with no account to finish them
     return out
 
 
@@ -2527,6 +2528,9 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
                    "eta_sec": eta_sec, "estimating": (eta_sec is None) and not ended, "rate_source": src,
                    "started_at": started_iso, "ended_at": now_iso if ended else None,
                    "ok": (reason == "completed") if ended else None, "reason": reason,
+                   # W191: numbers left unchecked when the lane ended early — the CRM's finish trigger
+                   # (lead_gen_jobs_mark_incomplete) reads it to keep the job Incomplete + follow up.
+                   "pending": max(0, total - done) if ended and reason != "completed" else 0,
                    "ran_sec": round(time.monotonic() - started)}
         idle = [{"key": k, "label": eta.LANE_LABELS[k], "unit": eta.LANE_UNITS[k],
                  "status": "disabled", "done": 0, "total": None, "total_is_min": False,
@@ -2565,6 +2569,12 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
     # Per-number verdicts per place (W26); the place-level picture is re-derived after
     # every check with the same rule the live lane uses (any yes → yes, all no → no).
     checks: dict[str, list[dict[str, Any]]] = {}
+    # W191 (CRM T1260): the latest FULL set_wa row per place (verdict + number + wa_numbers delta) and
+    # the places whose live flush failed — re-sent before ANY exit (incl. a session that died mid-run),
+    # so no checked verdict is lost. Only the failed ones are re-sent: the wa_numbers delta carries
+    # `checks: 1`, and re-sending a delivered one would count that look twice.
+    last_upd: dict[str, dict[str, Any]] = {}
+    unsent: set[str] = set()
 
     def _n_checked() -> int:
         return sum(len(v) for v in checks.values())
@@ -2611,9 +2621,27 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
             if cloud.progress(jid, "verifying_wa", wa_progress(_n_checked())) and not stop_ev.is_set():
                 stop_why[0] = "cancelled"
                 stop_ev.set()
+            last_upd[pk] = upd
+            unsent.add(pk)
             cloud.set_wa(jid, [upd])
+            unsent.discard(pk)
         except httpx.HTTPError as e:
             log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
+
+    def _flush_unsent() -> None:
+        """W191: re-send every verdict whose live set_wa failed (full row, not just the verdict)."""
+        with _onp_lock:
+            rows = [last_upd[k] for k in list(unsent) if k in last_upd]
+        if not rows:
+            return
+        try:
+            _crm_retry(lambda: cloud.set_wa(jid, rows), f"re-verify #{jid}: re-send {len(rows)} verdict(s)")
+        except Exception as e:  # noqa: BLE001 — never let the safety net mask the real exit
+            log.warning("re-verify #%s: re-sending %d verdict(s) failed: %s", jid, len(rows), e)
+            return
+        with _onp_lock:
+            for r in rows:
+                unsent.discard(r["place_key"])
 
     def onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
         with _onp_lock:
@@ -2637,22 +2665,40 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
             # here); `store` is still used for WA account rotation + daily caps.
             res = wa_verify.verify_places(store, targets, on_progress=onp, should_stop=stop_ev.is_set, job_id=None)
     except wa_verify.WaNotLoggedIn as e:
-        cloud.done(jid, "error", f"WhatsApp verify skipped — {e}")
+        # W191: the session died (all accounts logged out / relink / stuck syncing). Keep every verdict
+        # already checked, then end like the live lane does — `wa_not_logged_in` with the rest still
+        # pending — so the CRM marks the job Incomplete and its WhatsApp follow-up re-checks only the
+        # numbers that never got a verdict (nothing unchecked is ever written as 'no').
+        _flush_unsent()
+        n_checked = _n_checked()
+        _jlog(f"WhatsApp session lost after {n_checked} number(s) — {max(0, total - n_checked)} left for a re-run: {e}",
+              "warn")
+        _crm_retry(lambda: cloud.progress(jid, "verifying_wa", wa_progress(n_checked, "wa_not_logged_in")),
+                   f"re-verify #{jid}: session-lost progress")
+        _crm_retry(lambda: cloud.done(jid, "done", f"WhatsApp session lost after {n_checked} numbers — "
+                                                    f"{max(0, total - n_checked)} left: {e}"[:200]),
+                   f"re-verify #{jid}: done (session lost)")
         return
     except Exception as e:  # noqa: BLE001
         log.exception("re-verify #%s failed", jid)
+        _flush_unsent()
         cloud.done(jid, "error", str(e)[:200])
         return
     # Feed the rolling average so the next verify run can be estimated (W4).
     n_checked = _n_checked()
     store.record_phase_rate(None, "verifying_wa", n_checked, time.monotonic() - started)
     if collected:
-        _crm_retry(lambda: cloud.set_wa(jid, [{"place_key": k, "wa_verified": v} for k, v in collected.items()]),
+        # W191: a place whose live flush failed goes again as its full row (number + history).
+        _crm_retry(lambda: cloud.set_wa(jid, [last_upd[k] if k in unsent and k in last_upd
+                                              else {"place_key": k, "wa_verified": v} for k, v in collected.items()]),
                    f"re-verify #{jid}: final set_wa")
     capped = bool(res.get("capped")) if isinstance(res, dict) else False
     stopped = stop_ev.is_set()
     why = stop_why[0] or (_REVERIFY.get("why") if own is not None else None) or "parked"
-    reason = "stopped" if stopped else ("wa_daily_cap" if capped else "completed")
+    # W191: every slice's session died with places still unchecked (no healthy account left to
+    # finish them) = a lost session, not a completed lane.
+    dropped = int(res.get("dropped", 0) or 0) if isinstance(res, dict) else 0
+    reason = "stopped" if stopped else ("wa_daily_cap" if capped else ("wa_not_logged_in" if dropped else "completed"))
     left = max(0, total - n_checked)
     try:
         cloud.progress(jid, "verifying_wa", wa_progress(n_checked, reason))
