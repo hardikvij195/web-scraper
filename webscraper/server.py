@@ -493,7 +493,11 @@ def memory_start_max_pct() -> float:
 
 def job_needs_discovery(row: Any) -> bool:
     """W138: mirrors `lanes.DiscoveryLane.enabled` for a local jobs row — a re-enrich pass
-    (`reenrich_only`) needs no Maps tab unless it is a `discovery_pending` resume."""
+    (`reenrich_only`) needs no Maps tab unless it is a `discovery_pending` resume. W188: a
+    `wa_verify_only` row never does (mirrors `DiscoveryLane.enabled`), so a paused Maps lane (W186)
+    can never make W155 release a WhatsApp-only job as "discovery lane has no free slot"."""
+    if bool(_rowget(row, "wa_verify_only", 0)):
+        return False
     try:
         reenrich = bool(row["reenrich_only"])
     except (KeyError, IndexError, TypeError):

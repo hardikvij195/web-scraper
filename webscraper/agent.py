@@ -621,6 +621,20 @@ def _discovery_pending_for(claimed: dict) -> bool:
     return want
 
 
+def _no_maps_rerun(claimed: dict) -> bool:
+    """W188 (CRM T1247-e): does this claimed cloud job need NO Maps tab? True for a WhatsApp-only
+    re-verify, a re-enrich pass that is not a real `discovery_pending` resume, and a
+    `discovery_pending` resume whose Maps lane already completed (W157 drops the resume; the CRM's
+    auto-heal re-queue writes `reenrich_only=false, wa_verify_only=false, discovery_pending=true`,
+    so without this the local row read "full Maps run" and, with Maps paused (W186) on every
+    machine, W155 released it "discovery lane has no free slot" every 5 min - #21574 / #21594)."""
+    if claimed.get("wa_verify_only"):
+        return True
+    if _discovery_pending_for(claimed):
+        return False
+    return bool(claimed.get("reenrich_only")) or bool(claimed.get("discovery_pending"))
+
+
 _TERMINAL_PHASES = ("done", "stopped", "failed", "error", "cancelled")
 
 
@@ -2460,7 +2474,54 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
     return out
 
 
+class _CloudLogBuffer:
+    """W188 (CRM T1247-e): re-verify log lines straight to `lead_gen_job_logs` for the CLOUD job id.
+
+    `_reverify_wa`'s lines used to go only onto the local mirror job's `job_logs` (shipped by
+    `_ship_logs`) - a re-verify claimed by a machine with no mirror row (#21525) wrote its
+    "-> ON WhatsApp" verdict lines nowhere, so `lead_gen_machine_output` / the owner's WA report saw
+    zero WhatsApp work. Thread-safe (W109 slices); a failed POST keeps the lines for the next flush."""
+    FLUSH_LINES = 10
+    FLUSH_SEC = 15.0
+
+    def __init__(self, cloud: Any, jid: int) -> None:
+        self.cloud, self.jid = cloud, int(jid)
+        self.rows: list[dict] = []
+        self.lock = threading.Lock()
+        self.last = time.monotonic()
+
+    def add(self, lane: str, msg: str, level: str = "info") -> None:
+        with self.lock:
+            self.rows.append({"ts": now_iso(), "lane": lane, "level": level, "message": msg})
+            due = len(self.rows) >= self.FLUSH_LINES or time.monotonic() - self.last >= self.FLUSH_SEC
+        if due:
+            self.flush()
+
+    def flush(self) -> None:
+        with self.lock:
+            batch, self.rows = self.rows, []
+            self.last = time.monotonic()
+        if not batch:
+            return
+        try:
+            self.cloud.logs(self.jid, batch)
+        except Exception as e:                                    # noqa: BLE001 - a diary, never fatal
+            log.warning("re-verify #%s: log ship failed (%d line(s) kept): %s", self.jid, len(batch), e)
+            with self.lock:
+                self.rows = (batch + self.rows)[-500:]
+
+
 def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool = False) -> None:
+    """W188 wrapper: run the re-verify, then file any log lines still buffered for the CRM."""
+    buf = _CloudLogBuffer(cloud, jid)
+    try:
+        _reverify_wa_run(cloud, store, jid, leads_verify, buf)
+    finally:
+        buf.flush()
+
+
+def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool = False,
+                     cloud_log: "_CloudLogBuffer | None" = None) -> None:
     """Verify an existing CRM job's numbers on WhatsApp and sync wa_verified back.
     No scraping/enriching — operates purely on the job's already-synced results.
 
@@ -2560,6 +2621,9 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
                 (getattr(_SLICE_STORE, "st", None) or store).log(local_log_id, "whatsapp", msg, level)
             except Exception:                                     # noqa: BLE001
                 pass
+        elif cloud_log is not None:
+            # W188: no mirror row here -> no `_ship_logs` for these lines; file them on the cloud job.
+            cloud_log.add("whatsapp", msg, level)
 
     _jlog((f"leads-verify: checking {total} CRM lead(s) on WhatsApp" if leads_verify
            else f"re-verify: checking {total} number(s) on WhatsApp") + " — accounts: "
@@ -2746,6 +2810,35 @@ def _place_keys_json(cj: dict) -> str | None:
     return None
 
 
+def _route_reverify(cloud: "CrmCloud", store: Store, cj: dict) -> bool:
+    """W188 (CRM T1247-e): the one entry for a `wa_verify_only` cloud job, mirrored here or not -
+    claim it and run `_reverify_wa` on its thread. Before this a job with a LOCAL mirror row could
+    reach `_requeue_rerun`, which re-armed the mirror as a normal run (Maps first); with Maps paused
+    (W186) W155 released it and the CRM re-queued it every 5 min. True when a re-verify started."""
+    # W108: never a second re-verify while one runs (its progress can go stale during
+    # a long sync wait, and a stale job is claimable again by this same device).
+    if _reverify_busy() is not None:
+        return False
+    from webscraper.lanes import wa_off as _wa_off_fn
+    if _wa_off_fn():                             # W184: a re-verify is pure WhatsApp - never here
+        return False
+    claimed = cloud.claim(cj["id"])
+    if claimed is None:
+        return False
+    row = store.conn.execute("SELECT id FROM jobs WHERE cloud_id=? ORDER BY id DESC LIMIT 1", (cj["id"],)).fetchone()
+    if row is not None:
+        try:
+            store.log(int(row["id"]), "job", f"re-verify requested from the CRM (cloud job #{cj['id']}) - "
+                                             "WhatsApp only, no Maps / websites (W188)")
+        except Exception:                                         # noqa: BLE001
+            pass
+    # W51: `leads_verify` = the CRM's own leads, not this job's results.
+    # W108: on its own thread - the main loop keeps heartbeating and polling commands.
+    lv = claimed.get("leads_verify") if isinstance(claimed, dict) and "leads_verify" in claimed else cj.get("leads_verify")
+    _start_reverify(cloud, cj["id"], bool(lv))
+    return True
+
+
 def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str) -> None:
     """Re-arm an ALREADY-MIRRORED cloud job that the CRM has queued again.
 
@@ -2754,6 +2847,10 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     the queue. Without this the `mirrored` guard skipped it silently and the CRM
     showed "queued" for ever.
     """
+    if kind == "crm" and cj.get("wa_verify_only"):
+        # W188 (CRM T1247-e): a WhatsApp-only re-verify ALWAYS runs `_reverify_wa`, local mirror or not.
+        _route_reverify(cloud, store, cj)
+        return
     row = store.conn.execute(
         "SELECT id FROM jobs WHERE cloud_id=? AND cloud_kind=?", (cj["id"], kind)).fetchone()
     if not row:
@@ -2783,12 +2880,20 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     claimed = cloud.claim(cj["id"])
     if claimed is None:
         return                                   # another agent got there first
+    if kind == "crm" and claimed.get("wa_verify_only"):
+        # W188: the list row did not say so but the claimed row does - still the re-verify path.
+        if _reverify_busy() is None:
+            store.log(local_id, "job", f"re-verify requested from the CRM (cloud job #{cj['id']}) - "
+                                       "WhatsApp only, no Maps / websites (W188)")
+            _start_reverify(cloud, cj["id"], bool(claimed.get("leads_verify")))
+        return
+    no_maps = _no_maps_rerun(claimed)                                     # W188
     # T920: use `claim()`'s full row from here on, never the (possibly slimmed) list row `cj`.
     store.update_job(
         local_id,
         phase="queued", status="running", note=None, finished_at=None,
         stop_requested=0,
-        reenrich_only=int(bool(claimed.get("reenrich_only", False))),
+        reenrich_only=int(no_maps),
         discovery_pending=int(_discovery_pending_for(claimed)),
         do_enrich=int(bool(claimed.get("do_enrich", True))),
         do_wa_verify=int(bool(claimed.get("do_wa_verify", False))),
@@ -2818,7 +2923,7 @@ def _requeue_rerun(cloud: "Cloud | CrmCloud", store: Store, cj: dict, kind: str)
     # never ran the job and holds none of its leads. Pull the scoped rows from the CRM and
     # seed them locally so the enrichment lane has something to crawl — the WhatsApp
     # re-verify path has always done this; enrichment needed the same.
-    if claimed.get("reenrich_only"):
+    if no_maps:
         try:
             n = _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
             if n:
@@ -2973,18 +3078,9 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # the `mirrored` guard because a re-verify targets a job that was ALREADY
         # scraped+mirrored earlier — the guard would otherwise skip it forever.
         if kind == "crm" and cj.get("wa_verify_only"):
-            # W108: never a second re-verify while one runs (its progress can go stale during
-            # a long sync wait, and a stale job is claimable again by this same device).
-            if _reverify_busy() is not None or held:
-                continue
-            from webscraper.lanes import wa_off as _wa_off_fn
-            if _wa_off_fn():                         # W184: a re-verify is pure WhatsApp — never here
-                continue
-            if cloud.claim(cj["id"]) is None:
-                continue
-            # W51: `leads_verify` = the CRM's own leads, not this job's results.
-            # W108: on its own thread — the main loop keeps heartbeating and polling commands.
-            _start_reverify(cloud, cj["id"], bool(cj.get("leads_verify")))
+            # W188: one router for every re-verify, mirrored on this machine or not.
+            if not held:
+                _route_reverify(cloud, store, cj)
             continue
         if cj["id"] in mirrored:
             # ALREADY MIRRORED — but the CRM may have queued it AGAIN. "Re-enrich" and
@@ -3032,7 +3128,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                          # Carried from the very first mirror, not just on a re-run: a job
                          # created as a scoped re-enrich would otherwise start a full Maps
                          # scrape of everything.
-                         reenrich_only=int(bool(claimed.get("reenrich_only", False))),
+                         reenrich_only=int(_no_maps_rerun(claimed)),          # W188
                          discovery_pending=int(_discovery_pending_for(claimed)),
                          place_keys=_place_keys_json(claimed),
                          enrich_scope=str(claimed.get("enrich_scope") or "all"),   # W76
@@ -3051,7 +3147,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
         # Hydration rebuilds `places`, which is what enrichment and WhatsApp need; the
         # stub re-open still needs `job_links`, which only the original machine has, so
         # on a foreign machine that part offers 0 and the rest of the run is real.
-        if kind == "crm" and claimed.get("reenrich_only"):
+        if kind == "crm" and _no_maps_rerun(claimed):
             try:
                 _hydrate_enrichment_from_cloud(cloud, store, local_id, cj["id"])
             except Exception:                                     # noqa: BLE001
