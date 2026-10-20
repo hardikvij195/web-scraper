@@ -1627,13 +1627,51 @@ _DEFERRED_CMD: list = [None]
 #: `_tick` on the main loop, and the main loop is what heartbeats and polls commands — so a
 #: long re-check (the Mac, 2026-09-10 17:43–17:49: a relaunched profile waiting out WhatsApp's
 #: sync splash) showed the machine as offline and left Restart unanswered for 6 minutes.
-_REVERIFY: dict = {"thread": None, "job": None, "stop": None, "why": None}
+_REVERIFY: dict = {"thread": None, "job": None, "stop": None, "why": None, "ended": False, "stop_at": None}
+
+#: W192 (CRM T1320): how long a re-verify thread may outlive its stop request before the claim loop
+#: stops treating it as busy. Env `REVERIFY_STOP_GRACE_SEC`, default 20 min.
+REVERIFY_STOP_GRACE_SEC = 1200.0
+
+
+def _reverify_release(jid: int | None, why: str) -> None:
+    """W192: forget a re-verify that is over (or hung past its stop) and give its whatsapp stage
+    slot back, so the claim loop and the next lane are never blocked by a dead/hung thread."""
+    log.warning("re-verify #%s %s — no longer counted as busy; the WhatsApp slot is released", jid, why)
+    gate = STAGE_GATES.get("whatsapp")
+    if gate is not None and jid is not None:
+        try:
+            gate.release(-int(jid))
+        except Exception:                                         # noqa: BLE001
+            log.debug("could not release the whatsapp slot of #%s", jid, exc_info=True)
+    _REVERIFY.update(thread=None, job=None, stop=None, why=None, ended=False, stop_at=None)
 
 
 def _reverify_busy() -> int | None:
-    """The CRM job id of the re-verify running on this machine, or None."""
+    """The CRM job id of the re-verify running on this machine, or None.
+
+    W192 (CRM T1320): 2 - MAC, 2026-10-20 — #22581 crashed at 06:12 IST on CRM read timeouts, its
+    crash report reached the CRM, yet the machine claimed nothing for 6 h with 12+ jobs queued for
+    it: the `reverify-22581` thread never ended, so this returned 22581 on every tick. A re-verify
+    whose work is over (`ended`, set first thing on crash/finish) is never busy, whatever its thread
+    is still blocked on; one that outlives its stop request by REVERIFY_STOP_GRACE_SEC is released."""
     t = _REVERIFY.get("thread")
-    return _REVERIFY.get("job") if t is not None and t.is_alive() else None
+    jid = _REVERIFY.get("job")
+    if t is None or not t.is_alive():
+        return None
+    if _REVERIFY.get("ended"):
+        _reverify_release(jid, "ended but its thread is still alive (blocked in cleanup)")
+        return None
+    stop_at = _REVERIFY.get("stop_at")
+    if stop_at is not None:
+        try:
+            grace = float(os.environ.get("REVERIFY_STOP_GRACE_SEC", REVERIFY_STOP_GRACE_SEC))
+        except ValueError:
+            grace = REVERIFY_STOP_GRACE_SEC
+        if time.monotonic() - stop_at > grace:
+            _reverify_release(jid, f"still running {int(grace // 60)} min after it was asked to stop")
+            return None
+    return jid
 
 
 def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
@@ -1649,6 +1687,12 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
         slot = -int(jid)
         stop_ev = _REVERIFY.get("stop")
         got = True
+
+        def _mark_ended() -> None:
+            """W192: the work is over — the claim loop may move on even if cleanup below hangs."""
+            if _REVERIFY.get("job") == jid:
+                _REVERIFY["ended"] = True
+
         try:
             def _waiting(m: str) -> None:
                 """W133 (CRM T788): the wait for the WhatsApp slot must reach the CRM, not just
@@ -1670,6 +1714,7 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
             else:
                 log.info("re-verify #%s stopped while waiting for the WhatsApp slot", jid)
         except Exception:                                         # noqa: BLE001
+            _mark_ended()
             log.exception("re-verify #%s crashed", jid)
             # W189 (CRM T1235): tell the CRM, or the row reads 'running' until the stuck alert.
             # 'error' is picked up by the CRM's re-queue; checked numbers are skipped on the re-run.
@@ -1680,6 +1725,7 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
             except Exception:                                     # noqa: BLE001
                 log.warning("re-verify #%s: could not report the crash to the CRM", jid, exc_info=True)
         finally:
+            _mark_ended()
             if gate is not None:
                 gate.release(slot)
             try:
@@ -1689,6 +1735,7 @@ def _start_reverify(cloud: "CrmCloud", jid: int, leads_verify: bool) -> None:
     t = threading.Thread(target=_run, name=f"reverify-{jid}", daemon=True)
     # T596: the stop a re-verify never had — park and a CRM cancel both set it.
     _REVERIFY["stop"], _REVERIFY["why"] = threading.Event(), None
+    _REVERIFY["ended"], _REVERIFY["stop_at"] = False, None
     _REVERIFY["thread"], _REVERIFY["job"] = t, jid
     t.start()
 
@@ -1699,6 +1746,8 @@ def _stop_reverify(why: str) -> bool:
     if ev is None or _reverify_busy() is None:
         return False
     _REVERIFY["why"] = _REVERIFY.get("why") or why
+    if _REVERIFY.get("stop_at") is None:
+        _REVERIFY["stop_at"] = time.monotonic()                 # W192: the stop-grace clock
     ev.set()
     return True
 
