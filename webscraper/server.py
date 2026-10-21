@@ -487,8 +487,17 @@ def start_limit_pct(raw: str | None, total_mb: float | None) -> float:
     return MEMORY_START_DEFAULT_PCT
 
 
+def start_limit_raw(per_device: str | None, generic: str | None) -> str | None:
+    """W194 (CRM T1344-b): pure — `MEMORY_START_MAX_PCT__<DEVICE>` (CRM key `memory_start_max_pct__<device>`)
+    wins over the global `MEMORY_START_MAX_PCT` when set, so one machine (e.g. 5 - MI) can get its own
+    start limit without moving every other low-RAM machine's guard."""
+    return per_device if per_device is not None and str(per_device).strip() else generic
+
+
 def memory_start_max_pct() -> float:
-    return start_limit_pct(os.getenv("MEMORY_START_MAX_PCT"), (last_memory() or {}).get("total_mb"))
+    return start_limit_pct(start_limit_raw(lanes_mod._device_env("MEMORY_START_MAX_PCT"),
+                                           os.getenv("MEMORY_START_MAX_PCT")),
+                           (last_memory() or {}).get("total_mb"))
 
 
 def job_needs_discovery(row: Any) -> bool:

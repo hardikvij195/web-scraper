@@ -2020,7 +2020,9 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # W184: per-machine WhatsApp OFF switch (`wa_off__<device>`)
                             "WA_OFF",
                             # W186: per-machine manual lane pause (`lane_pause__<device>`)
-                            "LANE_PAUSE")
+                            "LANE_PAUSE",
+                            # W194 (CRM T1344-b): per-machine memory start limit (`memory_start_max_pct__<device>`)
+                            "MEMORY_START_MAX_PCT__")
 
 #: W186: the lane-pause knob alone is re-read this often (the CRM switch should bite within ~1 min;
 #: the other knobs keep the 5-min cadence).
