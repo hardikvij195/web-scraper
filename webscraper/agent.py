@@ -1404,6 +1404,14 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
                 log.debug("could not flag the running job", exc_info=True)
             _close_browsers()
             _STANDBY[0] = True
+            _STANDBY_BY_TOKEN[0] = True
+        elif _STANDBY[0] and _STANDBY_BY_TOKEN[0] and kind == "crm" and isinstance(cloud, CrmCloud)                 and CrmCloud._denied == 0:
+            # W193 (CRM T1344): the 401s were a blip — ASUS took 3 on 2026-10-20 14:18 UTC, parked itself and,
+            # while every later call (heartbeat, checks, commands) was accepted again, claimed nothing for 26 h.
+            # A token-revoke standby ends the moment the CRM accepts the token again; a manual Stop never does.
+            log.warning("CRM accepts this agent's token again — leaving the token-revoked standby (W193)")
+            _STANDBY[0] = False
+            _STANDBY_BY_TOKEN[0] = False
 
         if _STANDBY[0]:
             # Parked: heartbeat and commands only. `jobs()` is what carries the
@@ -1475,6 +1483,8 @@ def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> N
 #: Standby lives in this process only. A reboot (or anything that restarts the
 #: supervisor) comes back up running — "stopped" is not meant to outlive the machine.
 _STANDBY = [False]
+#: W193: True while _STANDBY was set by a revoked token (not a manual Stop) — cleared on the next accepted call.
+_STANDBY_BY_TOKEN = [False]
 
 
 # -- W142 (CRM T1020): main-loop watchdog ----------------------------------------------------
@@ -2310,7 +2320,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 # W58 — leave standby. A no-op when the agent is already working, so
                 # pressing Start on a healthy machine is harmless.
                 was = _STANDBY[0]
-                _STANDBY[0] = False
+                _STANDBY[0] = False; _STANDBY_BY_TOKEN[0] = False
                 cloud._checks_sent_at = 0.0
                 ok = True
                 result = "agent started" if was else "agent was already running"
@@ -2358,7 +2368,7 @@ def _poll_command(cloud: "CrmCloud") -> None:
                         log.debug("could not flag the running job on stop", exc_info=True)
                     _stop_reverify("parked")                     # T596: a re-verify has no local job
                     _close_browsers()
-                    _STANDBY[0] = True
+                    _STANDBY[0] = True; _STANDBY_BY_TOKEN[0] = False   # W193: a manual Stop stays parked
                     cloud._checks_sent_at = 0.0
                     ok = True
                     result = "agent stopped — parked, press Start in the CRM to run it again"
