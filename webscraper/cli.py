@@ -185,7 +185,7 @@ def agent(
     token: str = typer.Option("", "--token", help="Agent token; falls back to CRM_AGENT_TOKEN in .env"),
     base: str = typer.Option("", "--base", help="Override the API base URL"),
     crm: bool = typer.Option(False, "--crm", help="Serve the HVT CRM Lead Finder queue instead of the SaaS cloud"),
-    poll: int = typer.Option(5, "--poll", help="Seconds between cloud polls when idle (1s while work is in flight)"),
+    poll: int = typer.Option(15, "--poll", help="Seconds between cloud polls when idle (BUSY_POLL_SEC=10s while work is in flight; T1348: was 5)"),
 ) -> None:
     """Run cloud jobs on this machine: poll -> scrape locally -> sync results up.
 

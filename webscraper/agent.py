@@ -1157,7 +1157,15 @@ def _requeue_orphans(store: Store, kind: str, cloud: "Cloud | CrmCloud | None" =
 #: this is also the CRM Stop button's worst-case latency WHILE BUSY (the busy branch of
 #: the loop below is one plain `time.sleep`, unlike `_idle_sleep` which polls commands
 #: every 1s regardless of the interval) — Stop now takes up to ~5s instead of ~1s.
-BUSY_POLL_SEC = 5.0
+#: T1348 (2026-10-22): 5.0 -> 10.0. Every agent call costs the CRM edge function several logged
+#: PostgREST requests (~1.6 GB/day of Supabase logs on a 1 GB Micro). The CRM's tightest
+#: "online" window is 3 min and its stale-job rules are 5+ min, so 10 s is far inside them.
+BUSY_POLL_SEC = 10.0
+
+#: T1348: how often `_idle_sleep` (the parked/standby loop) looks for a CRM command. Was every
+#: 1 s — one parked machine alone made ~86k edge calls/day (ASUS, parked 26 h by W193). A Start /
+#: Re-link pressed on the Systems card now reaches a parked machine within ~10 s.
+IDLE_COMMAND_POLL_SEC = 10.0
 
 #: After work stops, stay in the fast lane this long before going back to the
 #: configured interval. Covers the common "finish one job, another is already
@@ -1274,7 +1282,7 @@ def _keep_awake() -> None:
         log.warning("keep-awake unavailable: %s", e)
 
 
-def run_agent(base: str, token: str, poll_sec: int = 5, kind: str = "saas") -> None:
+def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     if kind == "crm":
         _start_whoami_server()
@@ -2160,7 +2168,7 @@ def _run_deferred(cloud: "CrmCloud") -> bool:
 
 
 def _idle_sleep(cloud, kind: str, seconds: float) -> None:
-    """W92 (CRM T530): sleep `seconds` but look for a CRM command every second. The idle
+    """W92 (CRM T530): sleep `seconds` but look for a CRM command every IDLE_COMMAND_POLL_SEC (T1348; was 1 s). The idle
     loop slept the whole `poll_sec` (5–15 s) between polls, so a Re-link / Reset / Start
     pressed on the Systems card waited that long before the machine even noticed."""
     end = time.monotonic() + max(0.0, seconds)
@@ -2168,7 +2176,7 @@ def _idle_sleep(cloud, kind: str, seconds: float) -> None:
         left = end - time.monotonic()
         if left <= 0:
             return
-        time.sleep(min(1.0, left))
+        time.sleep(min(IDLE_COMMAND_POLL_SEC, left))
         if kind == "crm":
             try:
                 _poll_command(cloud)
