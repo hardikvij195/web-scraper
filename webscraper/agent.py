@@ -258,6 +258,41 @@ def _running_git() -> str:
 RUNNING_GIT = _running_git()
 
 
+#: T1348-b (CRM 20261022T1500): every lead-finder-agent reply carries `x-lf-cmd` (a CRM command is
+#: waiting for this machine), `x-lf-enabled` (its Systems switch) and, on `jobs`, `x-lf-next-poll`
+#: (seconds until asking for jobs again: 60 while switched off, 15 when nothing is offered). The agent
+#: calls `command` only when flagged (or the hint is stale) and skips `jobs` until the hint is due -
+#: a parked machine fell from ~20 calls/min to ~3.5, a busy one from ~24 to ~10. An old edge
+#: function sends no headers: the hint never becomes fresh and every call happens as before.
+_HINT = {"cmd": False, "cmd_at": 0.0, "enabled": None, "jobs_next_at": 0.0}
+HINT_FRESH_SEC = 45.0
+JOBS_HINT_MAX_SEC = 120.0
+
+
+def _read_hints(action, r) -> None:
+    try:
+        h = r.headers
+        if "x-lf-cmd" in h:
+            _HINT["cmd"] = h["x-lf-cmd"] == "1"
+            _HINT["cmd_at"] = time.monotonic()
+            en = h.get("x-lf-enabled")
+            _HINT["enabled"] = None if en is None else en == "1"
+        if action == "jobs":
+            np = float(h.get("x-lf-next-poll") or 0)
+            _HINT["jobs_next_at"] = time.monotonic() + min(max(np, 0.0), JOBS_HINT_MAX_SEC)
+    except Exception:                                             # noqa: BLE001 - a hint, never fatal
+        pass
+
+
+def _command_hint_says_idle() -> bool:
+    """True when a fresh server hint says no command is waiting, so `command` need not be called."""
+    return (not _HINT["cmd"]) and time.monotonic() - _HINT["cmd_at"] < HINT_FRESH_SEC
+
+
+def _jobs_due() -> bool:
+    return time.monotonic() >= _HINT["jobs_next_at"]
+
+
 def crm_payload(action: str, **kw) -> dict:
     # `device` rides on every call: it is both the heartbeat that puts this machine in the
     # CRM's "Run on" list and the key the CRM uses to route a targeted job here.
@@ -290,6 +325,7 @@ class CrmCloud:
                           "token, or delete data/agent.stop and re-register.", r.status_code)
         elif r.status_code < 400:
             CrmCloud._denied = 0
+            _read_hints(payload.get("action"), r)
             # W142b (2026-10-05 17:27): every successful CRM call made from the loop's own
             # thread is a heartbeat. `_tick` can legitimately run for many minutes (hydrating
             # a re-queued job with thousands of saved places page by page), and the watchdog
@@ -371,12 +407,26 @@ class CrmCloud:
         r.raise_for_status()
         return r.json(), None
 
+    #: T1348-b: an unchanged-phase progress ping goes out at most every PROGRESS_MIN_SEC per job (was every
+    #: 10 s tick). A CRM Stop / reassignment still lands within ~30 s; terminal phases always go out.
+    PROGRESS_MIN_SEC = 20.0
+    _last_progress: dict = {}
+
     def progress(self, jid: int, phase: str | None, progress: dict) -> ProgressReply:
         """Cancelled / reassigned (W114, CRM T624) status from the CRM."""
+        last = self._last_progress.get(jid)
+        if (last and last[0] == phase and phase not in ("done", "stopped", "failed")
+                and time.monotonic() - last[1] < self.PROGRESS_MIN_SEC
+                and not last[2].cancelled and not last[2].reassigned):
+            return last[2]
         r = self._post(crm_payload("progress", job_id=jid, phase=phase, progress=progress))
         r.raise_for_status()
         d = r.json()
-        return ProgressReply(bool(d.get("cancelled")), bool(d.get("reassigned")), d.get("agent_device"))
+        reply = ProgressReply(bool(d.get("cancelled")), bool(d.get("reassigned")), d.get("agent_device"))
+        if len(self._last_progress) > 200:
+            self._last_progress.clear()
+        self._last_progress[jid] = (phase, time.monotonic(), reply)
+        return reply
 
     def done(self, jid: int, status: str, error: str | None = None) -> None:
         self._post(crm_payload("done", job_id=jid, status=status, error=error)).raise_for_status()
@@ -704,6 +754,11 @@ def _ship_logs(cloud: "Cloud | CrmCloud", store: Store, row: Any) -> None:
                       limit=LOG_BATCH)
     if not rows:
         return
+    final = _col(row, "phase", None) in ("done", "stopped", "failed")
+    if (not final and len(rows) < LOG_BATCH
+            and time.monotonic() - _log_shipped_at.get(job_id, 0.0) < LOG_SHIP_SEC):
+        return                                  # T1348-b: batch lines, ship every LOG_SHIP_SEC
+    _log_shipped_at[job_id] = time.monotonic()
     try:
         cloud.logs(int(cid), [{"ts": r["ts"], "lane": r["lane"], "level": r["level"],
                                "message": r["message"]} for r in rows])
@@ -1164,8 +1219,17 @@ BUSY_POLL_SEC = 10.0
 
 #: T1348: how often `_idle_sleep` (the parked/standby loop) looks for a CRM command. Was every
 #: 1 s — one parked machine alone made ~86k edge calls/day (ASUS, parked 26 h by W193). A Start /
-#: Re-link pressed on the Systems card now reaches a parked machine within ~10 s.
-IDLE_COMMAND_POLL_SEC = 10.0
+#: Re-link pressed on the Systems card now reaches a parked machine within ~20 s (T1348-b).
+#: T1348-b: the parked loop polls `command` every 20 s (each call is also the heartbeat) and calls
+#: `jobs` (which carries the 5-min self-check / version) only every STANDBY_JOBS_SEC.
+IDLE_COMMAND_POLL_SEC = 20.0
+STANDBY_SLEEP_SEC = 60.0
+STANDBY_JOBS_SEC = 120.0
+_standby_jobs_at = [0.0]
+#: T1348-b: a job's new log lines ship at most every LOG_SHIP_SEC (each line keeps its own ts),
+#: unless a full LOG_BATCH is waiting or the job has ended.
+LOG_SHIP_SEC = 30.0
+_log_shipped_at: dict = {}
 
 #: After work stops, stay in the fast lane this long before going back to the
 #: configured interval. Covers the common "finish one job, another is already
@@ -1428,7 +1492,11 @@ def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> 
             # startable) without offering to do any work.
             try:
                 _loop_wd_mark("attempt")
-                cloud.jobs()
+                if not isinstance(cloud, CrmCloud) or time.monotonic() - _standby_jobs_at[0] >= STANDBY_JOBS_SEC:
+                    cloud.jobs()
+                    _standby_jobs_at[0] = time.monotonic()
+                else:
+                    _poll_command(cloud, force=True)              # T1348-b: heartbeat + command check
                 _loop_wd_mark("ok")                               # W142
             except httpx.HTTPError as e:
                 _loop_wd_mark("err")
@@ -1439,7 +1507,7 @@ def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> 
                 _run_deferred(cloud)
             except Exception as e:                                # noqa: BLE001
                 log.error("deferred command failed: %s", e)
-            _idle_sleep(cloud, kind, poll_sec)
+            _idle_sleep(cloud, kind, max(poll_sec, STANDBY_SLEEP_SEC) if kind == "crm" else poll_sec)
             continue
         try:
             _fail_unstarted(cloud, store, kind, srv)
@@ -2179,12 +2247,12 @@ def _idle_sleep(cloud, kind: str, seconds: float) -> None:
         time.sleep(min(IDLE_COMMAND_POLL_SEC, left))
         if kind == "crm":
             try:
-                _poll_command(cloud)
+                _poll_command(cloud, force=True)
             except Exception:                                     # noqa: BLE001
                 log.debug("command poll failed", exc_info=True)
 
 
-def _poll_command(cloud: "CrmCloud") -> None:
+def _poll_command(cloud: "CrmCloud", force: bool = False) -> None:
     """T202 - run a CRM-requested out-of-band command on this machine.
 
     `wa_login <label>` opens WhatsApp Web HEADED here (the browser window appears on this
@@ -2206,6 +2274,8 @@ def _poll_command(cloud: "CrmCloud") -> None:
                 pass
     _cmd_thread = None
     _cmd_id = None
+    if not force and _command_hint_says_idle():
+        return                                  # T1348-b: the last CRM reply said nothing is waiting
     try:
         cmd = cloud.command()
     except (httpx.HTTPError, ValueError):
@@ -3141,7 +3211,7 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                              # one seen here is the right one; claiming more than one per
                              # tick let a low-priority job jump ahead of one added between
                              # ticks with a higher number.
-    for cj in cloud.jobs():
+    for cj in (cloud.jobs() if (kind != "crm" or _jobs_due()) else []):   # T1348-b: x-lf-next-poll
         # On-demand WhatsApp re-verify: no scrape/enrich — fetch the job's existing
         # results, check each number, write wa_verified back. CRM-only. Checked BEFORE
         # the `mirrored` guard because a re-verify targets a job that was ALREADY
