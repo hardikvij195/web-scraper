@@ -1494,7 +1494,9 @@ class WhatsAppLane(Lane):
                 if n > 1:
                     self.store.log(self.job_id, "whatsapp",
                                    f"{n} WhatsApp sessions in parallel — {', '.join(accounts[:n])}")
-                    slices = [batch[i::n] for i in range(n)]
+                    # W195 (CRM T1387): one shared queue for the batch, not fixed slices — a fast
+                    # session keeps pulling numbers instead of idling while a slow one finishes its share.
+                    feed = wa_verify.WaFeed(batch)
                     results: list[dict] = []
                     errors: list[BaseException] = []
                     def run_slice(rows, name):
@@ -1511,9 +1513,9 @@ class WhatsAppLane(Lane):
                             log.warning("[whatsapp#%s] slice %s failed: %s", self.job_id, name, e)
                         finally:
                             st.close()
-                    ts = [threading.Thread(target=run_slice, args=(sl, accounts[i]),
+                    ts = [threading.Thread(target=run_slice, args=(feed, accounts[i]),
                                            name=f"wa-{i}", daemon=True)
-                          for i, sl in enumerate(slices) if sl]
+                          for i in range(n)]
                     for t in ts:
                         t.start()
                     for t in ts:

@@ -2530,46 +2530,55 @@ def _poll_command(cloud: "CrmCloud", force: bool = False) -> None:
 _SLICE_STORE = threading.local()
 
 
-def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, should_stop=None) -> dict:
-    """W109: verify `targets` split round-robin across `accounts`, one thread per account.
+#: W195 (CRM T1387): how often a running re-verify looks for a WhatsApp account that could join it
+#: (linked mid-job, or `wa_parallel__<device>` / `wa_slots__<device>` raised by the cloud refresh).
+WA_JOIN_POLL_SEC = 30.0
 
-    Each slice pins its account (`account=`, so two threads never share a Chrome profile) and
-    opens its OWN Store on the same file — sqlite connections are not thread-safe. `onp` is
-    shared and must already be locked by the caller. A slice that fails (logged out, never
-    rendered) takes only its own share down; the rest finish. All failing = the first error.
+
+def _join_memory_ok() -> bool:
+    """W195: a mid-job join launches one more WhatsApp Chrome — never past the W129/W194 start limit."""
+    try:
+        return not srv.memory_blocked()
+    except Exception:                                             # noqa: BLE001
+        return True
+
+
+def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, should_stop=None) -> dict:
+    """W109: verify `targets` on `accounts` at once, one thread per account.
+
+    W195 (CRM T1387): the threads share ONE queue (`wa_verify.WaFeed`) instead of fixed round-robin
+    slices, so every session keeps checking until the job's numbers run out; every WA_JOIN_POLL_SEC a
+    linked account not yet in use joins while `min(_wa_parallel(), linked)` allows more sessions and
+    RAM is under the start limit. Each thread pins its account (`account=`, so two threads never share
+    a Chrome profile) and opens its OWN Store on the same file — sqlite connections are not thread-safe.
+    `onp` is shared and must already be locked by the caller. A session that fails takes only itself
+    down; what it took but did not check goes back on the queue. All failing = the first error.
     """
     from webscraper import wa_verify
-    slices = [targets[i::len(accounts)] for i in range(len(accounts))]
+    from webscraper.lanes import _wa_parallel
+    feed = wa_verify.WaFeed(targets)
     results: list[dict] = []
     errors: list[BaseException] = []
-    # W187 (CRM T1247, PC 2026-10-15): a slice whose account dies (logged out / needs relink /
-    # stuck syncing) used to drop its whole share of the job for this run, and a linked account
-    # left out of `accounts` never got used — PC ran `main` (stale profile, logged out at once)
-    # + oneplus_biz while poco_biz sat idle and half the leads went unchecked. Now the rest of a
-    # dead slice moves to a spare enabled account, or, with none left, onto a surviving one after.
-    done_pks: set[str] = set()
     lock = threading.Lock()
+    # W187: a session whose account dies (logged out / needs relink / stuck syncing) hands over to a
+    # spare enabled account right away; with none left the queue is finished on a surviving one after.
     spare = [a for a in store.enabled_wa_accounts() if a not in accounts]
-    leftovers: list[dict] = []
-
-    def onp_tracked(pk: str, *a: Any, **k: Any) -> None:
-        with lock:
-            done_pks.add(pk)
-        onp(pk, *a, **k)
+    used: set[str] = set(accounts)           # W195: an account runs at most once per re-verify (+ the final pass)
+    threads: list[threading.Thread] = []
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
 
-    def run_slice(rows: list[dict], name: str) -> None:
-        while rows:
+    def run_slice(name: str) -> None:
+        while True:
             st = Store(store.path)
             _SLICE_STORE.st = st
             try:
-                results.append(wa_verify.verify_places(st, rows, on_progress=onp_tracked, should_stop=should_stop,
+                results.append(wa_verify.verify_places(st, feed, on_progress=onp, should_stop=should_stop,
                                                        job_id=None, account=name))
             except BaseException as e:                            # noqa: BLE001
                 errors.append(e)
-                log.warning("re-verify slice %s failed: %s", name, e)
+                log.warning("re-verify session %s failed: %s", name, e)
             finally:
                 try:
                     alive = name in st.enabled_wa_accounts()
@@ -2579,37 +2588,61 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
                     st.close()
                 except Exception:                                 # noqa: BLE001
                     pass
-            if stopped() or alive:
-                return            # finished, or stopped for a reason a new account would not fix (cap)
+            if stopped() or alive or not len(feed):
+                return            # queue done, stopped, or ended for a reason a new account would not fix
             with lock:
-                left = [r for r in rows if r.get("place_key") not in done_pks]
-                nxt = spare.pop(0) if (left and spare) else None
-                if left and nxt is None:
-                    leftovers.extend(left)
+                nxt = spare.pop(0) if spare else None
+                if nxt is not None:
+                    used.add(nxt)
             if nxt is None:
                 return
-            log.warning("re-verify: %s dropped with %d place(s) left — handing them to %s", name, len(left), nxt)
-            rows, name = left, nxt
+            log.warning("re-verify: %s dropped with %d number(s) still queued — %s takes over (W187)",
+                        name, len(feed), nxt)
+            name = nxt
 
-    ts = [threading.Thread(target=run_slice, args=(sl, accounts[i]), name=f"reverify-wa-{i}", daemon=True)
-          for i, sl in enumerate(slices) if sl]
-    for t in ts:
+    def start(name: str) -> None:
+        t = threading.Thread(target=run_slice, args=(name,), name=f"reverify-wa-{len(threads)}", daemon=True)
+        threads.append(t)
         t.start()
-    for t in ts:
-        t.join()
-    if leftovers and not stopped():
+
+    for a in accounts:
+        start(a)
+    while True:
+        alive_ts = [t for t in threads if t.is_alive()]
+        if not alive_ts:
+            break
+        alive_ts[0].join(WA_JOIN_POLL_SEC)
+        if stopped() or not len(feed) or not any(t.is_alive() for t in threads):
+            continue
+        # W195: a mid-job join — one new session per poll, so Chrome launches are staggered.
+        try:
+            linked = store.enabled_wa_accounts()     # this (calling) thread's own Store
+            want = max(1, min(_wa_parallel(), len(linked)))
+        except Exception:                                         # noqa: BLE001
+            continue
+        busy = sum(1 for t in threads if t.is_alive())
+        with lock:
+            cand = next((a for a in linked if a not in used), None)
+            if cand is None or busy >= want or not _join_memory_ok():
+                continue
+            used.add(cand)
+            if cand in spare:
+                spare.remove(cand)
+        log.info("re-verify: %s joins the running job (%d session(s) -> %d, %d number(s) queued) (W195)",
+                 cand, busy, busy + 1, len(feed))
+        start(cand)
+    capped = any(bool(r.get("capped")) for r in results)
+    if len(feed) and not stopped() and not capped:
         healthy = store.enabled_wa_accounts()
         if healthy:
-            rest = list(leftovers)
-            leftovers.clear()
-            log.warning("re-verify: %d place(s) from dropped session(s) — finishing them on %s", len(rest), healthy[0])
-            run_slice(rest, healthy[0])
+            log.warning("re-verify: %d number(s) left by ended session(s) — finishing them on %s", len(feed), healthy[0])
+            run_slice(healthy[0])
     if errors and not results:
         raise errors[0]
     out = {k: sum(int(r.get(k, 0) or 0) for r in results)
            for k in ("yes", "no", "unknown", "checked", "no_number")}
     out["capped"] = any(bool(r.get("capped")) for r in results)
-    out["dropped"] = len(leftovers)   # W191: places a dead session left with no account to finish them
+    out["dropped"] = 0 if (stopped() or out["capped"]) else len(feed)   # W191: numbers no account could finish
     return out
 
 
@@ -2859,7 +2892,9 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
     n_par = max(1, min(_wa_parallel(), len(accounts)))
 
     try:
-        if n_par > 1 and len(targets) > 1:
+        # W195: parallel mode whenever this machine allows >1 session — with one account linked at the
+        # start, an account linked later can still join the queue (the rotating path never could).
+        if _wa_parallel() > 1 and accounts and len(targets) > 1:
             _jlog(f"{n_par} WhatsApp sessions in parallel — {', '.join(accounts[:n_par])}")
             log.info("re-verify #%s: %d parallel sessions (%s)", jid, n_par, ", ".join(accounts[:n_par]))
             res = _verify_slices(store, targets, accounts[:n_par], onp, should_stop=stop_ev.is_set)

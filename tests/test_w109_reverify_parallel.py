@@ -46,6 +46,7 @@ def setup(tmp_path, monkeypatch):
     lock = threading.Lock()
 
     def fake_verify(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+        rows = list(rows)                     # W195: a shared WaFeed is drained once, like the real loop
         with lock:
             calls.append({"account": account, "keys": [r["place_key"] for r in rows],
                           "own_store": st is not s})
@@ -113,7 +114,8 @@ def test_w187_dead_session_hands_its_share_to_the_spare_account(setup, monkeypat
     monkeypatch.setattr(wa_verify, "verify_places", a1_logs_out)
     cloud = FakeCloud(rows)
     agent._reverify_wa(cloud, s, 1, leads_verify=True)
-    assert sorted(c["account"] for c in calls) == ["a2", "a3"]
+    # W195: a2 drains the shared queue at once here; a3 takes over only if numbers are still queued.
+    assert "a1" not in [c["account"] for c in calls] and "a2" in [c["account"] for c in calls]
     keys = [k for c in calls for k in c["keys"]]
     assert sorted(keys) == sorted(r["place_key"] for r in rows)        # nothing lost, nothing twice
 

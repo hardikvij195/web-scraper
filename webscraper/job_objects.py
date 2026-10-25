@@ -238,6 +238,22 @@ def _assign_profile(profile_dir: Path, what: str, cap_mb: int) -> None:
              profile_dir.name, cap_mb, ok, f", {len(errs)} failed" if errs else "")
 
 
+def profile_mem_ratio(profile_dir: Path | str | None) -> float | None:
+    """W195 (CRM T1387): peak / limit of the job object holding `profile_dir`'s Chrome tree — how close
+    that browser came to its W183 cap since it was launched. None off Windows / no job / query failed."""
+    if sys.platform != "win32" or profile_dir is None:
+        return None
+    with _LOCK:
+        entry = _JOBS.get(str(Path(profile_dir)).lower())
+    if entry is None:
+        return None
+    try:
+        peak, limit = job_peak(entry[0])
+    except Exception:                                             # noqa: BLE001
+        return None
+    return (peak / limit) if limit > 0 else None
+
+
 def cap_browser(profile_dir: Path | str | None, what: str = "") -> None:
     """Call right after a Chrome launch on `profile_dir`. Windows only; never raises; does the
     process enumeration (a PowerShell CIM call, ~1 s) on a daemon thread so the launch is not slowed."""

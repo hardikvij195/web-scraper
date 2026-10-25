@@ -64,7 +64,7 @@ def test_recheck_off_the_splash_that_cannot_decide_is_not_an_answer(wa, monkeypa
         def record_wa_check(self, job_id, pk, num, source, status, name=None):
             self.recorded.append(status)
 
-    monkeypatch.setattr(wv, "_decide", lambda page: "unknown")
+    monkeypatch.setattr(wv, "_decide", lambda page, **k: "unknown")
     monkeypatch.setattr(wv, "_boot_state", lambda page: "syncing")
     monkeypatch.setattr(wv, "wait_boot", lambda page, name, **kw: "chat")
     res = wv.verify_places(_S(), _rows(3), job_id=7)
@@ -73,7 +73,7 @@ def test_recheck_off_the_splash_that_cannot_decide_is_not_an_answer(wa, monkeypa
 
 def test_a_real_verdict_clears_the_strikes(wa, monkeypatch):
     seq = iter(["unknown", "unknown", "yes", "yes"])      # two strikes, then real answers
-    monkeypatch.setattr(wv, "_decide", lambda page: next(seq, "yes"))
+    monkeypatch.setattr(wv, "_decide", lambda page, **k: next(seq, "yes"))
     monkeypatch.setattr(wv, "_boot_state", lambda page: "syncing")
     monkeypatch.setattr(wv, "wait_boot", lambda page, name, **kw: "syncing")
     res = wv.verify_places(_Store(), _rows(2))

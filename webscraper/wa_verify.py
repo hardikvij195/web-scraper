@@ -28,7 +28,9 @@ import re
 import logging
 import random
 import sqlite3
+import threading
 import time
+from collections import deque
 from datetime import date
 from typing import Any, Callable
 
@@ -135,6 +137,66 @@ _LAST_SYNC_SEC: dict[str, float] = {}      # account -> seconds the last load sp
 _SYNC_MAX_OVERRIDE: dict[str, float] = {}  # account -> one-off sync window for its next `wait_boot`
 
 
+#: W195 (CRM T1387): a due W131 count recycle is deferred while the account's Chrome tree (its W183
+#: Windows job object) has peaked below this share of its RAM cap — the recycle exists to give memory
+#: back, and every one costs a fresh WhatsApp Web boot. Hard ceiling: WA_RECYCLE_MEM_MAX_FACTOR x N.
+WA_RECYCLE_MEM_PCT = 60.0
+WA_RECYCLE_MEM_MAX_FACTOR = 4
+
+
+def wa_recycle_mem_pct() -> float:
+    """W195: `WA_RECYCLE_MEM_PCT__<DEVICE>` > `WA_RECYCLE_MEM_PCT` > 60; 0 = always recycle on count."""
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env("WA_RECYCLE_MEM_PCT")
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw if raw is not None and str(raw).strip() else os.environ.get("WA_RECYCLE_MEM_PCT")
+    try:
+        return max(0.0, float(raw)) if raw is not None and str(raw).strip() else WA_RECYCLE_MEM_PCT
+    except ValueError:
+        return WA_RECYCLE_MEM_PCT
+
+
+def recycle_deferred(count: int, every: int, mem_ratio: float | None, mem_pct: float) -> bool:
+    """W195, pure: skip a count-due recycle while the Chrome is measurably small. `mem_ratio` =
+    peak / cap of the account's job object (None = unknown, e.g. macOS -> never deferred)."""
+    if every <= 0 or mem_pct <= 0 or mem_ratio is None:
+        return False
+    if count >= every * WA_RECYCLE_MEM_MAX_FACTOR:
+        return False
+    return mem_ratio < mem_pct / 100.0
+
+
+class WaFeed:
+    """W195 (CRM T1387): ONE shared, thread-safe queue of rows for every parallel WhatsApp session of
+    a job. Fixed per-account slices left accounts idle once their share was done (PC #23253: poco +
+    realme finished at 19:40, oneplus did the last ~900 alone for 2.5 h) — now each session pulls the
+    next row the moment it is free, and a session that joins later (newly linked / slots raised) takes
+    from the same queue. `verify_places` puts back what a session could not check (`put_back`)."""
+
+    def __init__(self, rows=()) -> None:
+        self._q: deque = deque(rows)
+        self._lock = threading.Lock()
+
+    def take(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._q.popleft() if self._q else None
+
+    def put_back(self, rows) -> None:
+        rows = list(rows)
+        with self._lock:
+            self._q.extendleft(reversed(rows))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._q)
+
+    def __iter__(self):
+        while (r := self.take()) is not None:
+            yield r
+
+
 def wa_resync_long_wait_sec() -> float:
     """W143: the single long sync window the episode-3 recovery waits (env WA_RESYNC_LONG_WAIT_SEC)."""
     import os
@@ -209,8 +271,12 @@ def wa_sync_max_sec() -> float:
         return WA_SYNC_MAX_SEC
 
 
+_BOOT_TXT = threading.local()   # W195: the last splash text `_boot_state` read on this thread
+
+
 def _boot_state(page: Page) -> str:
     """'chat' (linked, ready) | 'qr' (link-device screen) | 'syncing' (WhatsApp's splash) | 'blank'."""
+    _BOOT_TXT.txt = ""
     try:
         if page.locator(_CHAT_SEL).count():
             return "chat"
@@ -219,7 +285,17 @@ def _boot_state(page: Page) -> str:
         txt = (page.locator("body").inner_text(timeout=2_000) or "").lower()
     except Exception:                                             # noqa: BLE001
         return "blank"
+    _BOOT_TXT.txt = txt
     return "syncing" if any(w in txt for w in _SPLASH_WORDS) else "blank"
+
+
+def _splash_label() -> str:
+    """W195: the plain boot screen ("loading your chats", the end-to-end lock) after every page load is
+    NOT the history download — only say "messages are downloading" when WhatsApp says so."""
+    txt = getattr(_BOOT_TXT, "txt", "") or ""
+    if "messages are downloading" in txt or "don't close this window" in txt:
+        return "syncing (\"messages are downloading\")"
+    return "loading"
 
 
 def wait_boot(page: Page, name: str, *, blank_ms: int, sync_max_sec: float | None = None) -> str:
@@ -246,8 +322,8 @@ def wait_boot(page: Page, name: str, *, blank_ms: int, sync_max_sec: float | Non
         if st == "syncing":
             seen_sync = True
             if el - last_log >= 30:
-                log.info("[%s] WhatsApp Web is syncing (\"messages are downloading\") — %ds, waiting up to %ds",
-                         name, int(el), int(sync_max))
+                log.info("[%s] WhatsApp Web is %s — %ds, waiting up to %ds",
+                         name, _splash_label(), int(el), int(sync_max))
                 last_log = el
         if seen_sync:
             if el >= sync_max:
@@ -270,13 +346,13 @@ def _is_logged_in(page: Page, name: str = "?", sync_max_sec: float | None = None
     return st == "chat"
 
 
-def _decide(page: Page) -> str:
+def _decide(page: Page, timeout_ms: int | None = None) -> str:
     """On an already-loaded send URL, return 'yes' | 'no' | 'unknown'.
 
     Valid number      -> WhatsApp opens the conversation (#main chat pane appears).
     Not-on-WhatsApp    -> a popup, e.g. "The number +44 … isn't on WhatsApp." (~2 s).
     """
-    deadline = time.monotonic() + _CHECK_TIMEOUT_MS / 1000
+    deadline = time.monotonic() + (timeout_ms or _CHECK_TIMEOUT_MS) / 1000
     compose_sel = ('footer div[contenteditable="true"][data-tab], '
                    'div[contenteditable="true"][data-tab], div[title="Type a message"]')
     while time.monotonic() < deadline:
@@ -813,7 +889,7 @@ _CHECKS_SINCE_RECYCLE: dict[str, int] = {}
 
 def verify_places(
     store: Store,
-    rows: list[dict[str, Any]],
+    rows: "list[dict[str, Any]] | WaFeed",
     # (place_key, status, resolved_number|None, source|None). W26 added the 4th arg —
     # which of the place's numbers this verdict is about (maps | wa_link | site).
     on_progress: Callable[..., None] | None = None,
@@ -963,9 +1039,14 @@ def verify_places(
                         # never ready to answer for this number, so it was never really
                         # "checked". Tell the caller to re-queue it rather than record 'unknown'.
                         return _STILL_SYNCING
-                    page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
-                    st = _decide(page)
-                    log.info("[%s] number %s: WhatsApp Web was still syncing — re-checked (%s)", name, num, st)
+                    # W195 (CRM T1387): the send URL is already loaded — once the client is up it opens
+                    # the chat / not-on-WhatsApp popup by itself. Decide on THIS page first; a second
+                    # full reload (DELL: another slow boot per number) only when that still cannot tell.
+                    st = _decide(page, timeout_ms=8_000)
+                    if st == "unknown":
+                        page.goto(WA_SEND.format(num=num), timeout=60_000, wait_until="domcontentloaded")
+                        st = _decide(page)
+                    log.info("[%s] number %s: WhatsApp Web was still loading — re-checked (%s)", name, num, st)
                     if st == "unknown":
                         # W137: a re-check straight off the sync splash that still cannot decide
                         # is not an answer either — the caller re-queues it (bounded) or benches
@@ -997,14 +1078,18 @@ def verify_places(
                 # loop: retry this ONE number on the relaunched browser.
 
     # Expand to (row, bare digits, source) — one entry per number to check.
+    # W195: a `WaFeed` (shared by every parallel session of the job) is expanded one row at a time
+    # as this session gets free; a plain list is expanded up front exactly as before.
+    feed = rows if isinstance(rows, WaFeed) else None
     targets: list[tuple[dict[str, Any], str, str]] = []
-    for r in rows:
+
+    def _expand(r: dict[str, Any]) -> None:
         pk = r["place_key"]
         if r.get("number"):
             d = "".join(ch for ch in str(r["number"]) if ch.isdigit())
             if 8 <= len(d) <= 15:
                 targets.append((r, d, str(r.get("source") or "maps")))
-            continue
+            return
         cands = wa_candidates(r)
         if not cands:
             # Legacy single-number fallback covers a row whose phone did not parse for its
@@ -1017,9 +1102,27 @@ def verify_places(
             if job_id is not None:
                 store.set_wa_verify(job_id, pk, "unknown", None)
             on_progress(pk, "unknown", None, None)
-            continue
+            return
         for e164, src in cands:
             targets.append((r, e164.lstrip("+"), src))
+
+    if feed is None:
+        for r in rows:
+            _expand(r)
+    pos = [0]                              # W195: index of the next target to hand out
+
+    def _next_targets():
+        """W195: the targets in order (W115 re-queues append to the list), then — feed mode — the
+        next row from the shared queue, until it is empty."""
+        while True:
+            if pos[0] < len(targets):
+                pos[0] += 1
+                yield targets[pos[0] - 1]
+                continue
+            nxt = feed.take() if feed is not None else None
+            if nxt is None:
+                return
+            _expand(nxt)
 
     unavailable: set[str] = set()          # W93: accounts whose client never rendered this run
     requeue_tries: dict[tuple[str, str], int] = {}   # W115: (place_key, num) -> re-queues so far
@@ -1027,11 +1130,11 @@ def verify_places(
     sync_benched: set[str] = set()         # W137: accounts benched this slice for re-syncing
     stuck_cleared: set[str] = set()        # W171: accounts whose verdict already cleared `sync_stuck`
     try:
-        if targets:
-            pw = sync_playwright().start()
-        for r, num, source in targets:
+        for r, num, source in _next_targets():
             if should_stop():
                 break
+            if pw is None:
+                pw = sync_playwright().start()     # W102/W195: only once there is a number to check
             pk = r["place_key"]
 
             # W142: a CRM command asked for one of our accounts — drop its Chrome now and keep off
@@ -1069,6 +1172,8 @@ def verify_places(
                 log.warning("%s", e)
                 if job_id is not None:
                     store.log(job_id, "whatsapp", f"{name}: WhatsApp Web did not render on this machine — skipped this run, still linked", "warn")
+                if account:
+                    break         # W195: a pinned session ends here; this number goes back to the queue
                 continue
             if page is None:      # account logged out — disable it and try the next row
                 _disable_account(store, name, "logged_out", "session open found it logged out")   # W185
@@ -1186,7 +1291,19 @@ def verify_places(
             checks_since_recycle[name] = checks_since_recycle.get(name, 0) + 1
             _recycle_every = wa_relaunch_every()
             _allowed = recycle_allowed(name)                       # W143: one tick of the hold per check
-            if _recycle_every and checks_since_recycle[name] >= _recycle_every and not _allowed:
+            if (_recycle_every and _allowed and checks_since_recycle[name] >= _recycle_every
+                    and recycle_deferred(checks_since_recycle[name], _recycle_every,
+                                         _br.profile_mem_ratio(profile_dir(name)), wa_recycle_mem_pct())):
+                # W195 (CRM T1387): Chrome is still small — a recycle now only buys another boot.
+                if checks_since_recycle[name] == _recycle_every:
+                    log.info("[%s] WhatsApp recycle due after %d checks but Chrome is below %d%% of its RAM cap — "
+                             "deferred (W195)", name, _recycle_every, int(wa_recycle_mem_pct()))
+                _deferred = True
+            else:
+                _deferred = False
+            if _recycle_every and checks_since_recycle[name] >= _recycle_every and _deferred:
+                pass                                               # W195: keep counting, Chrome is small
+            elif _recycle_every and checks_since_recycle[name] >= _recycle_every and not _allowed:
                 # W143: this account's last load needed a long sync — a recycle now would only
                 # re-sync it again. Keep counting; the recycle fires once the hold has run out.
                 if checks_since_recycle[name] == _recycle_every:
@@ -1233,6 +1350,16 @@ def verify_places(
             on_progress(pk, status, e164, source)
             lo, hi = wa_delay_range()
             time.sleep(random.uniform(lo, hi))
+        else:
+            pos[0] = 0                           # W195: ran dry — nothing to hand back
+        if feed is not None and pos[0] > 0:
+            # W195: this session stopped early (account unusable / capped / stop) — hand the numbers
+            # it took but never checked back to the shared queue for the other sessions.
+            rest = targets[pos[0] - 1:]
+            if rest:
+                feed.put_back([{**r0, "number": plus(n0), "source": s0} for r0, n0, s0 in rest])
+                log.info("[%s] handed %d unchecked number(s) back to the job's queue (W195)",
+                         account or "wa", len(rest))
         # W143: the per-account re-sync ladder. Runs while the driver is still up so episode 3 can
         # relaunch the profile right here and wait one long sync out.
         counts["needs_relink"] = 0

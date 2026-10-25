@@ -350,6 +350,15 @@ def _cap(profile_dir: Path | None, what: str) -> None:
         log.debug("W183 cap hook failed", exc_info=True)
 
 
+def profile_mem_ratio(profile_dir: Path | None) -> float | None:
+    """W195: how near `profile_dir`'s Chrome got to its W183 RAM cap (0..1); None = unknown."""
+    try:
+        from webscraper.job_objects import profile_mem_ratio as _ratio
+        return _ratio(profile_dir)
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
 def profile_in_use(profile_dir: Path) -> bool:
     """W142: is some Chrome on `profile_dir` right now — a live lock holder, or any process
     whose command line names the directory (Windows has no SingletonLock symlink)?"""
