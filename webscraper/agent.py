@@ -2600,6 +2600,7 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
     spare = [a for a in store.enabled_wa_accounts() if a not in accounts]
     used: set[str] = set(accounts)           # W195: an account runs at most once per re-verify (+ the final pass)
     threads: list[threading.Thread] = []
+    active: set[str] = set()                 # W198: accounts a session thread holds right now
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
@@ -2610,6 +2611,8 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
             st = Store(store.path)
             _SLICE_STORE.st = st
             relock = False
+            with lock:
+                active.add(name)
             try:
                 results.append(wa_verify.verify_places(st, feed, on_progress=onp, should_stop=should_stop,
                                                        job_id=None, account=name))
@@ -2636,6 +2639,8 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
                     st.close()
                 except Exception:                                 # noqa: BLE001
                     pass
+                with lock:
+                    active.discard(name)
             if relock and len(feed):
                 time.sleep(2.0 * locks)
                 continue
@@ -2675,8 +2680,10 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
             try:
                 from webscraper.lanes import reprobe_disabled
                 with lock:
-                    held = set(used)
+                    held = set(active)
                 for a in reprobe_disabled(store, skip=held):
+                    with lock:
+                        used.discard(a)      # dropped earlier in THIS run (false disable) -> may rejoin
                     log.info("re-verify: %s re-enabled after a re-probe — it can join (W198)", a)
             except Exception:                                     # noqa: BLE001
                 log.debug("re-verify: disabled-account re-probe failed", exc_info=True)
