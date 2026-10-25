@@ -2774,6 +2774,19 @@ def _reverify_wa(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool =
         buf.flush()
 
 
+def _reverify_unknown() -> bool:
+    """W199: `WA_REVERIFY_UNKNOWN__<DEVICE>` > `WA_REVERIFY_UNKNOWN` > on; 0 = a re-verify checks
+    only never-checked numbers and leaves 'unknown' ones for a later run."""
+    import os
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env("WA_REVERIFY_UNKNOWN")
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw if raw is not None and str(raw).strip() else os.environ.get("WA_REVERIFY_UNKNOWN")
+    return str(raw).strip().lower() not in ("0", "false", "no", "off") if raw is not None else True
+
+
 def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bool = False,
                      cloud_log: "_CloudLogBuffer | None" = None) -> None:
     """Verify an existing CRM job's numbers on WhatsApp and sync wa_verified back.
@@ -2805,6 +2818,12 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
         # carry `site_phones`, so website numbers are only covered by the live job, not here),
         # and the unit of progress is NUMBERS.
         targets = [r for r in rows if wa_candidates(r) and r.get("wa_verified") not in ("yes", "no")]
+        # W199 (CRM T1393, owner 2026-10-25 "first check the never checked whatsapp numbers always"):
+        # never-checked (NULL) numbers go first; an 'unknown' (already tried, inconclusive) is only
+        # re-tried after them — and not at all while `WA_REVERIFY_UNKNOWN[__<DEVICE>]` = 0.
+        if not _reverify_unknown():
+            targets = [r for r in targets if not r.get("wa_verified")]
+        targets.sort(key=lambda r: bool(r.get("wa_verified")))
         already = sum(1 for r in rows if r.get("wa_verified") in ("yes", "no"))
         total = sum(len(wa_candidates(r)) for r in targets)
     src_by_pk = {r["place_key"]: r.get("whatsapp_source") for r in targets}
