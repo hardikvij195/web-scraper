@@ -235,7 +235,7 @@ def test_lane_parks_twice_then_takes_the_relink_wait(monkeypatch, tmp_path):
     calls = {"n": 0}
     base = {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         calls["n"] += 1
         if calls["n"] <= 2:
             return {**base, "sync_blocked": True, "needs_relink": 0}       # episodes 1-2

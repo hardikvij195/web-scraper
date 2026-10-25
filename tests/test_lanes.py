@@ -265,7 +265,7 @@ def test_whatsapp_lane_waits_out_an_open_login_instead_of_giving_up(db, monkeypa
         return state["login_open"]
     monkeypatch.setattr(wa_verify, "login_in_progress", login_open)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         state["calls"] += 1
         if state["login_open"]:
             raise wa_verify.WaNotLoggedIn("[spare1] a WhatsApp login is open on this machine — waiting for it")
@@ -309,7 +309,7 @@ def _relink_setup(db, monkeypatch, state):
     monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         state["calls"] += 1
         if not state["linked"]:
             raise wa_verify.WaNotLoggedIn("no WhatsApp account is logged in on this machine")
@@ -400,7 +400,7 @@ def test_parallel_whatsapp_slices_never_touch_the_lane_threads_sqlite(db, monkey
     monkeypatch.setattr(L, "_wa_parallel", lambda: 2)
     monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         with state["lock"]:
             state["threads"].add(threading.get_ident())
             state["accounts"].append(account)
@@ -497,7 +497,7 @@ def test_whatsapp_lane_finishes_incomplete_instead_of_hanging_with_no_account_ev
     monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         raise wa_verify.WaNotLoggedIn("no WhatsApp accounts - run `python -m webscraper wa-login <name>` first")
     monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
     monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)
@@ -548,7 +548,7 @@ def test_whatsapp_relink_wait_heartbeats_so_the_watchdog_does_not_see_a_hang(db,
     monkeypatch.setattr(Store, "count_wa_pending", lambda self, jid: 1 if state["pending"] else 0)
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         raise wa_verify.WaNotLoggedIn("session ended mid-run")
     monkeypatch.setattr(wa_verify, "verify_places", fake_verify)
     monkeypatch.setattr(L, "IDLE_POLL_SEC", 0.01)

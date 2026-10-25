@@ -835,7 +835,11 @@ class Lane(threading.Thread):
 
         _note_limited(f"handing the {self.key} slot to the next job in line after {done_in_turn} "
                       f"in this turn — back in the queue")
+        self._before_yield()                             # W196: the WhatsApp lane closes its browsers
         return gate.yield_slot(self.job_id, self.stopped, _note_limited)
+
+    def _before_yield(self) -> None:
+        """W196: called right before this lane hands its stage slot to another job."""
 
     # -- W136 (CRM T1015): a slot is held only while there is work ----------------------
     #
@@ -1356,10 +1360,52 @@ class WhatsAppLane(Lane):
     def enabled(self) -> bool:
         return bool(self.job.get("do_wa_verify")) or bool(self.job.get("wa_verify_only"))
 
+    # -- W196 (CRM T1388): WhatsApp browsers stay open across batches for the life of the lane ----
+    # Each 25-number batch used to open and close every account's Chrome, i.e. one WhatsApp Web boot
+    # (+ sync splash) per batch. The single-session path keeps a `WaSession` on this thread; parallel
+    # mode keeps one `WaWorker` thread per account. They are closed whenever the lane stops holding
+    # its slot (idle / pause / yield / park) and when the lane ends; a batch that raised has already
+    # closed its own (verify_places keeps browsers only after a clean, un-stopped call).
+    _wa_session: Any = None
+    _wa_workers: dict | None = None
+
+    def _close_wa(self, why: str = "") -> None:
+        sess, self._wa_session = self._wa_session, None
+        workers, self._wa_workers = (self._wa_workers or {}), None
+        if sess is None and not workers:
+            return
+        if (sess is not None and sess.open_ctx) or workers:
+            log.info("[whatsapp#%s] closing kept WhatsApp browser(s)%s (W196)", self.job_id,
+                     f" — {why}" if why else "")
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:                                     # noqa: BLE001
+                pass
+        for w in workers.values():
+            try:
+                w.stop()
+            except Exception:                                     # noqa: BLE001
+                pass
+
+    def _slot_idle(self, why: str, force: bool = False) -> None:
+        super()._slot_idle(why, force)
+        if force or self._slot_parked or STAGE_GATES.get(self.key) is None:
+            self._close_wa(why)                                   # W196: no slot = no open WhatsApp
+
+    def _pause_wait(self) -> bool:
+        if lane_paused(self.key):
+            self._close_wa("lane paused")                         # W196
+        return super()._pause_wait()
+
+    def _before_yield(self) -> None:
+        self._close_wa("slot handed to another job")              # W196: that job needs the profiles
+
     def work(self) -> str | None:
         try:
             return self._work()
         finally:
+            self._close_wa("lane ended")                          # W196
             # Whatever way the loop exits, nothing is in flight any more.
             if self.store is not None:
                 try:
@@ -1499,27 +1545,37 @@ class WhatsAppLane(Lane):
                     feed = wa_verify.WaFeed(batch)
                     results: list[dict] = []
                     errors: list[BaseException] = []
-                    def run_slice(rows, name):
-                        # Everything this thread touches in sqlite goes through `st`:
-                        # the verify itself, its progress lines, and the stop poll.
-                        st = self.ctl.new_store()
-                        try:
-                            results.append(wa_verify.verify_places(
-                                st, rows, make_on_wa(st),
+                    # W196: one long-lived worker thread per account owns that account's browser (and
+                    # its own sqlite `Store`) across batches; accounts no longer in the set are closed.
+                    if self._wa_session is not None:
+                        sess, self._wa_session = self._wa_session, None
+                        sess.close()                                # switching from single mode
+                    workers = self._wa_workers or {}
+                    want_names = list(accounts[:n])
+                    for nm in [k for k in workers if k not in want_names]:
+                        workers.pop(nm).stop()
+                    for nm in want_names:
+                        if nm not in workers or not workers[nm].thread.is_alive():
+                            workers[nm] = wa_verify.WaWorker(nm, self.ctl.new_store)
+                    self._wa_workers = workers
+
+                    def run_slice(name):
+                        def fn(st, sess):
+                            # Everything this thread touches in sqlite goes through `st`:
+                            # the verify itself, its progress lines, and the stop poll.
+                            return wa_verify.verify_places(
+                                st, feed, make_on_wa(st),
                                 lambda: bool(st.stop_requested(self.job_id)),
-                                job_id=self.job_id, headless=hl, account=name))
-                        except BaseException as e:                # noqa: BLE001
-                            errors.append(e)
-                            log.warning("[whatsapp#%s] slice %s failed: %s", self.job_id, name, e)
-                        finally:
-                            st.close()
-                    ts = [threading.Thread(target=run_slice, args=(feed, accounts[i]),
-                                           name=f"wa-{i}", daemon=True)
-                          for i in range(n)]
-                    for t in ts:
-                        t.start()
-                    for t in ts:
-                        t.join()
+                                job_id=self.job_id, headless=hl, account=name, session=sess)
+                        return fn
+                    pending = [(nm, *workers[nm].run(run_slice(nm))) for nm in want_names]
+                    for nm, box, done in pending:
+                        done.wait()
+                        if "error" in box:
+                            errors.append(box["error"])
+                            log.warning("[whatsapp#%s] slice %s failed: %s", self.job_id, nm, box["error"])
+                        else:
+                            results.append(box["result"])
                     if errors and not results:
                         raise errors[0]
                     # W78: the summary line below reads yes/no/unknown — a `capped`-only
@@ -1533,8 +1589,13 @@ class WhatsAppLane(Lane):
                     res["needs_relink"] = sum(int(r.get("needs_relink", 0) or 0) for r in results)
                     res["sync_stuck"] = sum(int(r.get("sync_stuck", 0) or 0) for r in results)   # W171
                 else:
+                    if self._wa_workers:
+                        self._close_wa("back to one WhatsApp session")   # W196: free the profiles
+                    if self._wa_session is None:
+                        self._wa_session = wa_verify.WaSession()
                     res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
-                                                  job_id=self.job_id, headless=hl)
+                                                  job_id=self.job_id, headless=hl,
+                                                  session=self._wa_session)   # W196
             except wa_verify.WaNotLoggedIn as e:
                 # W77: a login window is open on this machine (the user is linking a
                 # number from the CRM's "WhatsApp login" mid-job). The rotation reached

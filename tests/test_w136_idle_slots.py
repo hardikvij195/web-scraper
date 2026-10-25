@@ -53,7 +53,7 @@ def _one_slot_each(monkeypatch):
 def _fake_wa(monkeypatch, calls: list):
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         for r in batch:
             calls.append((job_id, r["place_key"]))
             store.record_wa_check(job_id, r["place_key"], r["number"], r.get("source") or "maps", "yes")

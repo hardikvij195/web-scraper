@@ -52,7 +52,7 @@ def setup(tmp_path, monkeypatch):
     checked: list[str] = []
     hook: dict = {"after_first": None}
 
-    def fake_verify(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def fake_verify(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         n = 0
         for r in rows:
             if should_stop and should_stop():         # the real verify_places checks per number too

@@ -35,7 +35,10 @@ DISABLE_FEATURES = ("site-per-process", "IsolateOrigins", "TranslateUI", "BackFo
 
 #: V8 old-space cap (MB) per Chrome kind. WhatsApp Web syncing a heavy-history account holds
 #: more live JS than a Maps panel (W143) — 256 MB there would OOM the renderer mid-sync.
-JS_HEAP_MB = {"maps": 256, "enrich": 256, "wa": 512}
+#: W197 (CRM T1388): WhatsApp 512 -> 1536 — WhatsApp Web on a big business account outgrows a 512 MB V8
+#: heap, the renderer dies ("Aw, Snap" / blank tab) and every crash costs a relaunch + a full sync wait.
+#: Maps / enrichment stay small. Still under the W183 job-object cap (max(1200, 30 % of RAM) per tree).
+JS_HEAP_MB = {"maps": 256, "enrich": 256, "wa": 1536}
 
 #: `browser_fetch.IGNORE_DEFAULT_ARGS` strips these two from Playwright's OWN defaults because a
 #: real Chrome never carries them (a Cloudflare tell) — the enrichment Chrome must not get them
@@ -117,8 +120,11 @@ def enabled() -> bool:
 
 
 def js_heap_mb(kind: str) -> int:
-    """`CHROME_JS_HEAP_MB__<KIND>` > `CHROME_JS_HEAP_MB` > the per-kind default; 0 = no cap."""
-    raw = os.getenv(f"CHROME_JS_HEAP_MB__{kind.upper()}") or os.getenv("CHROME_JS_HEAP_MB")
+    """`CHROME_JS_HEAP_MB__<KIND>__<DEVICE>` (W197) > `CHROME_JS_HEAP_MB__<KIND>` > `CHROME_JS_HEAP_MB`
+    > the per-kind default; 0 = no cap."""
+    dev = device_upper()
+    raw = ((os.getenv(f"CHROME_JS_HEAP_MB__{kind.upper()}__{dev}") if dev else None)
+           or os.getenv(f"CHROME_JS_HEAP_MB__{kind.upper()}") or os.getenv("CHROME_JS_HEAP_MB"))
     if raw is None or not str(raw).strip():
         return JS_HEAP_MB.get(kind, 256)
     try:

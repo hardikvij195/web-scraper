@@ -359,6 +359,52 @@ def profile_mem_ratio(profile_dir: Path | None) -> float | None:
         return None
 
 
+def tree_rss_mb(profile_dir: Path | str, procs: Iterable[tuple[int, int, int, str]]) -> float | None:
+    """W196 (CRM T1388), pure: resident MB of the Chrome tree on `profile_dir` — every process whose
+    command line carries its `--user-data-dir` plus all their descendants (macOS renderers/helpers do
+    not always repeat the flag). `procs` = (pid, ppid, rss_kb, command). None = no such Chrome."""
+    rows = list(procs)
+    roots = set(profile_holder_pids(Path(profile_dir), [(pid, cmd) for pid, _pp, _rss, cmd in rows]))
+    if not roots:
+        return None
+    kids: dict[int, list[int]] = {}
+    for pid, ppid, _rss, _cmd in rows:
+        kids.setdefault(ppid, []).append(pid)
+    seen: set[int] = set()
+    stack = list(roots)
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        stack.extend(kids.get(p, ()))
+    rss = {pid: r for pid, _pp, r, _c in rows}
+    return sum(rss.get(p, 0) for p in seen) / 1024.0
+
+
+def _list_processes_rss() -> list[tuple[int, int, int, str]]:
+    """W196: (pid, ppid, rss KB, command) via `ps` (POSIX only; [] elsewhere / on failure)."""
+    if sys.platform == "win32":
+        return []
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,command="], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out: list[tuple[int, int, int, str]] = []
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
+            out.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3] if len(parts) > 3 else ""))
+    return out
+
+
+def profile_tree_rss_mb(profile_dir: Path | str | None) -> float | None:
+    """W196: current RSS (MB) of `profile_dir`'s Chrome tree off Windows; None = unknown."""
+    if profile_dir is None:
+        return None
+    return tree_rss_mb(profile_dir, _list_processes_rss())
+
+
 def profile_in_use(profile_dir: Path) -> bool:
     """W142: is some Chrome on `profile_dir` right now — a live lock holder, or any process
     whose command line names the directory (Windows has no SingletonLock symlink)?"""

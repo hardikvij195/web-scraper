@@ -48,7 +48,7 @@ def _job_with_number(new_store, **over):
 def _slow_wa(monkeypatch, delay: float, ended: dict):
     monkeypatch.setattr(wa_verify, "login_in_progress", lambda name=None: False)
 
-    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None):
+    def fake_verify(store, batch, on_progress, should_stop, job_id=None, headless=None, account=None, **_kw):
         time.sleep(delay)
         for r in batch:
             store.record_wa_check(job_id, r["place_key"], r["number"], "maps", "yes")

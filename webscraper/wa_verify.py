@@ -23,6 +23,8 @@ Ban risk is never zero - use a spare number, not your main business WhatsApp.
 from __future__ import annotations
 
 import os
+import queue
+import sys
 import re
 
 import logging
@@ -37,7 +39,7 @@ from typing import Any, Callable
 from playwright.sync_api import Error as PWError, Page, TimeoutError as PWTimeout, sync_playwright
 
 from webscraper import browser_recovery as _br
-from webscraper.chrome_args import lean_args, merge_args
+from webscraper.chrome_args import js_heap_mb as lean_heap_mb, lean_args, merge_args
 from webscraper.browser_recovery import (MAX_RELAUNCH, RESTORE_BUBBLE_ARGS, Relauncher,
                                          is_closed, mark_profile_clean)
 from webscraper.config import settings
@@ -160,7 +162,8 @@ def wa_recycle_mem_pct() -> float:
 
 def recycle_deferred(count: int, every: int, mem_ratio: float | None, mem_pct: float) -> bool:
     """W195, pure: skip a count-due recycle while the Chrome is measurably small. `mem_ratio` =
-    peak / cap of the account's job object (None = unknown, e.g. macOS -> never deferred)."""
+    peak / cap of the account's job object, or off Windows its tree RSS / WA_RECYCLE_MEM_MB (W196,
+    `account_mem_ratio`); None = unknown -> never deferred."""
     if every <= 0 or mem_pct <= 0 or mem_ratio is None:
         return False
     if count >= every * WA_RECYCLE_MEM_MAX_FACTOR:
@@ -195,6 +198,135 @@ class WaFeed:
     def __iter__(self):
         while (r := self.take()) is not None:
             yield r
+
+
+#: W196 (CRM T1388): macOS has no W183 job object, so the W195 deferral never fired there (MAC kept a
+#: cloud recycle of 80). Off Windows the account's Chrome tree RSS (`ps`, no psutil in this project) is
+#: measured against this cap instead: `WA_RECYCLE_MEM_MB__<DEVICE>` > `WA_RECYCLE_MEM_MB` > 1500; 0 = off.
+WA_RECYCLE_MEM_MB = 1500
+
+
+def wa_recycle_mem_mb() -> int:
+    """W196: the RSS cap the off-Windows recycle deferral measures against (0 = no fallback)."""
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env("WA_RECYCLE_MEM_MB")
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw if raw is not None and str(raw).strip() else os.environ.get("WA_RECYCLE_MEM_MB")
+    try:
+        return max(0, int(float(raw))) if raw is not None and str(raw).strip() else WA_RECYCLE_MEM_MB
+    except ValueError:
+        return WA_RECYCLE_MEM_MB
+
+
+def account_mem_ratio(name: str, *, platform: str | None = None,
+                      rss_mb: Callable[[Any], float | None] | None = None) -> float | None:
+    """W195/W196: how full `name`'s WhatsApp Chrome is (0..1). Windows: peak / W183 job-object cap.
+    Elsewhere: current tree RSS / `wa_recycle_mem_mb()`. None = unknown -> the recycle is never deferred."""
+    plat = platform or sys.platform
+    pdir = profile_dir(name)
+    if plat == "win32":
+        return _br.profile_mem_ratio(pdir)
+    cap = wa_recycle_mem_mb()
+    if cap <= 0:
+        return None
+    try:
+        mb = (rss_mb or _br.profile_tree_rss_mb)(pdir)
+    except Exception:                                             # noqa: BLE001
+        mb = None
+    return None if mb is None else mb / cap
+
+
+class WaSession:
+    """W196 (CRM T1388): WhatsApp browsers kept open across `verify_places` calls — the live lane checks
+    25 numbers a batch and used to close every account's Chrome after each one, so every batch paid a
+    WhatsApp Web boot (+ its sync splash). Playwright's sync API is bound to the thread that started it,
+    so a session belongs to ONE thread (`owner`) and is closed by that thread (`close`)."""
+
+    def __init__(self) -> None:
+        self.pw: Any = None
+        self.open_ctx: dict[str, Any] = {}
+        self.relaunchers: dict[str, Relauncher] = {}
+        self.owner: int | None = None
+
+    def close(self) -> None:
+        for pair in list(self.open_ctx.values()):
+            try:
+                (pair[0] if isinstance(pair, tuple) else pair).close()
+            except Exception:                                     # noqa: BLE001
+                pass
+        self.open_ctx.clear()
+        self.relaunchers.clear()
+        if self.pw is not None:
+            try:
+                self.pw.stop()
+            except Exception:                                     # noqa: BLE001
+                log.warning("WhatsApp session: Playwright did not stop cleanly", exc_info=True)
+        self.pw = None
+        self.owner = None
+
+
+class WaWorker:
+    """W196: one long-lived thread per account for the parallel live lane. It owns that account's
+    `WaSession` and its own sqlite `Store` (both thread-bound) for the life of the lane; the lane hands
+    it one batch at a time (`run`) and `stop()` closes the browser on the worker's own thread."""
+
+    def __init__(self, name: str, new_store: Callable[[], Any]) -> None:
+        self.name = name
+        self.session = WaSession()
+        self._new_store = new_store
+        self._q: "queue.Queue[Any]" = queue.Queue()
+        self.thread = threading.Thread(target=self._loop, name=f"wa-{name}", daemon=True)
+        self.thread.start()
+
+    def _loop(self) -> None:
+        st = None
+        try:
+            st = self._new_store()
+            while True:
+                item = self._q.get()
+                if item is None:
+                    break
+                fn, box, done = item
+                try:
+                    box["result"] = fn(st, self.session)
+                except BaseException as e:                        # noqa: BLE001
+                    box["error"] = e
+                finally:
+                    done.set()
+        except BaseException as e:                                # noqa: BLE001 — store open failed
+            log.warning("[%s] WhatsApp worker died: %s", self.name, e)
+        finally:
+            self.session.close()
+            if st is not None:
+                try:
+                    st.close()
+                except Exception:                                 # noqa: BLE001
+                    pass
+
+    def run(self, fn: Callable[[Any, "WaSession"], Any]) -> tuple[dict, threading.Event]:
+        """Queue `fn(store, session)` on the worker; wait on the returned event, read the box."""
+        box: dict[str, Any] = {}
+        done = threading.Event()
+        if not self.thread.is_alive():
+            box["error"] = RuntimeError(f"WhatsApp worker {self.name} is not running")
+            done.set()
+            return box, done
+        self._q.put((fn, box, done))
+        return box, done
+
+    def stop(self, timeout: float = 60.0) -> None:
+        self._q.put(None)
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout)
+
+
+def is_crashed(e: BaseException) -> bool:
+    """W197 (CRM T1388): Playwright's 'Page crashed' / 'Target crashed' — the renderer died (on a big
+    WhatsApp business account usually the V8 heap: "Aw, Snap" / blank page). `is_closed` does not match
+    it, so it used to be retried in place on the dead tab and recorded 'unknown'."""
+    return "crashed" in str(e).lower()
 
 
 def wa_resync_long_wait_sec() -> float:
@@ -902,6 +1034,9 @@ def verify_places(
     # splits a batch across linked accounts and runs the slices at once; each slice
     # pins its own account so two threads never share one Chrome profile.
     account: str | None = None,
+    # W196: keep the browsers open after this call (the live lane, one session per thread). None =
+    # everything is closed in `finally`, exactly as before.
+    session: "WaSession | None" = None,
 ) -> dict[str, int]:
     """Verify numbers against WhatsApp, one verdict per NUMBER (W26).
 
@@ -949,6 +1084,16 @@ def verify_places(
     # (`set_wa_verify`, the progress callback), so a `database is locked` there leaked
     # the driver process, its two pipes and its event loop for the rest of the agent.
     pw: Any = None
+    if session is not None and session.owner not in (None, threading.get_ident()):
+        log.warning("WhatsApp session belongs to another thread — this call opens its own (W196)")
+        session = None
+    if session is not None:
+        # W196: carry on with the browsers the previous batch left open. The relaunch budget is per
+        # call as before (a crash in batch 1 must not eat batch 40's budget).
+        session.owner = threading.get_ident()
+        open_ctx, relaunchers, pw = session.open_ctx, session.relaunchers, session.pw
+        for _rl in relaunchers.values():
+            _rl.attempts = 0
 
     def _relaunch(name: str, where: str) -> bool:
         """Rebuild `name`'s dead browser and refresh its handle. False once its cap is spent.
@@ -978,6 +1123,16 @@ def verify_places(
                 ctx.close()
         except Exception:                                         # noqa: BLE001
             pass
+
+    if session is not None:
+        # W196: a kept browser whose account left the rotation (disabled / NEEDS RELINK / benched) or
+        # is being linked / paused for a CRM command right now is closed before anything else.
+        _usable = {str(a["name"]) for a in accounts}
+        for _n in [n for n in list(open_ctx)
+                   if n not in _usable or n in _PAUSED or login_in_progress(n)]:
+            log.info("[%s] closing its kept WhatsApp browser — out of rotation / paused (W196)", _n)
+            _close_account(_n)
+            relaunchers.pop(_n, None)
 
     def _resync_recover(name: str, ep: int) -> bool:
         """W143 episode 3: kill the profile's Chrome + its lock files (SingletonLock/Socket/Cookie,
@@ -1057,6 +1212,20 @@ def verify_places(
             except PWTimeout:                 # subclass of PWError - must stay above it
                 return "unknown"
             except PWError as e:
+                if is_crashed(e) and not is_closed(e):
+                    # W197 (CRM T1388): the renderer died (V8 heap / RAM) — the tab is dead, retrying
+                    # navigation in place only produced 'unknown'. Say so, then relaunch like a crash.
+                    msg = (f"{name}: WhatsApp tab crashed (out of memory?) on number {num} — relaunching "
+                           f"its Chrome (JS heap cap {lean_heap_mb('wa')} MB)")
+                    log.warning("[%s] %s", name, msg)
+                    if job_id is not None:
+                        try:
+                            store.log(job_id, "whatsapp", msg, "warn")
+                        except Exception:                         # noqa: BLE001
+                            pass
+                    if not _relaunch(name, f"number {num} (tab crashed)"):
+                        raise
+                    continue
                 if is_closed(e):
                     # maps.py has had this since job #3 died mid-feed with TargetClosedError;
                     # the lanes split (2026-08-23) gave WhatsApp its own long-lived browser
@@ -1129,6 +1298,7 @@ def verify_places(
     sync_strikes: dict[str, int] = {}      # W137: account -> consecutive sync non-answers
     sync_benched: set[str] = set()         # W137: accounts benched this slice for re-syncing
     stuck_cleared: set[str] = set()        # W171: accounts whose verdict already cleared `sync_stuck`
+    clean_end = False                      # W196: only a call that ran to its end may keep its browsers
     try:
         for r, num, source in _next_targets():
             if should_stop():
@@ -1293,7 +1463,7 @@ def verify_places(
             _allowed = recycle_allowed(name)                       # W143: one tick of the hold per check
             if (_recycle_every and _allowed and checks_since_recycle[name] >= _recycle_every
                     and recycle_deferred(checks_since_recycle[name], _recycle_every,
-                                         _br.profile_mem_ratio(profile_dir(name)), wa_recycle_mem_pct())):
+                                         account_mem_ratio(name), wa_recycle_mem_pct())):   # W196: + macOS RSS
                 # W195 (CRM T1387): Chrome is still small — a recycle now only buys another boot.
                 if checks_since_recycle[name] == _recycle_every:
                     log.info("[%s] WhatsApp recycle due after %d checks but Chrome is below %d%% of its RAM cap — "
@@ -1413,13 +1583,40 @@ def verify_places(
                                 WA_RESYNC_RECOVERY_EPISODE, WA_RESYNC_RELINK_EPISODE)
                     blocked = True
         counts["sync_blocked"] = blocked
+        clean_end = True
     finally:
-        for pw_ctx, _ in open_ctx.values():
+        keep = session is not None and clean_end
+        if keep:
+            try:
+                keep = not should_stop()
+            except Exception:                                     # noqa: BLE001
+                keep = False
+        if keep:
+            # W196: leave the healthy browsers open for the lane's next batch; an account that could
+            # not render / was benched / is paused is closed so its next use is a clean boot.
+            for _n in [n for n in list(open_ctx) if n in unavailable or n in sync_benched or n in _PAUSED]:
+                _close_account(_n)
+                relaunchers.pop(_n, None)
+            if not open_ctx and pw is not None:
+                try:
+                    pw.stop()
+                except Exception:                                 # noqa: BLE001
+                    pass
+                pw = None
+            session.pw = pw
+            log.info("[%s] keeping %d WhatsApp browser(s) open for the next batch (W196)",
+                     account or "wa", len(open_ctx))
+        for pw_ctx, _ in ([] if keep else open_ctx.values()):
             try:
                 pw_ctx.close()
             except Exception:  # noqa: BLE001
                 pass
-        if pw is not None:
+        if not keep and session is not None:
+            session.open_ctx.clear()
+            session.relaunchers.clear()
+            session.pw = None
+            session.owner = None
+        if pw is not None and not keep:
             # W102: `stop()` must not be allowed to raise — Playwright marks the session
             # as exited BEFORE it closes the event loop, so an exception here leaves the
             # loop's descriptors open for good and hides the error that ended the slice.
@@ -1683,6 +1880,12 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
         _br._cap(profile_dir(name), "WhatsApp")                   # W183: Job Object RAM cap (win32 only)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            try:                                                  # W197: say it the moment it happens
+                page.on("crash", lambda _p: log.warning(
+                    "[%s] WhatsApp tab crashed (out of memory?) — renderer died, JS heap cap %d MB (W197)",
+                    name, lean_heap_mb("wa")))
+            except Exception:                                     # noqa: BLE001
+                pass
             if mode == "hidden":
                 # Off-screen is honoured (probe: bounds stay at -32000), but the window
                 # still has a taskbar entry; minimising it too keeps it out of Alt-Tab.

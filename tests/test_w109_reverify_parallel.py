@@ -45,7 +45,7 @@ def setup(tmp_path, monkeypatch):
     calls: list[dict] = []
     lock = threading.Lock()
 
-    def fake_verify(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def fake_verify(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         rows = list(rows)                     # W195: a shared WaFeed is drained once, like the real loop
         with lock:
             calls.append({"account": account, "keys": [r["place_key"] for r in rows],
@@ -87,7 +87,7 @@ def test_a_failed_slice_does_not_sink_the_others(setup, monkeypatch):
     monkeypatch.setattr("webscraper.lanes._wa_parallel", lambda: 2)
     real = wa_verify.verify_places
 
-    def flaky(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def flaky(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         if account == "a1":
             raise wa_verify.WaNotLoggedIn("a1 logged out")
         return real(st, rows, on_progress, should_stop, job_id, headless, account)
@@ -105,7 +105,7 @@ def test_w187_dead_session_hands_its_share_to_the_spare_account(setup, monkeypat
     monkeypatch.setattr("webscraper.lanes._wa_parallel", lambda: 2)   # a1 + a2 start, a3 is the spare
     real = wa_verify.verify_places
 
-    def a1_logs_out(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def a1_logs_out(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         if account == "a1":
             st.set_wa_needs_relink("a1", True)                          # the account drops, nothing checked
             return {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}
@@ -125,7 +125,7 @@ def test_w187_no_spare_finishes_the_rest_on_a_surviving_account(setup, monkeypat
     monkeypatch.setattr("webscraper.lanes._wa_parallel", lambda: 3)   # all three in use, no spare
     real = wa_verify.verify_places
 
-    def a1_logs_out(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def a1_logs_out(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         if account == "a1":
             st.set_wa_needs_relink("a1", True)
             return {"yes": 0, "no": 0, "unknown": 0, "checked": 0, "capped": 0, "no_number": 0}

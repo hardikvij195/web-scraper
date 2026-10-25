@@ -24,7 +24,7 @@ def store(tmp_path):
 
 
 def _fake_verify(per_account_sec: dict[str, float], seen: dict[str, list[str]], lock: threading.Lock):
-    def fake(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def fake(st, rows, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         n = 0
         for r in rows:                                    # drains the shared WaFeed row by row
             time.sleep(per_account_sec.get(account, 0.0))

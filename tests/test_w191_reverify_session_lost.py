@@ -47,7 +47,7 @@ def setup(tmp_path, monkeypatch):
     rows = [{"place_key": f"r:{100 + i}", "name": f"L{i}", "phone": f"+9198765432{i:02d}",
              "whatsapp_source": "unverified", "wa_verified": None} for i in range(6)]
 
-    def dies_after_3(st, targets, on_progress=None, should_stop=None, job_id=None, headless=None, account=None):
+    def dies_after_3(st, targets, on_progress=None, should_stop=None, job_id=None, headless=None, account=None, **_kw):
         for r in targets[:3]:
             on_progress(r["place_key"], "yes", r["phone"].lstrip("+"), "maps")
         raise wa_verify.WaNotLoggedIn("session ended mid-run")

@@ -27,7 +27,7 @@ def _clean_env(monkeypatch):
 
 def test_lean_args_exact_list_per_kind():
     assert set(chrome_args.lean_args("maps")) == EXPECTED | {"--js-flags=--max-old-space-size=256"}
-    assert set(chrome_args.lean_args("wa")) == EXPECTED | {"--js-flags=--max-old-space-size=512"}
+    assert set(chrome_args.lean_args("wa")) == EXPECTED | {"--js-flags=--max-old-space-size=1536"}   # W197: WhatsApp heap 512 -> 1536
     # the enrichment Chrome keeps its stealth: no flags IGNORE_DEFAULT_ARGS deliberately strips
     enrich = chrome_args.lean_args("enrich")
     assert "--disable-component-update" not in enrich and "--disable-extensions" not in enrich
@@ -79,7 +79,7 @@ def test_every_launch_site_carries_the_diet():
     assert "--renderer-process-limit=2" in mk["args"] and mk["args"].count("--no-first-run") == 1
     for mode in ("visible", "hidden", "headless"):
         wk = wa_verify._launch_kwargs(mode)
-        assert "--js-flags=--max-old-space-size=512" in wk["args"], mode
+        assert "--js-flags=--max-old-space-size=1536" in wk["args"], mode
         assert len(wk["args"]) == len(set(wk["args"])), mode
     from webscraper import browser_fetch
     merged = chrome_args.merge_args(browser_fetch.LAUNCH_ARGS, chrome_args.lean_args("enrich"))
