@@ -684,10 +684,24 @@ def reset_account(name: str, *, busy: bool = False) -> tuple[bool, str]:
         except Exception:                                         # noqa: BLE001
             pass
         shutil.rmtree(d, ignore_errors=True)
-    try:
-        Store().remove_wa_account(name)
-    except Exception:                                             # noqa: BLE001
-        pass
+    # W198 (CRM T1391): the row removal used to be `except: pass` — a "database is locked" left `main`
+    # enabled on 1 - PC after "deleted main", and the next re-verify gave it a session slot. Retry, then
+    # check the row is really gone; say so instead of reporting a delete that did not happen.
+    gone = False
+    for attempt in range(3):
+        try:
+            st = Store()
+            st.remove_wa_account(name)
+            gone = not any(str(a["name"]) == name for a in st.list_wa_accounts())
+        except Exception as e:                                    # noqa: BLE001
+            log.warning("[%s] could not remove the account row (attempt %d/3): %s", name, attempt + 1,
+                        str(e).splitlines()[0][:120])
+        if gone:
+            break
+        time.sleep(2.0 * (attempt + 1))
+    if not gone:
+        return False, (f"{name}: profile wiped but its account row could not be removed (database busy) — "
+                       "run the delete again")
     log.info("[%s] WhatsApp profile reset — next wa-login starts from a fresh QR", name)
     return True, f"reset {name} — start a new session to link it again"
 

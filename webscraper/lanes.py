@@ -129,6 +129,46 @@ def wa_reprobe_force_min() -> float:
         return WA_REPROBE_FORCE_MIN
 
 
+def reprobe_disabled(store: Store, note: Callable[[str, str], None] | None = None,
+                     skip: set[str] | None = None) -> list[str]:
+    """W198 (CRM T1391): probe every `disabled=1` account with no QR proof (`unproven_disabled_wa_accounts`)
+    and return the ones re-enabled. A chat list re-enables it (Store.set_wa_status); the QR screen writes
+    `logged_out` — the proof — so it stays disabled, labelled NOT linked, and is not probed again. An
+    unanswered probe (blank / syncing / error) changes nothing. Never raises; `skip` = profiles in use."""
+    if wa_off():                                                  # W184
+        return []
+    try:
+        names = [n for n in (getattr(store, "unproven_disabled_wa_accounts", lambda: [])() or [])
+                 if n not in (skip or set())]
+    except Exception:                                             # noqa: BLE001 — db busy: next round
+        return []
+    back: list[str] = []
+    for name in names:
+        try:
+            from webscraper import wa_verify
+            if wa_verify.login_in_progress(name):
+                continue                                          # the owner is scanning right now
+            state = _account_status(name)
+        except Exception as e:                                    # noqa: BLE001 — a probe never ends anything
+            log.warning("[%s] disabled-account re-probe failed: %s", name, str(e).splitlines()[0][:160])
+            continue
+        if state == "logged_in":
+            back.append(name)
+            msg = (f"WhatsApp [{name}] was out of rotation without proof of a logout — re-probed, still linked; "
+                   "re-enabled (W198)")
+        elif state == "logged_out":
+            msg = f"WhatsApp [{name}] re-probed: QR screen shown — really logged out; stays NOT linked until a QR scan"
+        else:
+            msg = f"WhatsApp [{name}] re-probed: {str(state).replace('_', ' ')} — still out of rotation, retrying in 5 min"
+        log.info("%s", msg)
+        if note is not None:
+            try:
+                note(msg, "info" if state != "logged_out" else "warn")
+            except Exception:                                     # noqa: BLE001
+                pass
+    return back
+
+
 def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
     """W152: probe every `needs_relink` account; True when one showed its chat list (link is fine).
     W171: `sync_stuck` (benched, linked) accounts are probed the same way; a chat list un-benches
@@ -140,7 +180,11 @@ def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
     if wa_off():                                                  # W184: no WhatsApp Chrome on this machine
         return False
     names = list(getattr(store, "flagged_wa_accounts", lambda: [])() or [])
-    if not names:
+    try:                                                          # W198: falsely disabled accounts too
+        dis = list(getattr(store, "unproven_disabled_wa_accounts", lambda: [])() or [])
+    except Exception:                                             # noqa: BLE001
+        dis = []
+    if not names and not dis:
         return False
     wa_verify = None
     try:
@@ -202,6 +246,8 @@ def _reprobe_flagged(lane: "Lane", store: Store) -> bool:
         else:
             lane.note(f"WhatsApp [{name}] re-probed: {str(state).replace('_', ' ')} — still needs a QR relink from "
                       "Lead Finder > Systems > WhatsApp login", "info")
+    if dis and reprobe_disabled(store, note=lane.note):           # W198
+        ok = True
     return ok
 
 

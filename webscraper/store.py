@@ -1134,6 +1134,13 @@ class Store:
                                       (name,))
                 except sqlite3.Error:                         # pre-W143 / pre-W171 schema: no flag to clear
                     pass
+                # W198 (CRM T1391): the same proof ends a `disabled` set without one. 1 - PC's
+                # pc_realme_business sat disabled for hours (a mid-run drop, no QR proof) while its
+                # session was fine — a wa_login found it "already linked". `unlink_account` logs the
+                # session out first, so a deliberately unlinked account can never be seen logged in here.
+                if self._wa_flag(name, "disabled") == 1:
+                    self._insert_wa_event(name, "reenabled", "seen logged in")
+                    self.conn.execute("UPDATE wa_accounts SET disabled=0 WHERE name=?", (name,))
             self.conn.commit()
         self._write(f"wa_accounts {name}", _do)
 
@@ -1226,6 +1233,17 @@ class Store:
                 "SELECT name FROM wa_accounts WHERE disabled=0 AND (COALESCE(needs_relink,0)=1 "
                 "OR COALESCE(sync_stuck,0)=1) ORDER BY name")]
         except sqlite3.Error:                                     # pre-W143 schema
+            return []
+
+    def unproven_disabled_wa_accounts(self) -> list[str]:
+        """W198 (CRM T1391): `disabled=1` accounts NOT last seen on the QR screen (status is not
+        'logged_out') — disabled by a mid-run drop / error rather than proof. Re-probed every 5 min
+        (`lanes.reprobe_disabled`): a chat list re-enables (set_wa_status), a QR screen writes the proof."""
+        try:
+            return [str(r[0]) for r in self.conn.execute(
+                "SELECT name FROM wa_accounts WHERE disabled=1 AND COALESCE(status,'')<>'logged_out' "
+                "ORDER BY name")]
+        except sqlite3.Error:                                     # pre-W64 schema: no status column
             return []
 
     def wa_relinked_since(self, since_iso: str) -> bool:

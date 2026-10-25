@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import sys
 import threading
 import os
@@ -2299,22 +2300,36 @@ def _poll_command(cloud: "CrmCloud", force: bool = False) -> None:
                 ok, result = _defer_command(cmd, int(_rv_job), cloud_job=int(_rv_job))
             elif cmd["command"] == "wa_login":
                 from webscraper import wa_verify
-                label = (cmd.get("arg") or "main").strip() or "main"
-                log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
-                # W142: a running job no longer blocks the login — the lane pauses this account.
-                from webscraper.lanes import wa_off as _wa_off_fn
-                if _wa_off_fn():
-                    log.warning("wa_login %r while WhatsApp is switched off on this machine (wa_off, W184) — "
-                                "linking by hand; jobs still send WhatsApp checks elsewhere", label)
-                ok = wa_verify.login(label, busy=getattr(srv.worker, "current_job", None) is not None)
-                result = (f"linked {label}" if ok
-                          else wa_verify.LAST_LOGIN_RESULT.get(label) or "timed out waiting for the QR scan (2 min)")
+                label = (cmd.get("arg") or "").strip()
+                _named: list[str] = []
+                if not label:
+                    # W198 (CRM T1391): an unnamed wa_login used to (re)create `main` — the deleted account
+                    # that came back on 1 - PC. `main` is only the default on a machine with no account.
+                    try:
+                        _named = [str(a["name"]) for a in Store().list_wa_accounts()]
+                    except Exception:                             # noqa: BLE001
+                        _named = []
+                    label = "" if _named else "main"
+                if not label:
+                    ok, result = False, ("wa_login needs an account name on this machine (it has: "
+                                         f"{', '.join(_named)}) — no unnamed 'main' account is created")
+                    log.warning("CRM wa_login with no account name refused (W198): %s", result)
+                else:
+                    log.info("CRM asked for wa-login %r - opening WhatsApp Web, scan the QR", label)
+                    # W142: a running job no longer blocks the login — the lane pauses this account.
+                    from webscraper.lanes import wa_off as _wa_off_fn
+                    if _wa_off_fn():
+                        log.warning("wa_login %r while WhatsApp is switched off on this machine (wa_off, W184) — "
+                                    "linking by hand; jobs still send WhatsApp checks elsewhere", label)
+                    ok = wa_verify.login(label, busy=_wa_busy(_cur_job, _rv_job))
+                    result = (f"linked {label}" if ok
+                              else wa_verify.LAST_LOGIN_RESULT.get(label) or "timed out waiting for the QR scan (2 min)")
             elif cmd["command"] == "wa_reset":
                 # W91: wipe one account's profile + row so the next login is a clean QR.
                 from webscraper import wa_verify
                 ok, result = wa_verify.reset_account(
                     (cmd.get("arg") or "").strip(),
-                    busy=getattr(srv.worker, "current_job", None) is not None)
+                    busy=_wa_busy(_cur_job, _rv_job))
             elif cmd["command"] in ("wa_unlink", "wa_delete"):
                 # W110 (CRM T592): unlink = log the account out of WhatsApp Web (the phone's
                 # Linked devices loses it; the profile stays, not linked). delete = unlink,
@@ -2322,7 +2337,7 @@ def _poll_command(cloud: "CrmCloud", force: bool = False) -> None:
                 from webscraper import wa_verify
                 fn = wa_verify.unlink_account if cmd["command"] == "wa_unlink" else wa_verify.delete_account
                 ok, result = fn((cmd.get("arg") or "").strip(),
-                                busy=getattr(srv.worker, "current_job", None) is not None)
+                                busy=_wa_busy(_cur_job, _rv_job))
             elif cmd["command"] == "wa_rename":
                 # W80: "<old>><new>" — rename a WhatsApp account (profile dir + store row).
                 # The wa_login branch imports wa_verify locally, which makes the name
@@ -2333,7 +2348,7 @@ def _poll_command(cloud: "CrmCloud", force: bool = False) -> None:
                 old_name, _, new_name = arg.partition(">")
                 ok, result = wa_verify.rename_account(
                     old_name, new_name,
-                    busy=getattr(srv.worker, "current_job", None) is not None)
+                    busy=_wa_busy(_cur_job, _rv_job))
             elif cmd["command"] == "rename":
                 # The CRM already renamed its row + repointed jobs; from the next call on
                 # this machine must heartbeat under the new label, and keep it after reboot.
@@ -2535,6 +2550,26 @@ _SLICE_STORE = threading.local()
 WA_JOIN_POLL_SEC = 30.0
 
 
+def _wa_busy(cur_job: Any, rv_job: Any) -> bool:
+    """W198: a CRM WhatsApp command pauses the account's lane (`with_lane_paused`) while a job OR a
+    re-verify runs — a re-verify is not `srv.worker.current_job`, so its Chrome used to be yanked."""
+    return cur_job is not None or bool(rv_job)
+
+
+def _wa_logged_out(store: Store) -> set[str]:
+    """W198: accounts last SEEN on the QR screen (`status='logged_out'`)."""
+    try:
+        return {str(r["name"]) for r in store.list_wa_accounts() if r.get("status") == "logged_out"}
+    except Exception:                                             # noqa: BLE001
+        return set()
+
+
+#: W198 (CRM T1391): a running re-verify re-probes falsely disabled accounts this often.
+WA_DISABLED_REPROBE_SEC = 300.0
+#: W198: a slice that died on "database is locked" restarts on the same account up to this many times.
+WA_SLICE_LOCK_RETRIES = 3
+
+
 def _join_memory_ok() -> bool:
     """W195: a mid-job join launches one more WhatsApp Chrome — never past the W129/W194 start limit."""
     try:
@@ -2570,12 +2605,25 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
         return bool(should_stop and should_stop())
 
     def run_slice(name: str) -> None:
+        locks = 0
         while True:
             st = Store(store.path)
             _SLICE_STORE.st = st
+            relock = False
             try:
                 results.append(wa_verify.verify_places(st, feed, on_progress=onp, should_stop=should_stop,
                                                        job_id=None, account=name))
+            except sqlite3.OperationalError as e:
+                # W198 (CRM T1391): "database is locked" (ASUS / DELL, 25 Oct) is contention, never the
+                # account — the session restarts on the same account instead of ending the slice.
+                if "locked" in str(e).lower() and locks < WA_SLICE_LOCK_RETRIES and not stopped():
+                    locks += 1
+                    relock = True
+                    log.warning("re-verify session %s: database is locked — restarting it (%d/%d, W198)",
+                                name, locks, WA_SLICE_LOCK_RETRIES)
+                else:
+                    errors.append(e)
+                    log.warning("re-verify session %s failed: %s", name, e)
             except BaseException as e:                            # noqa: BLE001
                 errors.append(e)
                 log.warning("re-verify session %s failed: %s", name, e)
@@ -2588,6 +2636,9 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
                     st.close()
                 except Exception:                                 # noqa: BLE001
                     pass
+            if relock and len(feed):
+                time.sleep(2.0 * locks)
+                continue
             if stopped() or alive or not len(feed):
                 return            # queue done, stopped, or ended for a reason a new account would not fix
             with lock:
@@ -2607,6 +2658,8 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
 
     for a in accounts:
         start(a)
+    next_reprobe = time.monotonic() + WA_DISABLED_REPROBE_SEC
+    mem_noted = 0.0
     while True:
         alive_ts = [t for t in threads if t.is_alive()]
         if not alive_ts:
@@ -2614,6 +2667,19 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
         alive_ts[0].join(WA_JOIN_POLL_SEC)
         if stopped() or not len(feed) or not any(t.is_alive() for t in threads):
             continue
+        if time.monotonic() >= next_reprobe and _join_memory_ok():
+            # W198 (CRM T1391): a re-verify runs for hours with no job boundary (no per-job probe), so a
+            # falsely disabled account used to stay out all night. Probe the unproven ones here; one that
+            # comes back joins on the next poll (W195). Profiles a running session holds are skipped.
+            next_reprobe = time.monotonic() + WA_DISABLED_REPROBE_SEC
+            try:
+                from webscraper.lanes import reprobe_disabled
+                with lock:
+                    held = set(used)
+                for a in reprobe_disabled(store, skip=held):
+                    log.info("re-verify: %s re-enabled after a re-probe — it can join (W198)", a)
+            except Exception:                                     # noqa: BLE001
+                log.debug("re-verify: disabled-account re-probe failed", exc_info=True)
         # W195: a mid-job join — one new session per poll, so Chrome launches are staggered.
         try:
             linked = store.enabled_wa_accounts()     # this (calling) thread's own Store
@@ -2621,9 +2687,18 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
         except Exception:                                         # noqa: BLE001
             continue
         busy = sum(1 for t in threads if t.is_alive())
+        out = _wa_logged_out(store)                  # W198: never join an account last seen on the QR screen
         with lock:
-            cand = next((a for a in linked if a not in used), None)
-            if cand is None or busy >= want or not _join_memory_ok():
+            cand = next((a for a in linked if a not in used and a not in out), None)
+        if cand is None or busy >= want:
+            continue
+        if not _join_memory_ok():
+            if time.monotonic() - mem_noted >= 600:  # W198: say why a linked account is not joining
+                mem_noted = time.monotonic()
+                log.info("re-verify: %s could join but RAM is over the start limit — waiting (W195/W198)", cand)
+            continue
+        with lock:
+            if cand in used:
                 continue
             used.add(cand)
             if cand in spare:
@@ -2889,6 +2964,10 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
     # accounts read ~77 h; the Mac's four accounts sat idle but for one at a time.
     from webscraper.lanes import _wa_parallel
     accounts = store.enabled_wa_accounts()
+    # W198 (CRM T1391): an account last seen on the QR screen never takes a start slot while a linked
+    # one exists (W190 only sorted it last; `main` still got one of 4 slots on 1 - PC at 22:40).
+    _out = _wa_logged_out(store)
+    accounts = [a for a in accounts if a not in _out] or accounts
     n_par = max(1, min(_wa_parallel(), len(accounts)))
 
     try:

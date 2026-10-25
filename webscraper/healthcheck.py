@@ -117,6 +117,7 @@ def _wa_session() -> dict:
     seen: dict[str, tuple[str, str]] = {}
     relink: dict[str, str] = {}          # W143: account -> since when it needs a QR relink
     stuck: dict[str, str] = {}           # W171: account -> since when it is benched (linked, sync never finishes)
+    disabled: set[str] = set()           # W198: out of every lane's rotation (`disabled=1`)
     since: dict[str, int] = {}           # W185: account -> number checks since its last QR link
     drops: list[dict] = []               # W185: newest session drops with the count they happened at
     try:
@@ -126,6 +127,8 @@ def _wa_session() -> dict:
                  for e in _st.wa_drop_events(10)]
         for row in _st.list_wa_accounts():
             since[str(row["name"])] = int(row.get("checks_since_link") or 0)
+            if row.get("disabled"):
+                disabled.add(str(row["name"]))
             if row.get("status"):
                 seen[str(row["name"])] = (str(row["status"]), str(row.get("status_at") or ""))
             if row.get("needs_relink"):
@@ -161,10 +164,18 @@ def _wa_session() -> dict:
                     f"{_hhmm(stuck[a])} — session intact, auto-retry every 5 min, no action needed)")
         st, at = seen.get(a, ("unknown", ""))
         when = f" {_ago(at)}" if at else ""
+        if a in disabled:
+            # W198 (CRM T1391): `disabled=1` = no lane opens it, whatever `status` last said — the label
+            # used to read "linked" for accounts every re-verify skipped. QR proof -> NOT linked (owner
+            # to-do); no proof -> PAUSED, auto re-probed (neither "linked" nor "NEEDS RELINK": no to-do).
+            if st == "logged_out":
+                return f"{a}: NOT linked (logged out{when} — scan a QR via Start session)"
+            return (f"{a}: PAUSED (out of rotation after a session error, no QR seen — re-probed every "
+                    "5 min, re-enabled by itself when WhatsApp Web shows the chat list)")
         return f"{a}: {'linked' if st == 'logged_in' else 'NOT linked' if st == 'logged_out' else 'unchecked'}{when}"
 
     linked = [a for a in live if seen.get(a, ("", ""))[0] == "logged_in" and a not in relink and a not in stuck
-              and not _off]
+              and a not in disabled and not _off]
     detail = "WhatsApp accounts — " + ("; ".join(_label(a) for a in live) if live else "none")
     # Only a profile we have SEEN logged in counts as ok; unchecked stays a warning
     # rather than a green tick, because "we never looked" is not "it works".
