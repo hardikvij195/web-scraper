@@ -676,8 +676,12 @@ class Worker(threading.Thread):
         in-flight job's lane of that kind is alive with work left, slot or no slot."""
         if not lanes_mod.one_job_per_lane() or lane not in (LANE_ENRICHMENT, LANE_WHATSAPP):
             return False
+        # W200 (CRM T1440): the enrichment lane is spoken for once `enrich_slots()` jobs claim it (the
+        # owner raises `enrich_slots__<device>` on ASUS / MI); WhatsApp keeps one job per lane.
+        cap = max(1, lanes_mod.enrich_slots()) if lane == LANE_ENRICHMENT else 1
         with self._lock:
             pipes = [p for p in self._inflight.values() if p is not None]
+        claimed = 0
         for p in pipes:
             ln = getattr(p, "whatsapp" if lane == LANE_WHATSAPP else "enrichment", None)
             if ln is None or not ln.enabled() or ln.done.is_set():
@@ -685,7 +689,9 @@ class Worker(threading.Thread):
             try:
                 left = store.count_wa_pending(p.job_id) if lane == LANE_WHATSAPP else store.count_pending_enrichment(p.job_id)
                 if int(left) > 0:
-                    return True
+                    claimed += 1
+                    if claimed >= cap:
+                        return True
             except Exception:                                     # noqa: BLE001
                 continue
         return False

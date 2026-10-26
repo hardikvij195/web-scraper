@@ -36,9 +36,13 @@ def test_every_stage_gate_has_one_slot(monkeypatch):
     monkeypatch.setenv("LANE_SLOTS_ENRICHMENT", "3")
     monkeypatch.setenv("LANE_SLOTS_WHATSAPP", "4")
     assert L.one_job_per_lane()
-    assert L.enrich_slots() == 1 and L.wa_slots() == 1
+    # W200 (CRM T1440): the enrichment lane honours its slot knob under the rule; WhatsApp stays 1
+    assert L.enrich_slots() == 3 and L.wa_slots() == 1
     L.reset_stage_gates()
-    assert L.STAGE_GATES["enrichment"].slots == 1 and L.STAGE_GATES["whatsapp"].slots == 1
+    assert L.STAGE_GATES["enrichment"].slots == 3 and L.STAGE_GATES["whatsapp"].slots == 1
+    monkeypatch.delenv("LANE_SLOTS_ENRICHMENT")
+    assert L.enrich_slots() == 1                     # unset = one job per lane, as before
+    monkeypatch.setenv("LANE_SLOTS_ENRICHMENT", "3")
     monkeypatch.setenv("LANE_ONE_JOB_PER_LANE", "0")
     assert not L.one_job_per_lane()
     assert L.enrich_slots() == 3 and L.wa_slots() == 4

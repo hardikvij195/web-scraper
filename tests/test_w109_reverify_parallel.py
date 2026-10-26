@@ -95,7 +95,9 @@ def test_a_failed_slice_does_not_sink_the_others(setup, monkeypatch):
     monkeypatch.setattr(wa_verify, "verify_places", flaky)
     cloud = FakeCloud(rows)
     agent._reverify_wa(cloud, s, 1, leads_verify=True)
-    assert [c["account"] for c in calls] == ["a2"]
+    # W200: the pooled worker starts a beat later, so the W195 mid-job join may let spare a3 help
+    acc = [c["account"] for c in calls]
+    assert "a2" in acc and "a1" not in acc
     assert cloud.done_calls == [("done", None)]
 
 

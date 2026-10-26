@@ -276,6 +276,7 @@ class WaWorker:
         self.name = name
         self.session = WaSession()
         self._new_store = new_store
+        self.store_path: str | None = None
         self._q: "queue.Queue[Any]" = queue.Queue()
         self.thread = threading.Thread(target=self._loop, name=f"wa-{name}", daemon=True)
         self.thread.start()
@@ -284,6 +285,7 @@ class WaWorker:
         st = None
         try:
             st = self._new_store()
+            self.store_path = str(getattr(st, "path", "") or "") or None   # W200: pool key check
             while True:
                 item = self._q.get()
                 if item is None:
@@ -320,6 +322,158 @@ class WaWorker:
         self._q.put(None)
         if self.thread is not threading.current_thread():
             self.thread.join(timeout)
+
+
+#: W200 (CRM T1440): idle minutes after which a pooled WhatsApp browser is closed. CRM key
+#: `wa_keep_open_idle_min__<device>` (env `WA_KEEP_OPEN_IDLE_MIN__<DEVICE>`) > `WA_KEEP_OPEN_IDLE_MIN` > 10.
+#: 0 = close at the job boundary exactly as before W200.
+WA_KEEP_OPEN_IDLE_MIN = 10.0
+WA_POOL_REAP_SEC = 30.0
+
+
+def wa_keep_open_idle_min() -> float:
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env("WA_KEEP_OPEN_IDLE_MIN")
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw if raw is not None and str(raw).strip() else os.environ.get("WA_KEEP_OPEN_IDLE_MIN")
+    try:
+        return max(0.0, float(raw)) if raw is not None and str(raw).strip() else WA_KEEP_OPEN_IDLE_MIN
+    except ValueError:
+        return WA_KEEP_OPEN_IDLE_MIN
+
+
+class WaPool:
+    """W200 (CRM T1440): ONE `WaWorker` per account for the whole agent process, shared by every
+    WhatsApp job (live lane + CRM re-verify). W196 kept browsers open across batches but closed them
+    at the job boundary, so every small handed-off WhatsApp-only job (10–400 numbers, PC 26 Oct:
+    11 checks in 15 min) re-launched every account's Chrome and sat on WhatsApp Web's sync splash
+    (up to 360 s). Now a job end only RELEASES its workers; the next job on the same account reuses
+    the already-synced page. A worker is closed (on its own thread) when it has been idle for
+    `wa_keep_open_idle_min()`, when RAM is high for WhatsApp (W162 gate), when its account is paused
+    for a CRM command / probed / logged in (`drop`), or when its thread died. Two callers on one
+    account are serialised by the worker's own queue, so a Chrome profile is never opened twice.
+    Everything verify_places did per call (logged-out / QR detection, W131/W195 recycle, crash
+    relaunch) is unchanged — it still runs on every batch with the kept session."""
+
+    def __init__(self, *, now: Callable[[], float] = time.monotonic) -> None:
+        self._lock = threading.Lock()
+        self._workers: dict[str, WaWorker] = {}
+        self._busy: dict[str, int] = {}
+        self._last: dict[str, float] = {}
+        self._now = now
+        self._reaper: threading.Thread | None = None
+
+    def acquire(self, name: str, new_store: Callable[[], Any], path: Any = None) -> WaWorker:
+        """`name`'s pooled worker (a new one if none is alive). `path` = the caller's sqlite file: a
+        worker opened on another database (tests, a second checkout) is replaced, never shared."""
+        stale = None
+        with self._lock:
+            w = self._workers.get(name)
+            if (w is not None and path is not None and w.store_path is not None
+                    and str(path) != w.store_path and self._busy.get(name, 0) <= 0):
+                stale, w = self._workers.pop(name), None
+            if w is None or not w.thread.is_alive():
+                w = WaWorker(name, new_store)
+                self._workers[name] = w
+            else:
+                log.info("[%s] reusing the open WhatsApp browser from the previous job (W200)", name)
+            self._busy[name] = self._busy.get(name, 0) + 1
+            self._start_reaper()
+        if stale is not None:
+            stale.stop(timeout=0.0)
+        return w
+
+    def release(self, name: str) -> None:
+        with self._lock:
+            self._busy[name] = max(0, self._busy.get(name, 0) - 1)
+            self._last[name] = self._now()
+        if wa_keep_open_idle_min() <= 0:
+            self.reap()
+
+    def run(self, name: str, fn: Callable[[Any, "WaSession"], Any], new_store: Callable[[], Any],
+            path: Any = None) -> dict:
+        """Run `fn(store, session)` on `name`'s pooled worker and wait; returns the result box."""
+        w = self.acquire(name, new_store, path)
+        try:
+            box, done = w.run(fn)
+            done.wait()
+            return box
+        finally:
+            self.release(name)
+
+    def held(self) -> set[str]:
+        with self._lock:
+            return {n for n, w in self._workers.items() if w.thread.is_alive()}
+
+    def drop(self, name: str, why: str = "", *, wait: bool = True, if_idle: bool = False) -> bool:
+        """Close `name`'s pooled browser (after its current batch, on its own thread). `if_idle` =
+        leave a worker that is running a batch right now alone."""
+        with self._lock:
+            if if_idle and self._busy.get(name, 0) > 0:
+                return False
+            w = self._workers.pop(name, None)
+            self._busy.pop(name, None)
+            self._last.pop(name, None)
+        if w is None or not w.thread.is_alive():
+            return False
+        log.info("[%s] closing the pooled WhatsApp browser%s (W200)", name, f" — {why}" if why else "")
+        try:
+            w.stop(timeout=60.0 if wait else 0.0)
+        except Exception:                                         # noqa: BLE001
+            pass
+        return True
+
+    def close_idle(self, why: str = "") -> None:
+        for n in list(self.held()):
+            self.drop(n, why, if_idle=True)
+
+    def close_all(self, why: str = "", *, wait: bool = True) -> None:
+        for n in list(self.held()):
+            self.drop(n, why, wait=wait)
+
+    def reap(self, *, mem_high: bool | None = None) -> list[str]:
+        """Close idle workers past the idle limit (all idle ones while RAM is high). Never raises."""
+        try:
+            idle_sec = wa_keep_open_idle_min() * 60.0
+            if mem_high is None:
+                try:
+                    from webscraper.lanes import memory_high_for_whatsapp
+                    mem_high = bool(memory_high_for_whatsapp())
+                except Exception:                                 # noqa: BLE001
+                    mem_high = False
+            now = self._now()
+            with self._lock:
+                dead = [n for n, w in self._workers.items() if not w.thread.is_alive()]
+                for n in dead:
+                    self._workers.pop(n, None)
+                idle = [n for n in self._workers if self._busy.get(n, 0) <= 0
+                        and (mem_high or now - self._last.get(n, now) >= idle_sec)]
+            for n in idle:
+                self.drop(n, "RAM high" if mem_high else f"idle {int(idle_sec // 60)} min", wait=False)
+            return idle
+        except Exception:                                         # noqa: BLE001
+            log.debug("WhatsApp pool reap failed", exc_info=True)
+            return []
+
+    def _start_reaper(self) -> None:
+        if self._reaper is not None and self._reaper.is_alive():
+            return
+
+        tick = threading.Event()          # never time.sleep: tests patch it to a no-op (busy loop)
+
+        def loop() -> None:
+            while True:
+                tick.wait(WA_POOL_REAP_SEC)
+                self.reap()
+
+        self._reaper = threading.Thread(target=loop, name="wa-pool-reaper", daemon=True)
+        self._reaper.start()
+
+
+#: W200: the process-wide pool.
+POOL = WaPool()
 
 
 def is_crashed(e: BaseException) -> bool:
@@ -577,6 +731,7 @@ def with_lane_paused(name: str, fn: Callable[[], Any], *, wait_sec: float = WA_P
     evict = evict or (lambda n: _br.kill_profile_holder(raw, "wa command while a lane held it"))
     _PAUSED.add(name)
     try:
+        POOL.drop(name, "paused for a CRM WhatsApp command", wait=False)   # W200: free the profile
         deadline = now() + wait_sec
         waited = False
         while in_use(name) and now() < deadline:
@@ -856,6 +1011,7 @@ def login(name: str, *, busy: bool = False) -> bool:
     if busy:
         return with_lane_paused(name, lambda: login(name))
     Store().add_wa_account(name)
+    POOL.drop(name, "login window", if_idle=True)               # W200
     _LOGIN_ACTIVE.add(name)
     ok = False
     try:
@@ -1002,6 +1158,7 @@ def account_status(name: str) -> str:
     if _wa_off():                                                 # W184: no WhatsApp Chrome here
         log.info("WhatsApp probe for %r skipped — WhatsApp is switched off on this machine (wa_off, W184)", name)
         return "unknown"
+    POOL.drop(name, "status probe", if_idle=True)               # W200: an idle pooled browser holds the profile
     mark_profile_clean(profile_dir(name))
     with sync_playwright() as pw:
         # W88: the installed Chrome in new-headless mode — headless CHROMIUM never rendered

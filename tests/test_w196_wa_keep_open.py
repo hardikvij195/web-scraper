@@ -303,5 +303,9 @@ def test_parallel_lane_keeps_one_worker_per_account(db, monkeypatch):
         mine = [s for s in seen if s[0] == acc]
         assert len(mine) == 3, seen
         assert len({s[1] for s in mine}) == 1 and len({s[2] for s in mine}) == 1   # same session + thread
-    assert len(RecSession.made) == 2 and all(s.closed == 1 for s in RecSession.made)
+    # W200 (CRM T1440): the lane end hands the browsers back to the process pool — still open
+    assert len(RecSession.made) == 2 and all(s.closed == 0 for s in RecSession.made)
     assert lane._wa_workers is None
+    assert {"a1", "a2"} <= wa_verify.POOL.held()
+    wa_verify.POOL.close_all("test")
+    assert all(s.closed == 1 for s in RecSession.made)

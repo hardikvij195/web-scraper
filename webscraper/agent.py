@@ -2099,7 +2099,9 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # W186: per-machine manual lane pause (`lane_pause__<device>`)
                             "LANE_PAUSE",
                             # W194 (CRM T1344-b): per-machine memory start limit (`memory_start_max_pct__<device>`)
-                            "MEMORY_START_MAX_PCT__")
+                            "MEMORY_START_MAX_PCT__",
+                            # W200 (CRM T1440): parallel websites per job + pooled WhatsApp idle close
+                            "ENRICH_CONCURRENCY__", "WA_KEEP_OPEN_IDLE_MIN")
 
 #: W186: the lane-pause knob alone is re-read this often (the CRM switch should bite within ~1 min;
 #: the other knobs keep the 5-min cadence).
@@ -2614,8 +2616,16 @@ def _verify_slices(store: Store, targets: list[dict], accounts: list[str], onp, 
             with lock:
                 active.add(name)
             try:
-                results.append(wa_verify.verify_places(st, feed, on_progress=onp, should_stop=should_stop,
-                                                       job_id=None, account=name))
+                # W200 (CRM T1440): run on the account's POOLED worker — its browser stays open (and
+                # synced) after this job for the next WhatsApp job on this machine.
+                def _fn(wst, sess, _name=name):
+                    _SLICE_STORE.st = wst
+                    return wa_verify.verify_places(wst, feed, on_progress=onp, should_stop=should_stop,
+                                                   job_id=None, account=_name, session=sess)
+                box = wa_verify.POOL.run(name, _fn, lambda: Store(store.path), store.path)
+                if "error" in box:
+                    raise box["error"]
+                results.append(box["result"])
             except sqlite3.OperationalError as e:
                 # W198 (CRM T1391): "database is locked" (ASUS / DELL, 25 Oct) is contention, never the
                 # account — the session restarts on the same account instead of ending the slice.
@@ -3006,6 +3016,7 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
         else:
             # job_id=None → verify_places won't touch the local store's places (they aren't
             # here); `store` is still used for WA account rotation + daily caps.
+            wa_verify.POOL.close_idle("single-session re-verify needs the profiles")   # W200
             res = wa_verify.verify_places(store, targets, on_progress=onp, should_stop=stop_ev.is_set, job_id=None)
     except wa_verify.WaNotLoggedIn as e:
         # W191: the session died (all accounts logged out / relink / stuck syncing). Keep every verdict

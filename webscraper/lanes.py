@@ -129,6 +129,12 @@ def wa_reprobe_force_min() -> float:
         return WA_REPROBE_FORCE_MIN
 
 
+def wa_verify_pool():
+    """W200: the process-wide WhatsApp browser pool (lazy import — wa_verify imports Playwright)."""
+    from webscraper import wa_verify
+    return wa_verify.POOL
+
+
 def reprobe_disabled(store: Store, note: Callable[[str, str], None] | None = None,
                      skip: set[str] | None = None) -> list[str]:
     """W198 (CRM T1391): probe every `disabled=1` account with no QR proof (`unproven_disabled_wa_accounts`)
@@ -637,15 +643,28 @@ PARK_GRACE_SEC = 20.0
 def enrich_slots() -> int:
     """W135: jobs whose enrichment lane may run at once on this machine. CRM setting
     `enrich_slots__<device>` (default 2, clamped 1..3); `LANE_SLOTS_ENRICHMENT` in .env
-    is the local override. W153: always 1 under the one-job-per-lane rule."""
-    if one_job_per_lane():
-        return 1
+    is the local override. W153: 1 under the one-job-per-lane rule — W200 (CRM T1440, owner: "increase
+    the website enrichment slots for asus and mi"): the rule now honours `enrich_slots__<device>` (clamp
+    1..3, default 1) for the enrichment lane only; Maps and WhatsApp keep one job per lane."""
+    rule = one_job_per_lane()
     raw = os.getenv("LANE_SLOTS_ENRICHMENT") or _device_env("ENRICH_SLOTS")
+    dflt = 1 if rule else 2
     try:
-        n = int(raw) if raw else 2
+        n = int(float(raw)) if raw else dflt
     except ValueError:
-        n = 2
+        n = dflt
     return max(1, min(3, n))
+
+
+#: W200 (CRM T1440): parallel websites inside ONE enrichment job. CRM `enrich_concurrency__<device>`
+#: (env `ENRICH_CONCURRENCY__<DEVICE>`, read live) > `ENRICH_CONCURRENCY` (config, default 5); clamp 1..20.
+def enrich_concurrency() -> int:
+    raw = _device_env("ENRICH_CONCURRENCY")
+    try:
+        n = int(float(raw)) if raw is not None and str(raw).strip() else int(settings.enrich_concurrency)
+    except (ValueError, TypeError):
+        n = int(settings.enrich_concurrency or 5)
+    return max(1, min(20, n))
 
 
 def wa_slots() -> int:
@@ -1205,7 +1224,9 @@ class EnrichmentLane(Lane):
                 return R_STOPPED
             if not self._pause_wait():                                  # W186
                 return R_STOPPED
-            batch = store.pending_enrichment(self.job_id, ENRICH_BATCH)
+            conc = enrich_concurrency()                                 # W200: live per-device knob
+            batch_n = max(ENRICH_BATCH, conc)
+            batch = store.pending_enrichment(self.job_id, batch_n)
             if batch and scope_mode == "wa_missing":
                 # "Only those whose WhatsApp is not found or verified": a lead that already
                 # has a verified WhatsApp needs no website; settle it and crawl the rest.
@@ -1292,13 +1313,13 @@ class EnrichmentLane(Lane):
                            + (" …" if len(batch) > 10 else ""))
             store.update_job(self.job_id, enrich_active=len(batch))
             try:
-                asyncio.run(enrich_places(store, batch, None, self.job.get("country"),
+                asyncio.run(enrich_places(store, batch, conc, self.job.get("country"),
                                           on_progress, self.stopped,
                                           headless=None if hl is None else bool(hl)))
             finally:
                 store.update_job(self.job_id, enrich_active=0)
             still_pending = {r["place_key"] for r in
-                             store.pending_enrichment(self.job_id, ENRICH_BATCH)}
+                             store.pending_enrichment(self.job_id, batch_n)}
             if before & still_pending:
                 stuck += 1
                 if stuck >= 3:
@@ -1428,9 +1449,11 @@ class WhatsAppLane(Lane):
                 sess.close()
             except Exception:                                     # noqa: BLE001
                 pass
-        for w in workers.values():
+        for nm in workers:
+            # W200 (CRM T1440): hand the account's browser back to the process pool instead of closing
+            # it — the next WhatsApp job on this machine reuses the synced page (idle close: 10 min).
             try:
-                w.stop()
+                wa_verify_pool().release(nm)
             except Exception:                                     # noqa: BLE001
                 pass
 
@@ -1599,10 +1622,14 @@ class WhatsAppLane(Lane):
                     workers = self._wa_workers or {}
                     want_names = list(accounts[:n])
                     for nm in [k for k in workers if k not in want_names]:
-                        workers.pop(nm).stop()
+                        workers.pop(nm)
+                        wa_verify.POOL.release(nm)                  # W200: back to the pool
                     for nm in want_names:
                         if nm not in workers or not workers[nm].thread.is_alive():
-                            workers[nm] = wa_verify.WaWorker(nm, self.ctl.new_store)
+                            if nm in workers:
+                                wa_verify.POOL.release(nm)
+                            workers[nm] = wa_verify.POOL.acquire(nm, self.ctl.new_store,
+                                                                 getattr(self.store, "path", None))
                     self._wa_workers = workers
 
                     def run_slice(name):
@@ -1638,6 +1665,7 @@ class WhatsAppLane(Lane):
                     if self._wa_workers:
                         self._close_wa("back to one WhatsApp session")   # W196: free the profiles
                     if self._wa_session is None:
+                        wa_verify.POOL.close_idle("single-session rotation needs the profiles")   # W200
                         self._wa_session = wa_verify.WaSession()
                     res = wa_verify.verify_places(store, batch, on_wa, self.stopped,
                                                   job_id=self.job_id, headless=hl,
