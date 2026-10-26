@@ -2882,13 +2882,21 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
                  "started_at": None, "ended_at": None, "ok": None, "reason": "disabled",
                  "ran_sec": None} for k in ("discovery", "enrichment")]
         return {"wa_verify_total": total, "wa_verify_done": done,
-                "eta_sec": eta_sec, "phase_eta_sec": eta_sec, "estimating": eta_sec is None,
+                "eta_sec": eta_sec, "phase_eta_sec": eta_sec,
+                "estimating": (eta_sec is None) and not ended,
                 "lanes": idle + [wa_lane],
+                # W201 (CRM T1445): the phase closes with the lane. Its status was hard-coded
+                # "running", so EVERY re-verify left `lead_gen_jobs.phase = 'verifying_wa'` with a
+                # phase that said "running" for ever — even the final report. 12 jobs on 2 - MAC sat
+                # in `incomplete` with a running WhatsApp phase (#22646, #22650, 2026-10-27) and the
+                # CRM monitor never touches those. `reason` + `pending` say what was left.
                 "phases": [{"key": "verifying_wa", "label": eta.LABELS["verifying_wa"],
-                            "unit": eta.UNITS["verifying_wa"], "status": "running",
+                            "unit": eta.UNITS["verifying_wa"],
+                            "status": wa_lane["status"],
                             "done": done, "total": total, "total_is_min": False,
                             "eta_sec": eta_sec, "lane": "whatsapp",
-                            "estimating": eta_sec is None, "rate_source": src}]}
+                            "estimating": (eta_sec is None) and not ended, "rate_source": src,
+                            "reason": reason, "pending": wa_lane["pending"]}]}
 
     cloud.progress(jid, "verifying_wa", wa_progress(0))
     collected: dict[str, str] = {}
@@ -3025,12 +3033,13 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
         # numbers that never got a verdict (nothing unchecked is ever written as 'no').
         _flush_unsent()
         n_checked = _n_checked()
-        _jlog(f"WhatsApp session lost after {n_checked} number(s) — {max(0, total - n_checked)} left for a re-run: {e}",
+        n_left = max(0, total - n_checked)
+        _jlog(f"WhatsApp session lost after {n_checked} number(s) — {n_left} left for a re-run: {e}",
               "warn")
         _crm_retry(lambda: cloud.progress(jid, "verifying_wa", wa_progress(n_checked, "wa_not_logged_in")),
                    f"re-verify #{jid}: session-lost progress")
         _crm_retry(lambda: cloud.done(jid, "done", f"WhatsApp session lost after {n_checked} numbers — "
-                                                    f"{max(0, total - n_checked)} left: {e}"[:200]),
+                                                    f"{n_left} left: {e}"[:200]),
                    f"re-verify #{jid}: done (session lost)")
         return
     except Exception as e:  # noqa: BLE001
@@ -3043,9 +3052,16 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
     store.record_phase_rate(None, "verifying_wa", n_checked, time.monotonic() - started)
     if collected:
         # W191: a place whose live flush failed goes again as its full row (number + history).
-        _crm_retry(lambda: cloud.set_wa(jid, [last_upd[k] if k in unsent and k in last_upd
-                                              else {"place_key": k, "wa_verified": v} for k, v in collected.items()]),
-                   f"re-verify #{jid}: final set_wa")
+        # W201: and it may NOT abandon the run — every verdict here was already flushed live after
+        # its own check, so a dead network on this one call must not skip the phase close below and
+        # leave the job in `incomplete` with a "running" WhatsApp phase.
+        try:
+            _crm_retry(lambda: cloud.set_wa(jid, [last_upd[k] if k in unsent and k in last_upd
+                                                  else {"place_key": k, "wa_verified": v}
+                                                  for k, v in collected.items()]),
+                       f"re-verify #{jid}: final set_wa")
+        except httpx.HTTPError as e:
+            log.warning("re-verify #%s: final set_wa failed: %s — closing the phase anyway", jid, e)
     capped = bool(res.get("capped")) if isinstance(res, dict) else False
     stopped = stop_ev.is_set()
     why = stop_why[0] or (_REVERIFY.get("why") if own is not None else None) or "parked"
@@ -3054,8 +3070,11 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
     dropped = int(res.get("dropped", 0) or 0) if isinstance(res, dict) else 0
     reason = "stopped" if stopped else ("wa_daily_cap" if capped else ("wa_not_logged_in" if dropped else "completed"))
     left = max(0, total - n_checked)
+    # The phase MUST close, so this call retries like the other closing ones (W189) instead of being
+    # dropped on one blip — a lost final report is how a phase stays "running" for days.
     try:
-        cloud.progress(jid, "verifying_wa", wa_progress(n_checked, reason))
+        _crm_retry(lambda: cloud.progress(jid, "verifying_wa", wa_progress(n_checked, reason)),
+                   f"re-verify #{jid}: final progress")
     except httpx.HTTPError as e:
         log.warning("re-verify #%s: final progress failed: %s", jid, e)
     if stopped:
