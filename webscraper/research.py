@@ -196,6 +196,41 @@ _PROVIDERS: list[tuple[str, str, str, str]] = [
 ]
 
 
+#: Providers whose one key spans a FREE and a PAID catalogue that differ only by a
+#: model-id suffix — drop the suffix and the owner's card is billed. Owner directive
+#: 2026-10-27, verbatim: "use my open router key on free open models only" (the key sat
+#: at $8.04 of a $10 limit), so a paid id must be IMPOSSIBLE to send, not just unlikely.
+_FREE_ONLY_SUFFIX: dict[str, str] = {"openrouter": ":free"}
+
+
+def _resolve_model(name: str, default: str) -> tuple[str | None, str | None]:
+    """Resolve the model id a provider will be called with -> (model, skip_reason).
+
+    Single resolution point for EVERY caller: the CRM setting (it reaches the agent as
+    AI_RESEARCH_MODEL_<NAME>, e.g. `ai_research_model_openrouter`), a manual env
+    override and the hard-coded default in `_PROVIDERS` all come through here, so the
+    free-only guard cannot be bypassed by changing a setting. A rejected provider is
+    skipped and the chain moves on to the next FREE provider exactly as it does on an
+    HTTP failure; a missing/blank id is rejected too (no guessed default). Only the
+    model ID is ever logged, never a key.
+    """
+    model = (os.getenv(f"AI_RESEARCH_MODEL_{name.upper()}") or default or "").strip()
+    suffix = _FREE_ONLY_SUFFIX.get(name)
+    if suffix is None:
+        return (model or None), (None if model else f"{name}: no model id configured")
+    if not model:
+        reason = (f"{name}: skipped — no model id configured and a free-only provider gets "
+                  f"no guessed default (protecting the owner's credit limit)")
+        log.warning("%s", reason)
+        return None, reason
+    if not model.endswith(suffix):
+        reason = (f"{name}: skipped — model '{model}' is not a '{suffix}' model, so the request "
+                  f"was NOT sent (protecting the owner's credit limit); set a '{suffix}' model id "
+                  f"in Lead Finder -> AI APIs")
+        log.warning("%s", reason)
+        return None, reason
+    return model, None
+
 def _provider_order() -> list[str]:
     raw = os.getenv("AI_RESEARCH_PROVIDERS") or "gemini," + ",".join(p[0] for p in _PROVIDERS)
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
@@ -266,6 +301,7 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
     are cooling down after a 429 or were rejected with 401/403 earlier in this process);
     the next provider is only reached when every key of this one failed."""
     tried = 0
+    skipped: str | None = None
     attempts: list[dict[str, Any]] = []
     for name in _provider_order():
         keys = _keys_for(name)
@@ -274,6 +310,16 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
         spec = None if name == "gemini" else next((p for p in _PROVIDERS if p[0] == name), None)
         if name != "gemini" and spec is None:
             continue
+        model = None
+        if spec is not None:
+            # Key-independent, so resolved once per provider — and it is the gate the
+            # free-only guard sits behind (see _resolve_model).
+            model, skip_reason = _resolve_model(name, spec[3])
+            if model is None:
+                skipped = skip_reason
+                errors["error"] = skip_reason
+                attempts.append(_usage_row(name, None, False, None, skip_reason))
+                continue
         for idx, key in enumerate(keys, start=1):
             if not _key_usable(name, idx):
                 continue
@@ -281,7 +327,6 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
             if name == "gemini":
                 data, usage = await _ask_gemini(client, key, prompt, errors, key_index=idx)
             else:
-                model = os.getenv(f"AI_RESEARCH_MODEL_{name.upper()}") or spec[3]
                 data, usage = await _ask_openai_compat(client, name, key, spec[2], model, prompt, errors, key_index=idx)
             attempts.append(usage)
             if data:
@@ -289,8 +334,8 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
                 return data, attempts
             _note_key_result(name, idx, usage.get("status_code"))
     if tried == 0:
-        errors["error"] = ("no AI key configured" if not available_providers()
-                           else "every AI key is cooling down (429) or was rejected (401/403)")
+        errors["error"] = (skipped or ("no AI key configured" if not available_providers()
+                           else "every AI key is cooling down (429) or was rejected (401/403)"))
     else:
         errors["gemini_failed"] = errors.get("gemini_failed", 0) + 1   # counts "all providers failed"
     return None, attempts

@@ -157,3 +157,81 @@ def test_available_providers_needs_only_key_one(clean_env):
     clean_env.setenv("GROQ_API_KEY_2", "orphan")      # no GROQ_API_KEY → groq has no keys
     clean_env.setenv("OPENAI_API_KEY", "o1")
     assert research.available_providers() == ["openai"]
+
+
+# --- free-models-only guard on OpenRouter (owner directive 2026-10-27) -------------
+# OpenRouter's one key spans a free and a paid catalogue separated only by the ':free'
+# suffix, and the owner's key sits near its spend limit, so a non-':free' id must never
+# leave the process. The guard lives in research._resolve_model and the chain treats a
+# rejection like any other provider failure: on to the next FREE provider.
+
+def test_openrouter_free_model_is_sent(clean_env):
+    clean_env.setenv("AI_RESEARCH_PROVIDERS", "openrouter")
+    clean_env.setenv("OPENROUTER_API_KEY", "or1")
+    clean_env.setenv("AI_RESEARCH_MODEL_OPENROUTER", "nvidia/nemotron-3-ultra-550b-a55b:free")
+    client = FakeClient(lambda key: 200)
+
+    data, attempts, errors = _ask(client)
+
+    assert data == {"summary": "ok by or1"}
+    assert client.calls == ["or1"]
+    assert attempts[0]["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert errors["provider"] == "openrouter"
+
+
+def test_openrouter_paid_model_is_refused_and_chain_moves_to_free_providers(clean_env):
+    clean_env.setenv("AI_RESEARCH_PROVIDERS", "openrouter,groq,cerebras")
+    clean_env.setenv("OPENROUTER_API_KEY", "or1")
+    clean_env.setenv("AI_RESEARCH_MODEL_OPENROUTER", "openai/gpt-4o")
+    clean_env.setenv("GROQ_API_KEY", "g1")
+    clean_env.setenv("CEREBRAS_API_KEY", "c1")
+    client = FakeClient(lambda key: 500 if key == "g1" else 200)
+
+    data, attempts, errors = _ask(client)
+
+    assert "or1" not in client.calls                   # no request was ever sent
+    assert client.calls == ["g1", "c1"]                # groq first, then cerebras
+    assert data == {"summary": "ok by c1"}
+    assert [(a["provider"], a["ok"]) for a in attempts] == [
+        ("openrouter", False), ("groq", False), ("cerebras", True)]
+    assert "openai/gpt-4o" in attempts[0]["error"] and ":free" in attempts[0]["error"]
+
+
+def test_openrouter_blank_model_is_refused(clean_env):
+    clean_env.setenv("AI_RESEARCH_PROVIDERS", "openrouter")
+    clean_env.setenv("OPENROUTER_API_KEY", "or1")
+    clean_env.setenv("AI_RESEARCH_MODEL_OPENROUTER", "   ")
+    client = FakeClient(lambda key: 200)
+
+    data, attempts, errors = _ask(client)
+
+    assert data is None and client.calls == []
+    assert attempts[0]["provider"] == "openrouter" and attempts[0]["ok"] is False
+    assert "openrouter" in errors["error"]
+
+
+def test_openrouter_guard_never_falls_through_to_a_paid_provider_choice(clean_env):
+    # openai is configured but PAID: the guard must not turn an OpenRouter rejection
+    # into an OpenAI call when a free provider is available.
+    clean_env.setenv("AI_RESEARCH_PROVIDERS", "openrouter,groq,openai")
+    clean_env.setenv("OPENROUTER_API_KEY", "or1")
+    clean_env.setenv("AI_RESEARCH_MODEL_OPENROUTER", "anthropic/claude-3.5-sonnet")
+    clean_env.setenv("GROQ_API_KEY", "g1")
+    clean_env.setenv("OPENAI_API_KEY", "o1")
+    client = FakeClient(lambda key: 200)
+
+    data, _, errors = _ask(client)
+
+    assert client.calls == ["g1"] and "o1" not in client.calls
+    assert data == {"summary": "ok by g1"} and errors["provider"] == "groq"
+
+
+def test_resolve_model_guard_is_the_single_resolution_point(clean_env):
+    # the hard-coded default in _PROVIDERS must pass the same gate as a CRM setting
+    default = next(p[3] for p in research._PROVIDERS if p[0] == "openrouter")
+    assert default.endswith(":free")
+    assert research._resolve_model("openrouter", default) == (default, None)
+    model, reason = research._resolve_model("openrouter", "openai/gpt-4o")
+    assert model is None and "openai/gpt-4o" in reason
+    # a non-guarded provider is untouched
+    assert research._resolve_model("groq", "openai/gpt-oss-20b") == ("openai/gpt-oss-20b", None)
