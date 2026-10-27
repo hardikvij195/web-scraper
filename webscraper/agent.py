@@ -1423,6 +1423,7 @@ def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> 
         log.warning("config fetch failed (continuing with local .env): %s", e)
     _apply_stage_slots()                                          # W135
     log.info("agent up (%s) — polling %s every %ss", kind, base, poll_sec)
+    _IDLE_WD["offer"] = time.monotonic()                              # W201
     # local job id -> highest places.rowid already streamed up. In memory only: after a
     # restart it starts at 0 and re-sends that job's rows once, which upsert absorbs.
     synced_upto: dict[int, int] = {}
@@ -1524,6 +1525,7 @@ def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> 
             _loop_wd_mark("attempt")
             _tick(cloud, store, kind, synced_upto)
             _loop_wd_mark("ok")                                   # W142: `_tick` carries the heartbeat
+            _warn_if_starved()                                    # W201
         except httpx.HTTPError as e:
             _loop_wd_mark("err")
             log.warning("cloud unreachable: %s", e)
@@ -1682,6 +1684,55 @@ def _start_loop_watchdog() -> threading.Thread | None:
     t.start()
     log.info("loop watchdog armed: restart after %ds without a heartbeat", int(limit))
     return t
+
+#: W201 (CRM T1451, 2026-10-27): "offered nothing" silence. `3 - ASUS` / `5 - MI` polled the CRM for
+#: 30+ min with 40 / 28 jobs pinned to them and logged NOTHING after their startup banner: the loop was
+#: alive the whole time (its heartbeat and 5-min self-check kept arriving) but `jobs` came back empty on
+#: every call, because the CRM classifies those re-enrich jobs as WhatsApp-next from the PREVIOUS run's
+#: `progress.lanes` and withholds a WhatsApp-next job from a machine whose `wa_free` is false — which is
+#: every machine with its whatsapp lane paused (`lane_pause__<device>`). Nothing here can make the CRM
+#: offer that work, but an idle machine that has been offered nothing for this long now says so, with the
+#: lane flags the CRM decides on, instead of looking hung. Seconds; 0 = off.
+IDLE_STARVE_SEC = float(os.environ.get("AGENT_IDLE_STARVE_SEC", "900") or 0)
+#: monotonic(): the last `jobs` answer that contained at least one job, and the last warning.
+_IDLE_WD = {"offer": 0.0, "warn": 0.0}
+
+
+def _starve_due(now: float, last_offer: float, last_warn: float, limit: float) -> bool:
+    """Pure: should the starvation warning go out? Only once per `limit`, and never before the
+    first `jobs` answer has been seen (`last_offer` is stamped when the loop starts)."""
+    if limit <= 0 or last_offer <= 0:
+        return False
+    return (now - last_offer) >= limit and (now - last_warn) >= limit
+
+
+def _warn_if_starved(srv_mod=None) -> None:
+    """W201: log loudly while this machine is idle and the CRM keeps offering it nothing."""
+    worker = getattr(srv_mod or srv, "worker", None)
+    try:
+        if worker is not None and (worker.current_job is not None
+                                  or getattr(worker, "inflight_jobs", lambda: [])()):
+            _IDLE_WD["offer"] = time.monotonic()                  # working, not starved
+            return
+    except Exception:                                             # noqa: BLE001
+        return
+    now = time.monotonic()
+    if not _starve_due(now, _IDLE_WD["offer"], _IDLE_WD["warn"], IDLE_STARVE_SEC):
+        return
+    _IDLE_WD["warn"] = now
+    cap: dict = {}
+    try:
+        cap = worker.capacity() if worker is not None else {}
+    except Exception:                                             # noqa: BLE001
+        cap = {}
+    log.warning("idle: the CRM has offered this machine no job for %d min while it is polling normally "
+                "— maps_free=%s enrich_free=%s wa_free=%s lanes_paused=%s inflight=%s/%s. A job the CRM "
+                "reads as WhatsApp-next is never offered to a machine with wa_free=false (W201), so check "
+                "this machine's queue on the CRM and its lane_pause setting.",
+                int((now - _IDLE_WD["offer"]) // 60), cap.get("maps_free"), cap.get("enrich_free"),
+                cap.get("wa_free"), ",".join(cap.get("lanes_paused") or []) or "none",
+                cap.get("inflight"), cap.get("max_inflight"))
+
 
 #: The one command thread allowed at a time (a second QR window would only confuse).
 _cmd_thread = None
@@ -3381,7 +3432,10 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
                              # one seen here is the right one; claiming more than one per
                              # tick let a low-priority job jump ahead of one added between
                              # ticks with a higher number.
-    for cj in (cloud.jobs() if (kind != "crm" or _jobs_due()) else []):   # T1348-b: x-lf-next-poll
+    offered = cloud.jobs() if (kind != "crm" or _jobs_due()) else []   # T1348-b: x-lf-next-poll
+    if offered:
+        _IDLE_WD["offer"] = time.monotonic()                          # W201
+    for cj in offered:
         # On-demand WhatsApp re-verify: no scrape/enrich — fetch the job's existing
         # results, check each number, write wa_verified back. CRM-only. Checked BEFORE
         # the `mirrored` guard because a re-verify targets a job that was ALREADY
