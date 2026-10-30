@@ -3054,32 +3054,40 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
         elif agg == "no" and not leads_verify and src_by_pk.get(pk) in ("unverified", "assumed_mobile"):
             upd["whatsapp_number"] = None
             upd["whatsapp_source"] = None
+        # W206 (CRM T1476): the verdict is registered as unsent BEFORE any CRM call and written
+        # FIRST — a failed `progress` used to skip both, so that verdict reached the CRM only via the
+        # end-of-run bulk flush (lost on any restart / early end). Progress follows the write.
+        last_upd[pk] = upd
+        unsent.add(pk)
+        try:
+            cloud.set_wa(jid, [upd])
+            unsent.discard(pk)
+        except httpx.HTTPError as e:
+            log.warning("re-verify #%s: set_wa failed (kept for a re-send): %s", jid, e)
         # Flush after EVERY check so the CRM's progress bar + ✓/✗ badges move live.
         try:
             if cloud.progress(jid, "verifying_wa", wa_progress(_n_checked())) and not stop_ev.is_set():
                 stop_why[0] = "cancelled"
                 stop_ev.set()
-            last_upd[pk] = upd
-            unsent.add(pk)
-            cloud.set_wa(jid, [upd])
-            unsent.discard(pk)
         except httpx.HTTPError as e:
-            log.warning("re-verify #%s: progress/set_wa failed: %s", jid, e)
+            log.warning("re-verify #%s: progress failed: %s", jid, e)
 
     def _flush_unsent() -> None:
         """W191: re-send every verdict whose live set_wa failed (full row, not just the verdict)."""
         with _onp_lock:
             rows = [last_upd[k] for k in list(unsent) if k in last_upd]
-        if not rows:
-            return
-        try:
-            _crm_retry(lambda: cloud.set_wa(jid, rows), f"re-verify #{jid}: re-send {len(rows)} verdict(s)")
-        except Exception as e:  # noqa: BLE001 — never let the safety net mask the real exit
-            log.warning("re-verify #%s: re-sending %d verdict(s) failed: %s", jid, len(rows), e)
-            return
-        with _onp_lock:
-            for r in rows:
-                unsent.discard(r["place_key"])
+        # W206: in chunks — one 5,000-row set_wa (the old end-of-run bulk flush) ran past the Edge
+        # Function's time limit, so none of it landed.
+        for i in range(0, len(rows), SET_WA_CHUNK):
+            part = rows[i:i + SET_WA_CHUNK]
+            try:
+                _crm_retry(lambda: cloud.set_wa(jid, part), f"re-verify #{jid}: re-send {len(part)} verdict(s)")
+            except Exception as e:  # noqa: BLE001 — never let the safety net mask the real exit
+                log.warning("re-verify #%s: re-sending %d verdict(s) failed: %s", jid, len(part), e)
+                continue
+            with _onp_lock:
+                for r in part:
+                    unsent.discard(r["place_key"])
 
     def onp(pk: str, status: str, num: str | None = None, source: str | None = None) -> None:
         with _onp_lock:
@@ -3097,18 +3105,38 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
     accounts = [a for a in accounts if a not in _out] or accounts
     n_par = max(1, min(_wa_parallel(), len(accounts)))
 
-    try:
+    def _run(tg: list[dict]) -> Any:
         # W195: parallel mode whenever this machine allows >1 session — with one account linked at the
         # start, an account linked later can still join the queue (the rotating path never could).
-        if _wa_parallel() > 1 and accounts and len(targets) > 1:
+        if _wa_parallel() > 1 and accounts and len(tg) > 1:
             _jlog(f"{n_par} WhatsApp sessions in parallel — {', '.join(accounts[:n_par])}")
             log.info("re-verify #%s: %d parallel sessions (%s)", jid, n_par, ", ".join(accounts[:n_par]))
-            res = _verify_slices(store, targets, accounts[:n_par], onp, should_stop=stop_ev.is_set)
-        else:
-            # job_id=None → verify_places won't touch the local store's places (they aren't
-            # here); `store` is still used for WA account rotation + daily caps.
-            wa_verify.POOL.close_idle("single-session re-verify needs the profiles")   # W200
-            res = wa_verify.verify_places(store, targets, on_progress=onp, should_stop=stop_ev.is_set, job_id=None)
+            return _verify_slices(store, tg, accounts[:n_par], onp, should_stop=stop_ev.is_set)
+        # job_id=None → verify_places won't touch the local store's places (they aren't
+        # here); `store` is still used for WA account rotation + daily caps.
+        wa_verify.POOL.close_idle("single-session re-verify needs the profiles")   # W200
+        return wa_verify.verify_places(store, tg, on_progress=onp, should_stop=stop_ev.is_set, job_id=None)
+
+    try:
+        res = _run(targets)
+        # W206 (CRM T1476): the CRM keeps a FIRST 'no' undecided (T1441 trigger
+        # lead_gen_results_wa_no_2x: wa_verified stays NULL, the number is tagged 'no_once') until a
+        # second look. Without that look in the run, about half a pool job's checks never settled a
+        # row and the job still ended 'done'. Every such number gets its second look here, at the end
+        # of the queue (hours after the first on a big job), so the run leaves its rows decided.
+        r0d = res if isinstance(res, dict) else {}
+        if (not leads_verify and not stop_ev.is_set() and not r0d.get("capped")
+                and not int(r0d.get("dropped", 0) or 0)):
+            with _onp_lock:
+                again = second_look_targets(checks, name_by_pk)
+            if again:
+                total += len(again)
+                _jlog(f"second look: {len(again)} number(s) said 'no' once — checking them again "
+                      f"(2 looks before a 'no', T1441)")
+                log.info("re-verify #%s: second look for %d first-'no' number(s) (W206)", jid, len(again))
+                res2 = _run(again)
+                if isinstance(res2, dict):
+                    res = {**r0d, "capped": bool(res2.get("capped")), "dropped": int(res2.get("dropped", 0) or 0)}
     except wa_verify.WaNotLoggedIn as e:
         # W191: the session died (all accounts logged out / relink / stuck syncing). Keep every verdict
         # already checked, then end like the live lane does — `wa_not_logged_in` with the rest still
@@ -3133,18 +3161,13 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
     # Feed the rolling average so the next verify run can be estimated (W4).
     n_checked = _n_checked()
     store.record_phase_rate(None, "verifying_wa", n_checked, time.monotonic() - started)
-    if collected:
-        # W191: a place whose live flush failed goes again as its full row (number + history).
-        # W201: and it may NOT abandon the run — every verdict here was already flushed live after
-        # its own check, so a dead network on this one call must not skip the phase close below and
-        # leave the job in `incomplete` with a "running" WhatsApp phase.
-        try:
-            _crm_retry(lambda: cloud.set_wa(jid, [last_upd[k] if k in unsent and k in last_upd
-                                                  else {"place_key": k, "wa_verified": v}
-                                                  for k, v in collected.items()]),
-                       f"re-verify #{jid}: final set_wa")
-        except httpx.HTTPError as e:
-            log.warning("re-verify #%s: final set_wa failed: %s — closing the phase anyway", jid, e)
+    # W191: a place whose live flush failed goes again as its full row (number + history).
+    # W201: and it may NOT abandon the run (`_flush_unsent` never raises).
+    # W206 (CRM T1476): ONLY the unsent ones, chunked. The old flush re-sent every place's bare
+    # verdict in one call: 5,000 rows ran the Edge Function past its time limit (none landed), and
+    # where it did land a bare 'no' without its wa_numbers delta settled a first 'no' past the
+    # 2-looks rule.
+    _flush_unsent()
     capped = bool(res.get("capped")) if isinstance(res, dict) else False
     stopped = stop_ev.is_set()
     why = stop_why[0] or (_REVERIFY.get("why") if own is not None else None) or "parked"
@@ -3177,6 +3200,43 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
           "warn" if capped else "info")
     _crm_retry(lambda: cloud.done(jid, "done", msg), f"re-verify #{jid}: done")
     log.info("re-verify #%s: %d numbers checked%s", jid, n_checked, " (daily cap hit)" if capped else "")
+
+
+#: W206: rows per set_wa call when re-sending verdicts (each row is a read + an update in the Edge Function).
+SET_WA_CHUNK = 50
+
+
+def second_look_targets(checks: dict[str, list[dict[str, Any]]], rows_by_pk: dict[str, dict]) -> list[dict]:
+    """W206 (CRM T1476): one target per number whose looks so far (CRM history `wa_numbers[].checks`
+    + this run) are a single 'no' on a place with no 'yes' — the CRM holds such a row at NULL
+    ('no_once', T1441) until a second look. Each target carries its `number` + `source`."""
+    from webscraper.store import plus
+
+    def dg(x: Any) -> str:
+        return "".join(ch for ch in str(x or "") if ch.isdigit())
+
+    out: list[dict] = []
+    for pk, cs in checks.items():
+        r0 = rows_by_pk.get(pk)
+        if not r0 or any(c.get("verdict") == "yes" for c in cs):
+            continue
+        prior: dict[str, int] = {}
+        for e in r0.get("wa_numbers") or []:
+            if isinstance(e, dict) and dg(e.get("number")):
+                try:
+                    prior[dg(e["number"])] = max(1, int(e.get("checks") or 1))
+                except (TypeError, ValueError):
+                    prior[dg(e["number"])] = 1
+        seen: set[str] = set()
+        for c in cs:
+            d = dg(c.get("number"))
+            if c.get("verdict") != "no" or not d or d in seen:
+                continue
+            seen.add(d)
+            here = [x for x in cs if dg(x.get("number")) == d]
+            if prior.get(d, 0) + len(here) < 2 and all(x.get("verdict") == "no" for x in here):
+                out.append({**r0, "number": plus(d), "source": c.get("source") or "maps"})
+    return out
 
 
 def _crm_retry(call: Callable[[], Any], what: str, tries: int = 4) -> Any:
