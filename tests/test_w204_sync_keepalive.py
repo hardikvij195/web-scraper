@@ -1,7 +1,7 @@
 """W204 (CRM T1470, MAC 2026-10-30): a pinned WhatsApp session that keeps landing on the sync splash
 keeps its browser OPEN and waits the sync out in place (no new send-URL load) instead of closing it and
 leaving the job — closing restarted the sync on every job (216 checks/h, "keeps re-syncing" x4).
-The keep-alive is capped; past the cap the W137 bench + W171 stuck flag apply. Also: 8-session cap.
+The keep-alive is capped; past the cap the W137 bench + W171 stuck flag apply. Also: 10-session cap.
 
 Fakes only: no Playwright, no Chrome, no `data/leads.db`.
 """
@@ -36,11 +36,11 @@ def test_keepalive_env_override(monkeypatch):
     assert wv.wa_sync_keepalive_sec() == wv.WA_SYNC_KEEPALIVE_SEC
 
 
-def test_wa_parallel_cap_is_8(monkeypatch):
-    monkeypatch.setenv("WA_PARALLEL", "8")
-    assert L._wa_parallel() == 8
+def test_wa_parallel_cap_is_10(monkeypatch):
+    monkeypatch.setenv("WA_PARALLEL", "10")
+    assert L._wa_parallel() == 10
     monkeypatch.setenv("WA_PARALLEL", "12")
-    assert L._wa_parallel() == 8
+    assert L._wa_parallel() == 10
 
 
 def _fakes(monkeypatch, calls, sync_until_waits):

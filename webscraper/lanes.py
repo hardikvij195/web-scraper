@@ -1785,7 +1785,7 @@ def _wa_parallel() -> int:
     Set per machine on the CRM Systems tab as the lead_gen_settings key
     `wa_parallel__<device>`, pushed to the agent with the rest of the config at start
     (so it takes effect on the next restart), with `WA_PARALLEL` in .env as a local
-    override. Capped at 8 (W204, was 4): each session is a full Chrome; the W129/W194 RAM start
+    override. Capped at 10 (W204, was 4): each session is a full Chrome; the W129/W194 RAM start
     limit (`memory_start_max_pct`) still decides whether one more session may join.
     """
     import os
@@ -1796,7 +1796,7 @@ def _wa_parallel() -> int:
     raw = (os.getenv(f"WA_PARALLEL__{DEVICE_NAME.upper()}") if DEVICE_NAME else None) \
         or os.getenv("WA_PARALLEL") or "1"
     try:
-        return max(1, min(8, int(str(raw).strip())))   # W204: 4 -> 8 (MAC T1470)
+        return max(1, min(10, int(str(raw).strip())))  # W204: 4 -> 10 (MAC T1470)
     except ValueError:
         return 1
 
