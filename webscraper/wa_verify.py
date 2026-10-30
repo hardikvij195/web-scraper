@@ -114,6 +114,41 @@ WA_REQUEUE_MAX = 2
 #: Benched = skipped this slice, still linked, its Chrome closed so the next slice boots clean.
 WA_SYNC_STRIKES = 3
 
+#: W204 (CRM T1470, MAC 2026-10-30): a PINNED session (parallel re-verify) that hits WA_SYNC_STRIKES no
+#: longer closes its browser and leaves the job — every `_check` is a fresh send-URL load, and WhatsApp Web
+#: only finishes a sync while the page stays open, so closing it (and the next job reopening it) restarted
+#: the sync forever (216 checks/h with 4 accounts, "keeps re-syncing" on all of them). The session now keeps
+#: its page open and waits the sync out in place (no navigation), re-queuing the number, for up to this many
+#: seconds in total per account; only then is it benched as W171 stuck syncing. 0 = old W137 behaviour.
+#: `WA_SYNC_KEEPALIVE_SEC__<DEVICE>` > `WA_SYNC_KEEPALIVE_SEC` > 600.
+WA_SYNC_KEEPALIVE_SEC = 600.0
+
+
+def wa_sync_keepalive_sec() -> float:
+    """W204: total in-place sync wait a pinned session may spend before it is benched."""
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env("WA_SYNC_KEEPALIVE_SEC")
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw or os.getenv("WA_SYNC_KEEPALIVE_SEC")
+    try:
+        return max(0.0, float(raw)) if raw not in (None, "") else WA_SYNC_KEEPALIVE_SEC
+    except (TypeError, ValueError):
+        return WA_SYNC_KEEPALIVE_SEC
+
+
+def sync_keepalive_action(pinned: bool, waited_sec: float, cap_sec: float) -> str:
+    """W204: what a session does once it hit WA_SYNC_STRIKES sync non-answers in a row.
+
+    'wait'  = keep the browser open, put the number back, wait the sync out in place (pinned only);
+    'bench' = the W137 bench (close the browser, skip the account this slice) — unpinned lane runs,
+              keep-alive switched off (cap 0), or the account already used its whole keep-alive budget.
+    """
+    if not pinned or cap_sec <= 0:
+        return "bench"
+    return "wait" if waited_sec < cap_sec else "bench"
+
 #: W143 (CRM T1021, MAC 2026-10-05: 92 five-minute pauses, 0 verdicts in 5.5 h — every job's lane
 #: restarted the W137 park count from zero and nobody was told). Per-ACCOUNT ladder of consecutive
 #: re-sync episodes (a slice that benched the account and decided nothing), module-level so it
@@ -1468,6 +1503,7 @@ def verify_places(
     requeue_tries: dict[tuple[str, str], int] = {}   # W115: (place_key, num) -> re-queues so far
     sync_strikes: dict[str, int] = {}      # W137: account -> consecutive sync non-answers
     sync_benched: set[str] = set()         # W137: accounts benched this slice for re-syncing
+    sync_kept: dict[str, float] = {}       # W204: account -> seconds spent waiting a sync out in place
     stuck_cleared: set[str] = set()        # W171: accounts whose verdict already cleared `sync_stuck`
     clean_end = False                      # W196: only a call that ran to its end may keep its browsers
     try:
@@ -1574,7 +1610,42 @@ def verify_places(
                 # the number back untouched — never burn a real number's checks on a splash.
                 strikes = sync_strikes.get(name, 0) + 1
                 sync_strikes[name] = strikes
+                _cap = wa_sync_keepalive_sec()
+                if (strikes >= WA_SYNC_STRIKES
+                        and sync_keepalive_action(bool(account), sync_kept.get(name, 0.0), _cap) == "wait"):
+                    # W204 (CRM T1470): keep the browser OPEN and let WhatsApp Web finish its sync without
+                    # loading another send URL (each load restarts it); the number goes back on this
+                    # session's queue (handed to the job's shared queue if the session ends).
+                    sync_strikes[name] = 0
+                    targets.append((r, num, source))
+                    waited0 = sync_kept.get(name, 0.0)
+                    msg = (f"{name}: WhatsApp Web still syncing after {strikes} numbers — keeping its browser "
+                           f"open and waiting the sync out in place ({int(waited0)}/{int(_cap)} s used, W204)")
+                    log.info("[%s] %s", name, msg)
+                    if job_id is not None:
+                        store.log(job_id, "whatsapp", msg, "warn")
+                    state = "syncing"
+                    while not should_stop() and sync_kept.get(name, 0.0) < _cap:
+                        t0 = time.monotonic()
+                        try:
+                            state = wait_boot(page, name, blank_ms=1000,
+                                              sync_max_sec=min(120.0, _cap - sync_kept.get(name, 0.0)))
+                        except Exception as e:                    # noqa: BLE001 — page died: the next number relaunches it
+                            log.warning("[%s] in-place sync wait failed: %s", name, e)
+                            state = "error"
+                        sync_kept[name] = sync_kept.get(name, 0.0) + max(1.0, time.monotonic() - t0)
+                        if state != "syncing":
+                            break
+                    log.info("[%s] in-place sync wait ended on %r after %d s in total (W204)",
+                             name, state, int(sync_kept.get(name, 0.0)))
+                    continue
                 if strikes >= WA_SYNC_STRIKES:
+                    if account and _cap > 0:
+                        # W204: the keep-alive budget is spent — this is W171 stuck syncing, say so.
+                        try:
+                            store.set_wa_sync_stuck(name, True)
+                        except Exception:                         # noqa: BLE001 — db busy / legacy store
+                            pass
                     unavailable.add(name)
                     sync_benched.add(name)
                     _close_account(name)
@@ -1615,6 +1686,7 @@ def verify_places(
             counts["checked"] += 1
             if status in ("yes", "no"):
                 sync_strikes[name] = 0                             # W137: a real answer clears the strikes
+                sync_kept.pop(name, None)                          # W204: and refills the keep-alive budget
                 resync_reset(name)                                 # W143: and ends the re-sync ladder
                 if name not in stuck_cleared:                      # W171: a verdict proves the sync works
                     stuck_cleared.add(name)
