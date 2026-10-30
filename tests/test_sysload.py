@@ -38,3 +38,21 @@ def test_parse_ps_sums_cpu_over_cores():
     assert s["procs"][10]["cpu"] == 75.0
     assert s["procs"][12]["name"] == "mds"
     assert sysload.classify(s, me=10, data_dir="/x/data") >= {10, 11}
+
+
+def test_by_lane_attributes_chrome_trees_by_profile():
+    profiles = sorted([("/r/data/wa-profiles", "whatsapp"), ("/r/data/browser-profile-open", "maps"),
+                       ("/r/data/browser-profile", "maps"), ("/r/data/fetch-profile", "websites")],
+                      key=lambda t: -len(t[0]))
+    text = ("100   1  40.0 1000 /usr/bin/python3 -m webscraper agent --crm\n"
+            "200 100  80.0 1000 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/r/data/wa-profiles/acc1\n"
+            "201 200  60.0 1000 /Applications/Google Chrome.app/Contents/Frameworks/Helper (Renderer) --type=renderer\n"
+            "300 100  20.0 1000 /x/Chromium --user-data-dir=/r/data/browser-profile-open\n"
+            "400 100  10.0 1000 /x/Chromium --user-data-dir=/r/data/fetch-profile\n"
+            "500 100   4.0 1000 /x/node playwright driver\n"
+            "600   1  30.0 1000 /usr/sbin/mds\n")
+    s = sysload.parse_ps(text, cores=2)
+    lanes = sysload.by_lane(s, 100, "/r/data", profiles, total=None)
+    assert lanes == {"whatsapp": 70.0, "maps": 10.0, "websites": 5.0, "agent": 22.0, "other": 15.0}
+    lanes = sysload.by_lane(s, 100, "/r/data", profiles, total=100.0)
+    assert lanes["other"] == 0.0

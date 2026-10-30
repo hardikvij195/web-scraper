@@ -38,8 +38,10 @@ _PS_SNAPSHOT = (
     "$a=@{};Get-Process | ForEach-Object { $a[$_.Id]=$_.CPU };Start-Sleep -Milliseconds 2000;"
     "Get-Process | ForEach-Object { $d=0; if ($_.CPU -ne $null -and $a[$_.Id] -ne $null) { $d=($_.CPU-$a[$_.Id])*50 };"
     " \"P`t$($_.Id)`t$($_.ProcessName)`t$d`t$($_.WorkingSet64)\" };"
-    "Get-CimInstance Win32_Process -Filter \"Name like 'chrome%' or Name like 'python%' or Name like 'pythonw%'\" | "
-    "ForEach-Object { \"C`t$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" }"
+    # ppid for EVERY process (W203 lane attribution walks the tree); command line only where it
+    # classifies something (Chrome / python / node driver).
+    "Get-CimInstance Win32_Process | ForEach-Object { $c=''; if ($_.Name -match '^(chrome|python|pythonw|node)') { $c=$_.CommandLine };"
+    " \"C`t$($_.ProcessId)`t$($_.ParentProcessId)`t$c\" }"
 )
 
 _AGENT_PY_RE = re.compile(r"webscraper[\\/\"' ].*\bagent\b|-m\s+webscraper\s+agent", re.I)
@@ -166,39 +168,129 @@ def _raw_snapshot() -> dict:
     return parse_ps(r.stdout)
 
 
-def snapshot(force: bool = False) -> dict | None:
-    """Cached raw snapshot (None when the listing failed)."""
-    now = time.monotonic()
-    if not force and _cache["snap"] is not None and now - _cache["at"] < CACHE_SEC:
-        return _cache["snap"]
+_refreshing = [False]
+
+
+def _refresh() -> None:
     try:
         snap = _raw_snapshot()
     except Exception:                                             # noqa: BLE001
         log.debug("process snapshot failed", exc_info=True)
         snap = None
-    _cache.update(at=now, snap=snap)
-    return snap
+    _cache.update(at=time.monotonic(), snap=snap)
+    _refreshing[0] = False
 
 
-def load() -> dict:
-    """{cpu_pct: real 0-100 % or None, load1: 1-min loadavg or None, cores}."""
+def snapshot(force: bool = False, wait: bool = True) -> dict | None:
+    """Cached raw snapshot (None when the listing failed). `wait=False` (W203 live heartbeat)
+    never blocks: it returns the cached sample and refreshes it on a daemon thread."""
+    now = time.monotonic()
+    fresh = _cache["snap"] is not None and now - _cache["at"] < CACHE_SEC
+    if not force and fresh:
+        return _cache["snap"]
+    if not wait:
+        if not _refreshing[0]:
+            _refreshing[0] = True
+            import threading
+            threading.Thread(target=_refresh, name="sysload", daemon=True).start()
+        return _cache["snap"]
+    _refresh()
+    return _cache["snap"]
+
+
+def sample_age() -> float | None:
+    return None if _cache["snap"] is None else time.monotonic() - _cache["at"]
+
+
+def _lane_profiles() -> list[tuple[str, str]]:
+    """(lower-cased profile path, lane), longest first so `browser-profile-open` beats `browser-profile`."""
+    out: list[tuple[str, str]] = []
+    try:
+        from webscraper.config import settings
+        base = settings.profile_dir.parent
+        out = [(str(settings.wa_profiles_dir), "whatsapp"), (str(base / "browser-profile-open"), "maps"),
+               (str(settings.profile_dir), "maps"), (str(base / "fetch-profile"), "websites"),
+               (str(base / "camoufox-profile"), "websites")]
+    except Exception:                                             # noqa: BLE001
+        pass
+    return sorted(((n.lower().rstrip("\\/"), lane) for n, lane in out if n), key=lambda t: -len(t[0]))
+
+
+_UDD_RE = re.compile(r'--user-data-dir=(?:"([^"]+)"|(\S+))', re.I)
+
+
+def lane_of_cmd(cmd: str, profiles: list[tuple[str, str]]) -> str | None:
+    """Lane a Chrome command line belongs to, by its --user-data-dir."""
+    m = _UDD_RE.search(cmd or "")
+    if not m:
+        return None
+    udd = (m.group(1) or m.group(2) or "").lower().rstrip("\\/")
+    for needle, lane in profiles:
+        if udd == needle or udd.startswith(needle):
+            return lane
+    return None
+
+
+def by_lane(snap: dict, me: int, data_dir: str, profiles: list[tuple[str, str]],
+            total: float | None) -> dict:
+    """W203: machine CPU % split {whatsapp, maps, websites, agent, other}. A process takes the
+    lane of the nearest ancestor-or-self whose --user-data-dir is one of our profiles (Chrome
+    helpers do not all carry the flag); else `agent` when classify() says it is ours; else
+    `other`. When the real machine total is known, `other` = total - our lanes, so the
+    segments add up to the bar."""
+    cmd = snap.get("cmd") or {}
+    parent = {pid: pp for pid, (pp, _) in cmd.items()}
+    ours = classify(snap, me, data_dir)
+    sums = {"whatsapp": 0.0, "maps": 0.0, "websites": 0.0, "agent": 0.0, "other": 0.0}
+    memo: dict[int, str | None] = {}
+    for pid, p in (snap.get("procs") or {}).items():
+        lane, chain, q = None, [], pid
+        for _ in range(16):
+            if q in memo:
+                lane = memo[q]
+                break
+            chain.append(q)
+            lane = lane_of_cmd(cmd.get(q, (0, ""))[1], profiles)
+            if lane or q not in parent:
+                break
+            q = parent[q]
+        for c in chain:
+            memo[c] = lane
+        key = lane or ("agent" if pid in ours else "other")
+        sums[key] += float(p.get("cpu") or 0)
+    if total is not None:
+        mine = sums["whatsapp"] + sums["maps"] + sums["websites"] + sums["agent"]
+        sums["other"] = max(0.0, float(total) - mine)
+    return {k: round(min(100.0, v), 1) for k, v in sums.items()}
+
+
+def load(wait: bool = True) -> dict:
+    """{cpu_pct: real 0-100 % or None, load1: 1-min loadavg or None, cores, by_lane (W203), age_s}."""
     out: dict[str, Any] = {"cpu_pct": None, "load1": None, "cores": _CORES}
     try:
         out["load1"] = round(os.getloadavg()[0], 2)
     except Exception:                                             # noqa: BLE001
         pass
-    snap = snapshot()
+    snap = snapshot(wait=wait)
     if snap and snap.get("cpu_pct") is not None:
         out["cpu_pct"] = round(float(snap["cpu_pct"]), 1)
+    if snap and snap.get("procs"):
+        try:
+            out["by_lane"] = by_lane(snap, os.getpid(), _data_dir(), _lane_profiles(), out["cpu_pct"])
+        except Exception:                                         # noqa: BLE001
+            log.debug("by_lane failed", exc_info=True)
+    age = sample_age()
+    if age is not None:
+        out["age_s"] = round(age)
     return out
 
 
 _last_killed: list[str] = []
 
 
-def processes(top: int = 8) -> dict | None:
+def processes(top: int = 8, wait: bool = True) -> dict | None:
     """{top_cpu: [...], top_rss: [...], agent_rss_mb, killed} — kept well under 2 KB."""
-    snap = snapshot()
+    snap = snapshot(wait=wait)
     if not snap or not snap.get("procs"):
         return None
     ours = classify(snap, os.getpid(), _data_dir())

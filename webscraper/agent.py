@@ -346,6 +346,11 @@ class CrmCloud:
     #: unchanged picture every second while a job is busy.
     CHECKS_EVERY_SEC = 300.0
     _checks_sent_at = 0.0
+    #: W203 (CRM T1466): while a job runs, re-send the last self-check with fresh CPU every this
+    #: many seconds (the full checks stay on CHECKS_EVERY_SEC).
+    LIVE_CHECKS_SEC = 90.0
+    _live_at = 0.0
+    _last_checks: dict | None = None
 
     #: W122: set by `run_agent` to `srv.worker.capacity` so the CRM Edge Function can see
     #: whether this machine has room (and a free discovery slot) for another job. `None`
@@ -358,7 +363,29 @@ class CrmCloud:
         # it can drop `query`/`progress`/other big columns from this call's payload. An
         # older, un-updated Edge Function ignores an unknown key and just returns `*`.
         extra: dict = {"slim": True}
-        if time.monotonic() - self._checks_sent_at >= self.CHECKS_EVERY_SEC:
+        cap: dict | None = None
+        if self.capacity_fn is not None:
+            try:
+                cap = self.capacity_fn()
+                extra["capacity"] = cap
+            except Exception:                                     # noqa: BLE001
+                log.debug("capacity() failed", exc_info=True)
+        now = time.monotonic()
+        busy = bool(cap and (cap.get("inflight") or cap.get("started")))
+        if (now - self._checks_sent_at < self.CHECKS_EVERY_SEC and busy and self._last_checks
+                and now - self._live_at >= self.LIVE_CHECKS_SEC):
+            # W203 (CRM T1466): live CPU while a job runs — the last full self-check with fresh
+            # load/processes from the cached sample (refreshed on a thread, never blocks the poll).
+            try:
+                from .sysload import load as _sl_load, processes as _sl_procs
+                live = dict(self._last_checks)
+                live["load"] = _sl_load(wait=False)
+                live["processes"] = _sl_procs(wait=False) or live.get("processes")
+                extra["checks"] = live
+            except Exception:                                     # noqa: BLE001
+                log.debug("live load failed", exc_info=True)
+            self._live_at = now
+        elif now - self._checks_sent_at >= self.CHECKS_EVERY_SEC:
             try:
                 try:                                      # W202: orphan Chrome / 2nd agent / proc_kill
                     from .sysload import reap
@@ -368,14 +395,10 @@ class CrmCloud:
                 from .healthcheck import run_checks
                 extra["checks"] = run_checks()
                 extra["checks"]["running_git"] = RUNNING_GIT
+                self._last_checks = extra["checks"]
             except Exception:                                     # noqa: BLE001
                 log.debug("self-check failed", exc_info=True)
-            self._checks_sent_at = time.monotonic()
-        if self.capacity_fn is not None:
-            try:
-                extra["capacity"] = self.capacity_fn()
-            except Exception:                                     # noqa: BLE001
-                log.debug("capacity() failed", exc_info=True)
+            self._checks_sent_at = self._live_at = time.monotonic()
         r = self._post(crm_payload("jobs", **extra))
         r.raise_for_status()
         return r.json()
