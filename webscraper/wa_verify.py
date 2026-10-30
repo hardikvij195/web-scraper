@@ -168,7 +168,7 @@ _INAPP_AGREE: dict[str, int] = {}    # account -> calibration verdicts that matc
 _INAPP_N: dict[str, int] = {}        # account -> in-app verdicts so far
 _INAPP_ERRS: dict[str, int] = {}     # account -> in-app errors in a row
 
-_INAPP_JS = r"""async ({num, next}) => {
+_INAPP_JS = r"""async ({num, next, ahead}) => {
   if (!window.__hvtMark) window.__hvtMark = 'm' + Date.now() + Math.random();
   const mark = window.__hvtMark;
   const req = window.require;
@@ -188,7 +188,9 @@ _INAPP_JS = r"""async ({num, next}) => {
   };
   const p = start(num);
   if (next) start(next);                                  // W205b: pipelining — next lookup already in flight
-  for (const k of Object.keys(P)) if (k !== num && k !== next && Date.now() - P[k].at > 60000) delete P[k];
+  const keep = new Set([num, next].concat(ahead || []));
+  for (const n of (ahead || [])) start(n);                // W207: up to N lookups in flight per account
+  for (const k of Object.keys(P)) if (!keep.has(k) && Date.now() - P[k].at > 60000) delete P[k];
   const out = await p;
   delete P[num];
   if (out.e) return {err: 'call: ' + out.e, mark};
@@ -240,6 +242,16 @@ def wa_inapp_prefetch() -> bool:
     return _inapp_int("WA_INAPP_PREFETCH", 0) > 0
 
 
+#: W207 (CRM T1477): in-app lookups in flight at once per account (`WA_INAPP_CONCURRENCY[__DEVICE]`).
+WA_INAPP_CONCURRENCY_MAX = 4
+
+
+def wa_inapp_concurrency() -> int:
+    """W207: 1 (default) = one lookup at a time (+ the W205b prefetch); 2..4 = the current number plus the
+    next N-1 queued numbers are looked up together in the page; the per-account delay runs once per N."""
+    return max(1, min(WA_INAPP_CONCURRENCY_MAX, _inapp_int("WA_INAPP_CONCURRENCY", 1) or 1))
+
+
 def inapp_active(name: str) -> bool:
     return wa_inapp_enabled() and name not in _INAPP_OFF
 
@@ -273,7 +285,8 @@ def inapp_note_audit(name: str, inapp: str, sendurl: str) -> bool:
     return True
 
 
-def inapp_lookup(page: Any, name: str, num: str, next_num: str | None = None) -> str | None:
+def inapp_lookup(page: Any, name: str, num: str, next_num: str | None = None,
+                 ahead: list[str] | None = None) -> str | None:
     """W205: 'yes' | 'no' from the running app without navigating, or None (caller uses the send URL).
 
     Never navigates, never opens a chat, never sends. A page that is not on the booted chat list, an
@@ -285,7 +298,8 @@ def inapp_lookup(page: Any, name: str, num: str, next_num: str | None = None) ->
         if _boot_state(page) != "chat":
             return None
         mark0 = page.evaluate("() => window.__hvtMark || null")
-        res = page.evaluate(_INAPP_JS, {"num": num, "next": next_num if wa_inapp_prefetch() else None}) or {}
+        res = page.evaluate(_INAPP_JS, {"num": num, "next": next_num if wa_inapp_prefetch() else None,
+                                        "ahead": [a for a in (ahead or []) if a and a != num]}) or {}
     except Exception as e:                                        # noqa: BLE001 — fakes / dead page / closed ctx
         res = {"err": f"evaluate: {str(e).splitlines()[0] if str(e) else type(e).__name__}"}
     if not isinstance(res, dict):
@@ -1569,8 +1583,12 @@ def verify_places(
         untouched too - the caller's randomised sleep still happens once per number.
         """
         _nx = targets[pos[0]][1] if pos[0] < len(targets) else None   # W205b: next number, for pipelining
-        inapp = inapp_lookup(open_ctx[name][1], name, num, _nx)     # W205: no reload
+        _conc = wa_inapp_concurrency()
+        _ahead = [t[1] for t in targets[pos[0]:pos[0] + _conc - 1]] if _conc > 1 else None   # W207
+        last_inapp[0] = False
+        inapp = inapp_lookup(open_ctx[name][1], name, num, _nx, _ahead)     # W205: no reload
         if inapp is not None and not inapp_needs_audit(name):
+            last_inapp[0] = True
             return inapp
         st = _check_sendurl(name, num)
         if inapp is not None:
@@ -1691,17 +1709,23 @@ def verify_places(
         for r in rows:
             _expand(r)
     pos = [0]                              # W195: index of the next target to hand out
+    last_inapp = [False]                   # W207: the last verdict came from an in-app lookup (no audit)
+    batch_i = [0]                          # W207: in-app verdicts since the last per-account delay
 
     def _next_targets():
         """W195: the targets in order (W115 re-queues append to the list), then — feed mode — the
         next row from the shared queue, until it is empty."""
         while True:
             if pos[0] < len(targets):
-                if (feed is not None and pos[0] + 1 >= len(targets) and wa_inapp_enabled()
-                        and wa_inapp_prefetch()):
-                    _la = feed.take()                     # W205b: one row of look-ahead (handed back if unused)
-                    if _la is not None:
-                        _expand(_la)
+                # W205b: one row of look-ahead; W207: N-1 numbers for N lookups in flight (handed back
+                # to the shared queue if this session ends before checking them).
+                _need = max(1 if wa_inapp_prefetch() else 0, wa_inapp_concurrency() - 1)
+                while (feed is not None and _need and wa_inapp_enabled()
+                       and len(targets) - pos[0] - 1 < _need):
+                    _la = feed.take()
+                    if _la is None:
+                        break
+                    _expand(_la)
                 pos[0] += 1
                 yield targets[pos[0] - 1]
                 continue
@@ -1972,6 +1996,15 @@ def verify_places(
                 # re-derived from every verdict so far (any yes → yes, all no → no).
                 store.record_wa_check(job_id, pk, e164, source, status, name)
             on_progress(pk, status, e164, source)
+            # W207: with N in-app lookups in flight the account's delay runs once per N verdicts (between
+            # batches), never between the lookups of one batch; a send-URL check always waits.
+            _conc = wa_inapp_concurrency()
+            if last_inapp[0] and _conc > 1:
+                batch_i[0] += 1
+                if batch_i[0] % _conc:
+                    continue
+            else:
+                batch_i[0] = 0
             lo, hi = wa_delay_range()
             time.sleep(random.uniform(lo, hi))
         else:
