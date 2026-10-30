@@ -27,14 +27,17 @@ CACHE_SEC = 45.0
 _cache: dict[str, Any] = {"at": 0.0, "snap": None}
 _CORES = os.cpu_count() or 1
 
-#: Windows: total CPU + every process (perf counters, no admin) + command lines of the
+#: Windows: total CPU + every process (Get-Process delta, no admin) + command lines of the
 #: processes we must classify (chrome / python). Tab-separated, one record per line.
 _PS_SNAPSHOT = (
     "$ErrorActionPreference='SilentlyContinue';"
     "$t=(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \"Name='_Total'\").PercentProcessorTime;"
     "\"TOTAL`t$t\";"
-    "Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.IDProcess -gt 0 } | "
-    "ForEach-Object { \"P`t$($_.IDProcess)`t$($_.Name)`t$($_.PercentProcessorTime)`t$($_.WorkingSetPrivate)\" };"
+    # Per-process CPU = Get-Process CPU-seconds delta over 2 s (% of ONE core; the parser divides
+    # by cores). The CIM PerfProc formatted class read 0 for every process on DELL (single query).
+    "$a=@{};Get-Process | ForEach-Object { $a[$_.Id]=$_.CPU };Start-Sleep -Milliseconds 2000;"
+    "Get-Process | ForEach-Object { $d=0; if ($_.CPU -ne $null -and $a[$_.Id] -ne $null) { $d=($_.CPU-$a[$_.Id])*50 };"
+    " \"P`t$($_.Id)`t$($_.ProcessName)`t$d`t$($_.WorkingSet64)\" };"
     "Get-CimInstance Win32_Process -Filter \"Name like 'chrome%' or Name like 'python%' or Name like 'pythonw%'\" | "
     "ForEach-Object { \"C`t$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" }"
 )
