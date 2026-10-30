@@ -30,11 +30,14 @@ class _Page:
         self.inapp, self.reload_on = inapp, reload_on
         self.gotos: list[str] = []
         self.evals = 0
+        self.nexts: list = []
         self.mark = "m1"
 
-    def evaluate(self, js, num=None):
-        if num is None:
+    def evaluate(self, js, arg=None):
+        if arg is None:
             return self.mark
+        num = arg["num"]
+        self.nexts.append(arg.get("next"))
         self.evals += 1
         if self.reload_on is not None and num == self.reload_on:
             self.mark = "m2"                           # the document reloaded under the lookup
@@ -92,7 +95,7 @@ def test_audit_mismatch_switches_off_and_agreement_counts():
     assert "acc1" in wv._INAPP_OFF
 
 
-def _run(monkeypatch, page, n, rec):
+def _run(monkeypatch, page, n, rec, feed=None):
     class _Ctx:
         def close(self):
             pass
@@ -106,7 +109,7 @@ def _run(monkeypatch, page, n, rec):
     monkeypatch.setattr(wv, "_boot_state", lambda pg: "chat")
     monkeypatch.setattr(wv, "_decide", lambda pg, timeout_ms=None: "yes")
     monkeypatch.setattr(wv, "wa_delay_range", lambda: (0.0, 0.0))
-    return wv.verify_places(_S(), _rows(n), job_id=7, account="acc1")
+    return wv.verify_places(_S(), feed if feed is not None else _rows(n), job_id=7, account="acc1")
 
 
 def test_only_the_calibration_numbers_reload(wa, monkeypatch):
@@ -126,3 +129,37 @@ def test_a_disagreement_falls_back_to_the_send_url_for_the_rest(wa, monkeypatch)
     assert res["yes"] == 6                                        # the send-URL verdict is what is recorded
     assert "acc1" in wv._INAPP_OFF
     assert len(page.gotos) == 6
+
+
+def test_audit_cadence_setting(monkeypatch):
+    wv._INAPP_AGREE["acc1"] = wv.WA_INAPP_CALIBRATE
+    monkeypatch.setenv("WA_INAPP_AUDIT_EVERY", "200")
+    wv._INAPP_N["acc1"] = 50
+    assert not wv.inapp_needs_audit("acc1")
+    wv._INAPP_N["acc1"] = 200
+    assert wv.inapp_needs_audit("acc1")
+    monkeypatch.setenv("WA_INAPP_AUDIT_EVERY", "0")
+    assert not wv.inapp_needs_audit("acc1")
+
+
+def test_prefetch_passes_the_next_number_only_when_on(wa, monkeypatch):
+    rec: list[str] = []
+    page = _Page(inapp=lambda n: "yes")
+    _run(monkeypatch, page, 5, rec)
+    assert set(page.nexts) == {None}                          # off by default
+    for d in (wv._INAPP_OFF, wv._INAPP_AGREE, wv._INAPP_N, wv._INAPP_ERRS):
+        d.clear()
+    monkeypatch.setenv("WA_INAPP_PREFETCH", "1")
+    page2 = _Page(inapp=lambda n: "yes")
+    res = _run(monkeypatch, page2, 5, rec)
+    assert res["checked"] == 5
+    assert page2.nexts[0] == "919876540001" and page2.nexts[-1] is None   # next queued number, none at the end
+
+
+def test_prefetch_look_ahead_in_feed_mode(wa, monkeypatch):
+    monkeypatch.setenv("WA_INAPP_PREFETCH", "1")
+    rec: list[str] = []
+    page = _Page(inapp=lambda n: "yes")
+    res = _run(monkeypatch, page, 0, rec, feed=wv.WaFeed(_rows(4)))
+    assert res["checked"] == 4
+    assert page.nexts[:3] == ["919876540001", "919876540002", "919876540003"]

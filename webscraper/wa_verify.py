@@ -168,7 +168,7 @@ _INAPP_AGREE: dict[str, int] = {}    # account -> calibration verdicts that matc
 _INAPP_N: dict[str, int] = {}        # account -> in-app verdicts so far
 _INAPP_ERRS: dict[str, int] = {}     # account -> in-app errors in a row
 
-_INAPP_JS = r"""async (num) => {
+_INAPP_JS = r"""async ({num, next}) => {
   if (!window.__hvtMark) window.__hvtMark = 'm' + Date.now() + Math.random();
   const mark = window.__hvtMark;
   const req = window.require;
@@ -178,13 +178,24 @@ _INAPP_JS = r"""async (num) => {
   catch (e) { return {err: 'module: ' + e, mark}; }
   const fn = Q && Q.queryWidExists;
   if (typeof fn !== 'function' || !W || typeof W.createWid !== 'function') return {err: 'no queryWidExists', mark};
-  const t = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 15s')), 15000));
-  try {
-    const r = await Promise.race([fn(W.createWid(num + '@c.us')), t]);
-    if (r && r.wid) return {v: 'yes', mark};
-    if (r === null || r === undefined) return {v: 'no', mark};
-    return {err: 'shape ' + Object.keys(r).join(','), mark};
-  } catch (e) { return {err: 'call: ' + e, mark}; }
+  const P = window.__hvtQ = window.__hvtQ || {};
+  const start = (n) => {
+    if (!P[n]) {
+      const t = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 15s')), 15000));
+      P[n] = {at: Date.now(), p: Promise.race([fn(W.createWid(n + '@c.us')), t]).then((r) => ({r}), (e) => ({e: String(e)}))};
+    }
+    return P[n].p;
+  };
+  const p = start(num);
+  if (next) start(next);                                  // W205b: pipelining — next lookup already in flight
+  for (const k of Object.keys(P)) if (k !== num && k !== next && Date.now() - P[k].at > 60000) delete P[k];
+  const out = await p;
+  delete P[num];
+  if (out.e) return {err: 'call: ' + out.e, mark};
+  const r = out.r;
+  if (r && r.wid) return {v: 'yes', mark};
+  if (r === null || r === undefined) return {v: 'no', mark};
+  return {err: 'shape ' + Object.keys(r).join(','), mark};
 }"""
 
 
@@ -205,6 +216,30 @@ def wa_inapp_enabled() -> bool:
     return "MAC" in (DEVICE_NAME or "").upper()
 
 
+def _inapp_int(key: str, default: int) -> int:
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env(key)
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw if raw not in (None, "") else os.getenv(key)
+    try:
+        return max(0, int(float(raw))) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def wa_inapp_audit_every() -> int:
+    """W205b: every Nth in-app verdict is re-checked with a send-URL load (`WA_INAPP_AUDIT_EVERY[__DEVICE]`);
+    each audit is a full reload + re-sync, so fewer = faster. 0 = no audits after calibration."""
+    return _inapp_int("WA_INAPP_AUDIT_EVERY", WA_INAPP_AUDIT_EVERY)
+
+
+def wa_inapp_prefetch() -> bool:
+    """W205b: start the next number's lookup while the current one is read (`WA_INAPP_PREFETCH[__DEVICE]`)."""
+    return _inapp_int("WA_INAPP_PREFETCH", 0) > 0
+
+
 def inapp_active(name: str) -> bool:
     return wa_inapp_enabled() and name not in _INAPP_OFF
 
@@ -222,7 +257,8 @@ def inapp_needs_audit(name: str) -> bool:
     agreed = _INAPP_AGREE.get(name, 0)
     if agreed < WA_INAPP_CALIBRATE:
         return True
-    return WA_INAPP_AUDIT_EVERY > 0 and _INAPP_N.get(name, 0) % WA_INAPP_AUDIT_EVERY == 0
+    every = wa_inapp_audit_every()
+    return every > 0 and _INAPP_N.get(name, 0) % every == 0
 
 
 def inapp_note_audit(name: str, inapp: str, sendurl: str) -> bool:
@@ -237,7 +273,7 @@ def inapp_note_audit(name: str, inapp: str, sendurl: str) -> bool:
     return True
 
 
-def inapp_lookup(page: Any, name: str, num: str) -> str | None:
+def inapp_lookup(page: Any, name: str, num: str, next_num: str | None = None) -> str | None:
     """W205: 'yes' | 'no' from the running app without navigating, or None (caller uses the send URL).
 
     Never navigates, never opens a chat, never sends. A page that is not on the booted chat list, an
@@ -249,7 +285,7 @@ def inapp_lookup(page: Any, name: str, num: str) -> str | None:
         if _boot_state(page) != "chat":
             return None
         mark0 = page.evaluate("() => window.__hvtMark || null")
-        res = page.evaluate(_INAPP_JS, num) or {}
+        res = page.evaluate(_INAPP_JS, {"num": num, "next": next_num if wa_inapp_prefetch() else None}) or {}
     except Exception as e:                                        # noqa: BLE001 — fakes / dead page / closed ctx
         res = {"err": f"evaluate: {str(e).splitlines()[0] if str(e) else type(e).__name__}"}
     if not isinstance(res, dict):
@@ -1532,7 +1568,8 @@ def verify_places(
         number in the caller, so a crash can never eat into the daily cap. Pacing is
         untouched too - the caller's randomised sleep still happens once per number.
         """
-        inapp = inapp_lookup(open_ctx[name][1], name, num)          # W205: no reload
+        _nx = targets[pos[0]][1] if pos[0] < len(targets) else None   # W205b: next number, for pipelining
+        inapp = inapp_lookup(open_ctx[name][1], name, num, _nx)     # W205: no reload
         if inapp is not None and not inapp_needs_audit(name):
             return inapp
         st = _check_sendurl(name, num)
@@ -1660,6 +1697,11 @@ def verify_places(
         next row from the shared queue, until it is empty."""
         while True:
             if pos[0] < len(targets):
+                if (feed is not None and pos[0] + 1 >= len(targets) and wa_inapp_enabled()
+                        and wa_inapp_prefetch()):
+                    _la = feed.take()                     # W205b: one row of look-ahead (handed back if unused)
+                    if _la is not None:
+                        _expand(_la)
                 pos[0] += 1
                 yield targets[pos[0] - 1]
                 continue

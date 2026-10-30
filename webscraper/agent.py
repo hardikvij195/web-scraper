@@ -2182,7 +2182,9 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             # W194 (CRM T1344-b): per-machine memory start limit (`memory_start_max_pct__<device>`)
                             "MEMORY_START_MAX_PCT__",
                             # W200 (CRM T1440): parallel websites per job + pooled WhatsApp idle close
-                            "ENRICH_CONCURRENCY__", "WA_KEEP_OPEN_IDLE_MIN")
+                            "ENRICH_CONCURRENCY__", "WA_KEEP_OPEN_IDLE_MIN",
+                            # W205 (CRM T1472): in-app WhatsApp checks + audit cadence + pipelining
+                            "WA_INAPP")
 
 #: W186: the lane-pause knob alone is re-read this often (the CRM switch should bite within ~1 min;
 #: the other knobs keep the 5-min cadence).
