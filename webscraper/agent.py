@@ -360,6 +360,11 @@ class CrmCloud:
         extra: dict = {"slim": True}
         if time.monotonic() - self._checks_sent_at >= self.CHECKS_EVERY_SEC:
             try:
+                try:                                      # W202: orphan Chrome / 2nd agent / proc_kill
+                    from .sysload import reap
+                    reap("self-check")
+                except Exception:                         # noqa: BLE001
+                    log.debug("W202 reap failed", exc_info=True)
                 from .healthcheck import run_checks
                 extra["checks"] = run_checks()
                 extra["checks"]["running_git"] = RUNNING_GIT
@@ -1908,8 +1913,8 @@ def _should_defer(cmd: dict, current_job: int | None) -> bool:
     backstop (`lead_gen_restart_frozen_agents`) sends, and a wedged job is the whole reason for
     it. `_requeue_orphans` resumes the in-flight jobs after the relaunch (W46)."""
     name = str(cmd.get("command") or "")
-    if name == "restart" and str(cmd.get("arg") or "").strip().lower() == "now":
-        return False
+    if name in ("restart", "update") and str(cmd.get("arg") or "").strip().lower() == "now":
+        return False                              # W202: `update now` too (pull + relaunch, job resumed)
     return name in _EXIT_COMMANDS and current_job is not None
 
 
@@ -2147,6 +2152,8 @@ _CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PAR
                             "CHROME_JOB_MEM_MB",
                             # W184: per-machine WhatsApp OFF switch (`wa_off__<device>`)
                             "WA_OFF",
+                            # W202 (T1464): owner-approved third-party exe names to stop (`proc_kill__<device>`)
+                            "PROC_KILL__",
                             # W186: per-machine manual lane pause (`lane_pause__<device>`)
                             "LANE_PAUSE",
                             # W194 (CRM T1344-b): per-machine memory start limit (`memory_start_max_pct__<device>`)

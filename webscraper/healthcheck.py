@@ -512,14 +512,23 @@ def _chrome() -> dict:
 
 
 def _load() -> dict:
-    """W122: 1-minute load average where the OS offers one (macOS/Linux); Windows has no
-    equivalent so both fields stay None there."""
-    out: dict[str, Any] = {"cpu_pct": None}
+    """W122 + W202 (CRM T1464): `cpu_pct` = REAL machine CPU % (0-100; Windows via CIM/typeperf,
+    macOS/Linux via `ps` sum / cores) — before W202 it was the 1-min loadavg on the Mac and None
+    on Windows. `load1` = the 1-min loadavg (None on Windows), `cores`. Never raises."""
     try:
-        out["cpu_pct"] = os.getloadavg()[0]
+        from webscraper import sysload
+        return sysload.load()
     except Exception:                                              # noqa: BLE001
-        pass
-    return out
+        return {"cpu_pct": None, "load1": None, "cores": os.cpu_count()}
+
+
+def _processes() -> dict | None:
+    """W202: top processes by CPU / RAM (agent-owned marked) + recent W202 kills. Never raises."""
+    try:
+        from webscraper import sysload
+        return sysload.processes()
+    except Exception:                                              # noqa: BLE001
+        return None
 
 
 def _git_rev() -> str:
@@ -574,4 +583,5 @@ def run_checks() -> dict:
         "memory": _memory(),
         "chrome": _chrome(),
         "load": _load(),
+        "processes": _processes(),
     }
