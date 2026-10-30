@@ -149,6 +149,157 @@ def sync_keepalive_action(pinned: bool, waited_sec: float, cap_sec: float) -> st
         return "bench"
     return "wait" if waited_sec < cap_sec else "bench"
 
+
+#: W205 (CRM T1472, MAC 2026-10-30): every check used to be `page.goto(WA_SEND)` = a FULL reload of WhatsApp
+#: Web per number (app boot + IndexedDB re-open + "messages are downloading" re-sync each time; 61 checks /
+#: 10 min on 8 sessions). In-app mode keeps ONE booted WhatsApp Web page per account and asks the running
+#: app whether the number exists — the same contact-exists query the app fires itself when a send URL is
+#: opened (`WAWebQueryExistsJob.queryWidExists`, what whatsapp-web.js `getNumberId` uses). No navigation,
+#: no UI, never a message. Safety: the first WA_INAPP_CALIBRATE verdicts per account (and every
+#: WA_INAPP_AUDIT_EVERY-th after) are cross-checked against the old send-URL path; one disagreement, or
+#: WA_INAPP_MAX_ERRS errors in a row, switches the account back to the send-URL path for the process.
+#: `WA_INAPP__<DEVICE>` > `WA_INAPP`; default ON for MAC only.
+WA_INAPP_CALIBRATE = 3
+WA_INAPP_AUDIT_EVERY = 50
+WA_INAPP_MAX_ERRS = 3
+_INAPP_LOCK = threading.Lock()
+_INAPP_OFF: dict[str, str] = {}      # account -> why in-app was switched off (process lifetime)
+_INAPP_AGREE: dict[str, int] = {}    # account -> calibration verdicts that matched the send-URL path
+_INAPP_N: dict[str, int] = {}        # account -> in-app verdicts so far
+_INAPP_ERRS: dict[str, int] = {}     # account -> in-app errors in a row
+
+_INAPP_JS = r"""async (num) => {
+  if (!window.__hvtMark) window.__hvtMark = 'm' + Date.now() + Math.random();
+  const mark = window.__hvtMark;
+  const req = window.require;
+  if (typeof req !== 'function') return {err: 'no window.require', mark};
+  let Q, W;
+  try { Q = req('WAWebQueryExistsJob'); W = req('WAWebWidFactory'); }
+  catch (e) { return {err: 'module: ' + e, mark}; }
+  const fn = Q && Q.queryWidExists;
+  if (typeof fn !== 'function' || !W || typeof W.createWid !== 'function') return {err: 'no queryWidExists', mark};
+  const t = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 15s')), 15000));
+  try {
+    const r = await Promise.race([fn(W.createWid(num + '@c.us')), t]);
+    if (r && r.wid) return {v: 'yes', mark};
+    if (r === null || r === undefined) return {v: 'no', mark};
+    return {err: 'shape ' + Object.keys(r).join(','), mark};
+  } catch (e) { return {err: 'call: ' + e, mark}; }
+}"""
+
+
+def wa_inapp_enabled() -> bool:
+    """W205: in-app checks on? `WA_INAPP__<DEVICE>` > `WA_INAPP` > on for MAC only."""
+    try:
+        from webscraper.lanes import _device_env
+        raw = _device_env("WA_INAPP")
+    except Exception:                                             # noqa: BLE001
+        raw = None
+    raw = raw if raw not in (None, "") else os.getenv("WA_INAPP")
+    if raw not in (None, ""):
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    try:
+        from webscraper.agent import DEVICE_NAME
+    except Exception:                                             # noqa: BLE001
+        DEVICE_NAME = ""
+    return "MAC" in (DEVICE_NAME or "").upper()
+
+
+def inapp_active(name: str) -> bool:
+    return wa_inapp_enabled() and name not in _INAPP_OFF
+
+
+def inapp_switch_off(name: str, why: str) -> None:
+    with _INAPP_LOCK:
+        if name not in _INAPP_OFF:
+            _INAPP_OFF[name] = why
+            log.warning("[%s] in-app checks switched OFF (%s) — back to one send-URL load per number (W205)",
+                        name, why)
+
+
+def inapp_needs_audit(name: str) -> bool:
+    """W205: True while the account is calibrating, and on every WA_INAPP_AUDIT_EVERY-th verdict."""
+    agreed = _INAPP_AGREE.get(name, 0)
+    if agreed < WA_INAPP_CALIBRATE:
+        return True
+    return WA_INAPP_AUDIT_EVERY > 0 and _INAPP_N.get(name, 0) % WA_INAPP_AUDIT_EVERY == 0
+
+
+def inapp_note_audit(name: str, inapp: str, sendurl: str) -> bool:
+    """W205: compare an in-app verdict with the send-URL one. False (and in-app OFF) on a disagreement."""
+    if sendurl not in ("yes", "no"):
+        return True                                               # nothing to compare against
+    if inapp != sendurl:
+        inapp_switch_off(name, f"verdict mismatch: in-app {inapp!r} vs send-URL {sendurl!r}")
+        return False
+    with _INAPP_LOCK:
+        _INAPP_AGREE[name] = _INAPP_AGREE.get(name, 0) + 1
+    return True
+
+
+def inapp_lookup(page: Any, name: str, num: str) -> str | None:
+    """W205: 'yes' | 'no' from the running app without navigating, or None (caller uses the send URL).
+
+    Never navigates, never opens a chat, never sends. A page that is not on the booted chat list, an
+    error, or a lost window marker (= the document reloaded under us) all return None."""
+    if not inapp_active(name):
+        return None
+    mark0 = None
+    try:
+        if _boot_state(page) != "chat":
+            return None
+        mark0 = page.evaluate("() => window.__hvtMark || null")
+        res = page.evaluate(_INAPP_JS, num) or {}
+    except Exception as e:                                        # noqa: BLE001 — fakes / dead page / closed ctx
+        res = {"err": f"evaluate: {str(e).splitlines()[0] if str(e) else type(e).__name__}"}
+    if not isinstance(res, dict):
+        res = {"err": f"result {res!r}"}
+    v = res.get("v")
+    if mark0 is not None and res.get("mark") != mark0:
+        v = None
+        res = {"err": "window marker changed — the page reloaded"}
+    if v in ("yes", "no"):
+        with _INAPP_LOCK:
+            _INAPP_ERRS[name] = 0
+            _INAPP_N[name] = _INAPP_N.get(name, 0) + 1
+        return v
+    with _INAPP_LOCK:
+        n = _INAPP_ERRS[name] = _INAPP_ERRS.get(name, 0) + 1
+    log.info("[%s] in-app lookup failed for %s (%s) — send-URL path for this number (W205)",
+             name, num, res.get("err"))
+    if n >= WA_INAPP_MAX_ERRS:
+        inapp_switch_off(name, f"{n} in-app errors in a row, last: {res.get('err')}")
+    return None
+
+
+#: W205: "sync once, then check" — the in-chat-list banner WhatsApp shows while history still downloads.
+_SYNC_BANNER_SEL = "text=/messages are downloading|syncing older messages/i"
+
+
+def wait_sync_banner(page: Any, name: str, cap_sec: float) -> bool:
+    """W205: after the chat list painted, wait (bounded) for the sync / downloading banner to go.
+    True = no banner (ready). Best effort: any error counts as ready."""
+    t0 = time.monotonic()
+    logged = False
+    while True:
+        try:
+            if not page.locator(_SYNC_BANNER_SEL).count():
+                if logged:
+                    log.info("[%s] WhatsApp Web sync finished after %ds — chat list ready (W205)",
+                             name, int(time.monotonic() - t0))
+                return True
+        except Exception:                                         # noqa: BLE001
+            return True
+        el = time.monotonic() - t0
+        if not logged:
+            log.info("[%s] chat list is up but WhatsApp is still syncing — waiting up to %ds before checking (W205)",
+                     name, int(cap_sec))
+            logged = True
+        if el >= cap_sec:
+            log.warning("[%s] sync banner still shown after %ds — checking anyway (W205)", name, int(el))
+            return False
+        time.sleep(2.0)
+
 #: W143 (CRM T1021, MAC 2026-10-05: 92 five-minute pauses, 0 verdicts in 5.5 h — every job's lane
 #: restarted the W137 park count from zero and nobody was told). Per-ACCOUNT ladder of consecutive
 #: re-sync episodes (a slice that benched the account and decided nothing), module-level so it
@@ -1381,6 +1532,24 @@ def verify_places(
         number in the caller, so a crash can never eat into the daily cap. Pacing is
         untouched too - the caller's randomised sleep still happens once per number.
         """
+        inapp = inapp_lookup(open_ctx[name][1], name, num)          # W205: no reload
+        if inapp is not None and not inapp_needs_audit(name):
+            return inapp
+        st = _check_sendurl(name, num)
+        if inapp is not None:
+            if inapp_note_audit(name, inapp, st):
+                log.info("[%s] in-app verdict %s for %s matches the send URL (%d/%d calibration, W205)",
+                         name, inapp, num, min(_INAPP_AGREE.get(name, 0), WA_INAPP_CALIBRATE), WA_INAPP_CALIBRATE)
+            elif job_id is not None:
+                try:
+                    store.log(job_id, "whatsapp", f"{name}: in-app check disagreed with the send URL on {num} "
+                              f"(in-app {inapp}, send URL {st}) — in-app switched off for this account (W205)", "warn")
+                except Exception:                                 # noqa: BLE001
+                    pass
+        return st
+
+    def _check_sendurl(name: str, num: str) -> str:
+        """The pre-W205 path: one full send-URL load per number."""
         nav_retries = 0
         while True:
             page = open_ctx[name][1]
@@ -2160,6 +2329,16 @@ def _ensure_session(pw, open_ctx: dict[str, Any],
             if last is not None:
                 raise last
             state = wait_boot(page, name, blank_ms=40_000)
+            _ka = wa_sync_keepalive_sec() if wa_inapp_enabled() else 0.0   # MAC-first rollout
+            if state == "syncing" and _ka > 0:
+                # W205 (CRM T1472): the W204 keep-alive lived in the per-number loop, but a sync-out
+                # happens HERE at boot first — the session raised, closed Chrome and the next job
+                # restarted the sync, so the keep-alive never ran. Keep the page open and let it finish.
+                log.info("[%s] still syncing at boot — keeping it open, waiting up to %ds more (W204/W205)",
+                         name, int(_ka))
+                state = wait_boot(page, name, blank_ms=1000, sync_max_sec=_ka)
+            if state == "chat" and _ka > 0:
+                wait_sync_banner(page, name, _ka)                 # W205: sync once, then check
             if state == "syncing":
                 # W94: linked, still downloading messages. Not this run's problem — skip the
                 # account without touching its flag; the sync finishes in a later open.
