@@ -294,6 +294,54 @@ def _jobs_due() -> bool:
     return time.monotonic() >= _HINT["jobs_next_at"]
 
 
+# -- W209 (T1490 #6): heartbeat independent of the main loop -------------------------------
+#: ASUS (#59, 1,610 sites) and DELL went OFFLINE on the CRM on 2026-10-31 while the main loop was
+#: busy pulling/rebuilding a big job ("pulled 1054 lead(s) from the CRM"): the only heartbeat was the
+#: main loop's own CRM calls, so the CRM's auto-heal unpinned their jobs. A daemon thread now sends
+#: a bare `config` call whenever NO thread has reached the CRM for AGENT_HEARTBEAT_SEC (default 45;
+#: the CRM writes last_seen_at at most once per 60 s). 0 = off.
+_LAST_CRM_OK = [time.monotonic()]
+HEARTBEAT_SEC = 45.0
+HEARTBEAT_POLL_SEC = 10.0
+
+
+def _heartbeat_interval() -> float:
+    try:
+        return float(os.environ.get("AGENT_HEARTBEAT_SEC", str(HEARTBEAT_SEC)) or 0)
+    except ValueError:
+        return HEARTBEAT_SEC
+
+
+def _heartbeat_due(now: float, last_ok: float, interval: float) -> bool:
+    """Pure decision: ping when nothing reached the CRM for `interval` s (<= 0 disables)."""
+    return interval > 0 and now - last_ok >= interval
+
+
+def _heartbeat_once(cloud, now: float | None = None) -> bool:
+    """One side-heartbeat pass; True when a ping was sent. Never raises."""
+    now = time.monotonic() if now is None else now
+    try:
+        if CrmCloud.token_revoked() or not _heartbeat_due(now, _LAST_CRM_OK[0], _heartbeat_interval()):
+            return False
+        cloud.ping()
+        return True
+    except Exception as e:                                        # noqa: BLE001
+        log.debug("side heartbeat failed: %s", e)
+        return False
+
+
+def _start_heartbeat(cloud) -> threading.Thread:
+    def _run() -> None:
+        while True:
+            time.sleep(HEARTBEAT_POLL_SEC)
+            _heartbeat_once(cloud)
+
+    t = threading.Thread(target=_run, name="agent-heartbeat", daemon=True)
+    t.start()
+    log.info("side heartbeat armed: ping the CRM after %ds without any call", int(_heartbeat_interval()))
+    return t
+
+
 def crm_payload(action: str, **kw) -> dict:
     # `device` rides on every call: it is both the heartbeat that puts this machine in the
     # CRM's "Run on" list and the key the CRM uses to route a targeted job here.
@@ -326,6 +374,7 @@ class CrmCloud:
                           "token, or delete data/agent.stop and re-register.", r.status_code)
         elif r.status_code < 400:
             CrmCloud._denied = 0
+            _LAST_CRM_OK[0] = time.monotonic()                    # W209: any thread, any action
             _read_hints(payload.get("action"), r)
             # W142b (2026-10-05 17:27): every successful CRM call made from the loop's own
             # thread is a heartbeat. `_tick` can legitimately run for many minutes (hydrating
@@ -336,6 +385,24 @@ class CrmCloud:
             if threading.current_thread() is threading.main_thread():
                 _loop_wd_mark("ok")
         return r
+
+    #: W209/T1490 #6: the side heartbeat's own client — short timeout, never queued behind a
+    #: long `results`/`sync` call on the main client.
+    _ping_client: "httpx.Client | None" = None
+
+    def ping(self) -> bool:
+        """W209: a bare heartbeat (`config` is read-only; every call carrying `device` refreshes
+        `last_seen_at`). Does NOT stamp the loop watchdog or `agent.alive` — a hung main loop must
+        still be caught by W142/W182."""
+        if self._ping_client is None:
+            self._ping_client = httpx.Client(timeout=20, headers={
+                "X-Agent-Token": self.c.headers.get("X-Agent-Token", ""),
+                "Content-Type": "application/json"})
+        r = self._ping_client.post(self.url, json=crm_payload("config"))
+        if r.status_code < 400:
+            _LAST_CRM_OK[0] = time.monotonic()
+            return True
+        return False
 
     @classmethod
     def token_revoked(cls) -> bool:
@@ -982,6 +1049,20 @@ def _restart_if_lane_hung(store: Store, srv) -> None:
 #: W136: slot-wait log lines do not count as movement (a deadlock narrates itself forever).
 GLOBAL_STALL_SEC = 20 * 60.0
 _GLOBAL_STALL: list = [None, 0.0]        # [signature, first seen at]
+#: W209 (T1490 #5, DELL 2026-10-31 21:04): 4 enriching jobs, heartbeat green, NO counter moved for
+#: 21 min — but log lines kept arriving, so the log-aware rule above never fired and the owner had to
+#: press Restart. Second rule: no work counter moved on any job with live lanes for
+#: AGENT_COUNTER_STALL_SEC (default 25 min, 0 = off) -> restart, whatever is being logged. Not armed
+#: while a discovery lane is alive (collecting Maps links moves no counter) or on the W135 exceptions.
+COUNTER_STALL_SEC = 25 * 60.0
+_COUNTER_STALL: list = [None, 0.0]
+
+
+def _counter_stall_limit() -> float:
+    try:
+        return float(os.environ.get("AGENT_COUNTER_STALL_SEC", str(COUNTER_STALL_SEC)) or 0)
+    except ValueError:
+        return COUNTER_STALL_SEC
 
 
 def _restart_if_all_stalled(store: Store, kind: str, now: float | None = None) -> bool:
@@ -995,11 +1076,24 @@ def _restart_if_all_stalled(store: Store, kind: str, now: float | None = None) -
             "('done','failed','stopped','error','cancelled','draft')", (kind,)).fetchall()
     except Exception:                                             # noqa: BLE001
         return False
-    live = [int(r["id"]) for r in rows if alive_lanes(int(r["id"]))]
+    lanes_by_job = {int(r["id"]): alive_lanes(int(r["id"])) for r in rows}
+    live = [j for j, ls in lanes_by_job.items() if ls]
     if not live or RELINK_WAITERS or any(_job_lane_paused(j) for j in live):   # W186: paused = waiting
         _GLOBAL_STALL[0] = None
+        _COUNTER_STALL[0] = None
         return False
     ids = [int(r["id"]) for r in rows]
+    # W209: counters only — log chatter is not work. The clock re-arms with the W135 one (a fresh
+    # arm after a relink/paused spell) and is judged AFTER it, so W135's own verdict keeps priority.
+    csig = "|".join(f"{r['id']}:{r['scraped_count']}:{r['enrich_done']}:{r['research_done']}:{r['wa_verify_done']}"
+                    for r in rows)
+    climit = _counter_stall_limit()
+    counter_due = False
+    if (climit <= 0 or _GLOBAL_STALL[0] is None or _COUNTER_STALL[0] != csig
+            or any("discovery" in ls for ls in lanes_by_job.values())):
+        _COUNTER_STALL[0], _COUNTER_STALL[1] = csig, now
+    else:
+        counter_due = now - _COUNTER_STALL[1] >= climit
     try:
         # W136 (CRM T1015): the 90-s "waiting for the … slot — held by job #N" lines are NOT
         # movement. DELL's three jobs deadlocked on each other's slots for 21 h and those
@@ -1014,14 +1108,20 @@ def _restart_if_all_stalled(store: Store, kind: str, now: float | None = None) -
                    for r in rows) + f"|{n_logs}|{top}"
     if _GLOBAL_STALL[0] != sig:
         _GLOBAL_STALL[0], _GLOBAL_STALL[1] = sig, now
+    if now - _GLOBAL_STALL[1] >= GLOBAL_STALL_SEC:
+        mins = int(GLOBAL_STALL_SEC // 60)
+        log.error("agent restarting: nothing moved on any job for %d min (live lanes on %s)", mins, live)
+        line = f"agent restarting: nothing moved for {mins} min"
+    elif counter_due:
+        mins = int(climit // 60)
+        log.error("agent restarting: no work counter moved on any job for %d min (live lanes on %s)", mins, live)
+        line = f"agent restarting: no work output for {mins} min (W209 self-heal)"
+    else:
         return False
-    if now - _GLOBAL_STALL[1] < GLOBAL_STALL_SEC:
-        return False
-    mins = int(GLOBAL_STALL_SEC // 60)
-    log.error("agent restarting: nothing moved on any job for %d min (live lanes on %s)", mins, live)
+    _COUNTER_STALL[0] = None
     for jid in live:
         try:
-            store.log(jid, "job", f"agent restarting: nothing moved for {mins} min", "error")
+            store.log(jid, "job", line, "error")
         except Exception:                                         # noqa: BLE001
             pass
     _close_browsers()
@@ -1392,6 +1492,7 @@ def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> 
     _LOOP_WD.update(cloud=cloud, ok=time.monotonic())
     if kind == "crm":
         _start_loop_watchdog()
+        _start_heartbeat(cloud)                                   # W209/T1490 #6
     _keep_awake()
     # W102 (CRM T545): macOS starts a process with 256 open files. Six Chromes' worth of
     # Playwright drivers, three sqlite lanes, httpx and the log fit — until anything leaks,

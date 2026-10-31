@@ -35,6 +35,20 @@ log = logging.getLogger("webscraper.server")
 STATIC = Path(__file__).parent / "static"
 
 
+def reenrich_reset(r) -> dict:
+    """W209/T1490 #7: the row update a re-enrich makes for a row in its retry set.
+
+    Only a row that was actually CRAWLED (failed / thin) spends a try. A row still `pending` was
+    never crawled — a run that never reached it, or an earlier re-queue that reset it — so its
+    `enrich_attempts` stays where it is. Before this, every re-queue bumped pending rows too:
+    three re-queues on 2026-10-31 pushed never-crawled sites to 2 tries, and one real failure
+    then counted as "gave up after 2 tries"."""
+    keys = r.keys() if hasattr(r, "keys") else ()
+    att = int((r["enrich_attempts"] if "enrich_attempts" in keys else 0) or 0)
+    if r["enrich_status"] == "pending":
+        return {"enrich_status": "pending"}
+    return {"enrich_status": "pending", "enrich_attempts": att + 1}
+
 def _record_rate(store: Store, job_id: int, phase: str, units: Any, started_at: Any) -> None:
     """Bank "phase X did N units in T seconds" so future jobs can be estimated (W4).
 
@@ -1132,10 +1146,7 @@ class Worker(threading.Thread):
                         else:
                             retry.append(r)
                     for r in retry:
-                        store.update_enrichment(job_id, r["place_key"], {
-                            "enrich_status": "pending",
-                            "enrich_attempts": int(r["enrich_attempts"] if "enrich_attempts" in r.keys() else 0) + 1,
-                        })
+                        store.update_enrichment(job_id, r["place_key"], reenrich_reset(r))
                     missing = len(keys) - len(rows) if keys else 0
                     store.log(job_id, "job",
                               f"re-enrich queued for {len(retry)} lead(s)"

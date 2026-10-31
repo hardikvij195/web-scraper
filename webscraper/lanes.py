@@ -1248,7 +1248,11 @@ class EnrichmentLane(Lane):
                 # Nothing waiting. If discovery has finished, nothing ever will be.
                 if self.ctl.discovery_finished():
                     if seen and self.research_error:
-                        return f"error:AI research: {self.research_error}"[:200]
+                        # W209/T1490 #11: AI research is an extra, never the job. MI #169 / DELL #939
+                        # (2026-10-31) ended `error` on "nvidia: could not reach the API" after the
+                        # websites were crawled. Say it, finish the lane cleanly.
+                        self.note(f"AI research incomplete ({self.research_error}) — websites done, "
+                                  "the job carries on without the missing summaries", "warn")
                     return R_COMPLETED if seen else R_NO_TARGETS
                 self._slot_idle("nothing to crawl yet")                 # W136
                 time.sleep(IDLE_POLL_SEC)
@@ -1366,7 +1370,13 @@ class EnrichmentLane(Lane):
             rdone["n"] += 1
             store.update_job(self.job_id, research_done=base + rdone["n"])
 
-        rc = asyncio.run(research_places(store, targets, 3, on_research, self.stopped))
+        try:
+            rc = asyncio.run(research_places(store, targets, 3, on_research, self.stopped))
+        except Exception as e:                                    # noqa: BLE001
+            # W209/T1490 #11: a provider outage / network error inside research must never take
+            # the enrichment lane (and the job) down with it — skip this batch, log, keep crawling.
+            log.warning("[%s#%s] AI research raised: %s", self.key, self.job_id, e, exc_info=True)
+            rc = {"failed": len(targets), "error": f"{type(e).__name__}: {e}"[:160]}
         store.update_job(self.job_id, research_done=base + rdone["n"],
                          research_total=base + rdone["n"])
         store.record_phase_rate(self.job_id, "researching", rdone["n"], time.monotonic() - t0)
