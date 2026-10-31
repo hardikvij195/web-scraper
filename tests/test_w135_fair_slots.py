@@ -12,10 +12,10 @@ def test_gate_slots_from_device_settings(monkeypatch):
     monkeypatch.delenv("LANE_SLOTS_ENRICHMENT", raising=False)
     monkeypatch.delenv("LANE_SLOTS_WHATSAPP", raising=False)
     monkeypatch.setattr(agent, "DEVICE_NAME", "testdev")
-    monkeypatch.setenv("ENRICH_SLOTS__TESTDEV", "9")           # clamped to 3
+    monkeypatch.setenv("ENRICH_SLOTS__TESTDEV", "12")          # clamped to 8 (W208)
     monkeypatch.setenv("WA_SLOTS__TESTDEV", "0")               # clamped to 1
     lanes.reset_stage_gates()
-    assert lanes.STAGE_GATES["enrichment"].slots == 3
+    assert lanes.STAGE_GATES["enrichment"].slots == 8
     assert lanes.STAGE_GATES["whatsapp"].slots == 1
     # defaults: enrichment 2, WhatsApp = _wa_parallel() (here: wa_parallel__<device>)
     monkeypatch.delenv("ENRICH_SLOTS__TESTDEV")

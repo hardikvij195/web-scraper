@@ -642,7 +642,7 @@ PARK_GRACE_SEC = 20.0
 
 def enrich_slots() -> int:
     """W135: jobs whose enrichment lane may run at once on this machine. CRM setting
-    `enrich_slots__<device>` (default 2, clamped 1..3); `LANE_SLOTS_ENRICHMENT` in .env
+    `enrich_slots__<device>` (default 2, clamped 1..8 since W208); `LANE_SLOTS_ENRICHMENT` in .env
     is the local override. W153: 1 under the one-job-per-lane rule — W200 (CRM T1440, owner: "increase
     the website enrichment slots for asus and mi"): the rule now honours `enrich_slots__<device>` (clamp
     1..3, default 1) for the enrichment lane only; Maps and WhatsApp keep one job per lane."""
@@ -653,18 +653,19 @@ def enrich_slots() -> int:
         n = int(float(raw)) if raw else dflt
     except ValueError:
         n = dflt
-    return max(1, min(3, n))
+    return max(1, min(8, n))   # W208 (CRM T1483): 3 -> 8, websites-only machines idle at ~5% CPU
 
 
 #: W200 (CRM T1440): parallel websites inside ONE enrichment job. CRM `enrich_concurrency__<device>`
-#: (env `ENRICH_CONCURRENCY__<DEVICE>`, read live) > `ENRICH_CONCURRENCY` (config, default 5); clamp 1..20.
+#: (env `ENRICH_CONCURRENCY__<DEVICE>`, read live) > `ENRICH_CONCURRENCY` (config, default 5); clamp 1..60
+#: (W208, CRM T1483: was 20 — plain httpx, the sites are all different hosts).
 def enrich_concurrency() -> int:
     raw = _device_env("ENRICH_CONCURRENCY")
     try:
         n = int(float(raw)) if raw is not None and str(raw).strip() else int(settings.enrich_concurrency)
     except (ValueError, TypeError):
         n = int(settings.enrich_concurrency or 5)
-    return max(1, min(20, n))
+    return max(1, min(60, n))
 
 
 def wa_slots() -> int:

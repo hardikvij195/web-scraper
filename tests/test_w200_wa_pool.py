@@ -93,12 +93,12 @@ def test_idle_min_knob(monkeypatch):
 
 
 def test_enrich_concurrency_knob(monkeypatch):
-    monkeypatch.setattr(L, "_device_env", lambda n: {"ENRICH_CONCURRENCY": "50"}.get(n))
-    assert L.enrich_concurrency() == 20
+    monkeypatch.setattr(L, "_device_env", lambda n: {"ENRICH_CONCURRENCY": "90"}.get(n))
+    assert L.enrich_concurrency() == 60
     monkeypatch.setattr(L, "_device_env", lambda n: {"ENRICH_CONCURRENCY": "10"}.get(n))
     assert L.enrich_concurrency() == 10
     monkeypatch.setattr(L, "_device_env", lambda n: None)
-    assert L.enrich_concurrency() == max(1, min(20, int(L.settings.enrich_concurrency)))
+    assert L.enrich_concurrency() == max(1, min(60, int(L.settings.enrich_concurrency)))
 
 
 def test_enrich_slots_under_the_lane_rule(monkeypatch):
@@ -106,5 +106,5 @@ def test_enrich_slots_under_the_lane_rule(monkeypatch):
     monkeypatch.setenv("LANE_ONE_JOB_PER_LANE", "1")
     monkeypatch.setattr(L, "_device_env", lambda n: {"ENRICH_SLOTS": "2"}.get(n))
     assert L.one_job_per_lane() and L.enrich_slots() == 2 and L.wa_slots() == 1
-    monkeypatch.setattr(L, "_device_env", lambda n: {"ENRICH_SLOTS": "9"}.get(n))
-    assert L.enrich_slots() == 3
+    monkeypatch.setattr(L, "_device_env", lambda n: {"ENRICH_SLOTS": "12"}.get(n))
+    assert L.enrich_slots() == 8
