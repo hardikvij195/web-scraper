@@ -14,6 +14,35 @@ from selectolax.parser import HTMLParser
 # ── emails ────────────────────────────────────────────────────────────────────
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 
+# W211 (CRM T1491, PC 2026-11-01): `EMAIL_RE.findall` over a whole page is O(n^2) on a long run of
+# [A-Za-z0-9._%+-] with no '@' (inline base64 / minified JS): every start position re-scans the run.
+# One such page held the GIL for minutes in `extract_emails` -> heartbeat, CRM loop and log shipping all
+# starved -> "machine silent" -> watchdog restart -> job auto-stopped (ASUS/MI/PC). Scan only a bounded
+# window around each '@' instead — same matches for any address <= 64 local / 255 domain chars.
+_EMAIL_LOCAL_TAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+$")
+_EMAIL_DOMAIN_HEAD_RE = re.compile(r"[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
+_EMAIL_LOCAL_MAX = 64
+_EMAIL_DOMAIN_MAX = 255
+_DEOBF_PROBE_RE = re.compile(r"[\[\(]\s{0,3}(?:at|dot)\s{0,3}[\]\)]", re.I)
+
+
+def _find_emails(s: str) -> list[str]:
+    """Linear-time equivalent of `EMAIL_RE.findall(s)` for real addresses (see W211 above)."""
+    out: list[str] = []
+    i = s.find("@")
+    end_prev = 0
+    while i != -1:
+        lo = max(end_prev, i - _EMAIL_LOCAL_MAX - 1)
+        left = _EMAIL_LOCAL_TAIL_RE.search(s, lo, i)
+        right = _EMAIL_DOMAIN_HEAD_RE.match(s, i + 1, min(len(s), i + 1 + _EMAIL_DOMAIN_MAX))
+        if left and right and (i - left.start()) <= _EMAIL_LOCAL_MAX:
+            out.append(s[left.start():right.end()])
+            end_prev = right.end()
+            i = s.find("@", right.end())
+        else:
+            i = s.find("@", i + 1)
+    return out
+
 # Obvious non-contact addresses that show up in markup/JS bundles.
 _EMAIL_BAD_DOMAINS = (
     "example.com", "example.org", "sentry.io", "wixpress.com",
@@ -83,11 +112,17 @@ def extract_emails(html: str) -> list[str]:
                 add(clean_email(part))
     # de-obfuscated text patterns: "name [at] domain [dot] com"
     text = tree.body.text(separator=" ") if tree.body else tree.text()
-    deobf = re.sub(r"\s*[\[\(]\s*at\s*[\]\)]\s*", "@", text, flags=re.I)
-    deobf = re.sub(r"\s*[\[\(]\s*dot\s*[\]\)]\s*", ".", deobf, flags=re.I)
-    for m in EMAIL_RE.findall(deobf):
+    # W211: the leading `\s*` of these subs is O(n^2) on a long whitespace run — only run them when the
+    # page has a "[at]" / "(dot)" style token at all.
+    if _DEOBF_PROBE_RE.search(text):
+        # bounded \s{0,10}: an unbounded leading \s* re-scans a long whitespace run from every start
+        deobf = re.sub(r"\s{0,10}[\[\(]\s{0,10}at\s{0,10}[\]\)]\s{0,10}", "@", text, flags=re.I)
+        deobf = re.sub(r"\s{0,10}[\[\(]\s{0,10}dot\s{0,10}[\]\)]\s{0,10}", ".", deobf, flags=re.I)
+    else:
+        deobf = text
+    for m in _find_emails(deobf):
         add(clean_email(m))
-    for m in EMAIL_RE.findall(html):
+    for m in _find_emails(html):
         add(clean_email(m))
     return found
 
