@@ -193,6 +193,10 @@ _PROVIDERS: list[tuple[str, str, str, str]] = [
     ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",         "nvidia/nemotron-3-super-120b-a12b:free"),
     ("nvidia",     "NVIDIA_API_KEY",     "https://integrate.api.nvidia.com/v1",  "openai/gpt-oss-20b"),
     ("openai",     "OPENAI_API_KEY",     "https://api.openai.com/v1",            "gpt-4o-mini"),
+    # W212 (owner 2026-11-01 "use groq free accounts and then use my 5070ti in pc"): a local
+    # Ollama on the machine's own GPU. Any OLLAMA_API_KEY value turns it on (Ollama ignores
+    # it); base overridable with AI_RESEARCH_BASE_OLLAMA (e.g. another machine on the LAN).
+    ("ollama",     "OLLAMA_API_KEY",     "http://localhost:11434/v1",            "gpt-oss:20b"),
 ]
 
 
@@ -233,7 +237,19 @@ def _resolve_model(name: str, default: str) -> tuple[str | None, str | None]:
 
 def _provider_order() -> list[str]:
     raw = os.getenv("AI_RESEARCH_PROVIDERS") or "gemini," + ",".join(p[0] for p in _PROVIDERS)
-    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+    order = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    # W212: the CRM key selection writes AI_RESEARCH_PROVIDERS from its own (cloud) keys only,
+    # so a machine-local Ollama would never be in it. When this machine has one, it goes right
+    # after groq (owner: groq first, then the local GPU), or first when groq is not listed.
+    if "ollama" not in order and os.getenv("OLLAMA_API_KEY"):
+        at = order.index("groq") + 1 if "groq" in order else 0
+        order.insert(at, "ollama")
+    return order
+
+
+def _base_for(name: str, default: str) -> str:
+    """W212: AI_RESEARCH_BASE_<NAME> overrides a provider's base URL (local Ollama on the LAN)."""
+    return (os.getenv(f"AI_RESEARCH_BASE_{name.upper()}") or default).rstrip("/")
 
 
 def available_providers() -> list[str]:
@@ -327,7 +343,7 @@ async def _ask_llm(client: httpx.AsyncClient, prompt: str, errors: dict[str, Any
             if name == "gemini":
                 data, usage = await _ask_gemini(client, key, prompt, errors, key_index=idx)
             else:
-                data, usage = await _ask_openai_compat(client, name, key, spec[2], model, prompt, errors, key_index=idx)
+                data, usage = await _ask_openai_compat(client, name, key, _base_for(name, spec[2]), model, prompt, errors, key_index=idx)
             attempts.append(usage)
             if data:
                 errors["provider"] = name

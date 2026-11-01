@@ -2312,7 +2312,12 @@ _CLOUD_ENV: set[str] = set()
 #: W128: per-machine tuning knobs the periodic refresh is allowed to update live (a
 #: restart-free way to pick up a lowered `MAX_INFLIGHT__<DEVICE>` etc. from the CRM
 #: Systems tab). Anything else pulled from cloud config still only applies once, at start.
-_CONFIG_REFRESH_PREFIXES = ("AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__",
+_CONFIG_REFRESH_PREFIXES = (# W212: AI research keys / order / models — a key added on the CRM (Lead Finder ->
+                            # AI APIs) reached an agent only at its next restart, so research kept
+                            # failing on a capped provider while a working key sat unused.
+                            "AI_RESEARCH_", "GROQ_API_KEY", "OPENROUTER_API_KEY", "NVIDIA_API_KEY",
+                            "CEREBRAS_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY",
+                            "AGENT_LOOP_WATCHDOG_SEC", "MAX_INFLIGHT__", "WA_PARALLEL__", "WA_DELAY__", "WA_WINDOW__",
                             # T793: per-machine memory knobs, same live-refresh path
                             "WA_RELAUNCH__", "MAPS_RELAUNCH__", "ENRICH_IDLE__",
                             # W135 (CRM T1011): stage-gate slots per machine
