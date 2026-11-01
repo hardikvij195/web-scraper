@@ -1495,6 +1495,22 @@ class Store:
             self.conn.commit()
         self._write(f"places update_enrichment {job_id}/{place_key}", _do)
 
+    def hydration_watermark(self, job_id: int, keys: "set[str]") -> tuple[int, str]:
+        """W210/T1491: (rowid, changed_at) up to which this job's places are exactly the rows just
+        hydrated from the CRM. A local row that was NOT in the CRM's results caps the rowid just
+        below it, so it still streams up."""
+        rows = self.conn.execute("SELECT rowid AS rid, place_key, changed_at FROM places "
+                                 "WHERE job_id=? ORDER BY rowid", (job_id,)).fetchall()
+        upto, top = 0, ""
+        for r in rows:
+            if str(r["place_key"]) not in keys:
+                break
+            upto = int(r["rid"])
+        for r in rows:
+            if r["changed_at"] and str(r["place_key"]) in keys and str(r["changed_at"]) > top:
+                top = str(r["changed_at"])
+        return upto, top
+
     def places_changed_since(self, job_id: int, since: str, upto_rowid: int) -> tuple[list[dict[str, Any]], str]:
         """Places already streamed (rowid <= upto_rowid) that changed after `since`, plus the
         new watermark. New rows go through places_after(); this catches the enrichment and

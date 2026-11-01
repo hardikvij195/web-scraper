@@ -342,6 +342,11 @@ def _start_heartbeat(cloud) -> threading.Thread:
     return t
 
 
+#: W210/T1491: every CRM call — read up to 60 s (a big `results`/`sync` on the Micro DB),
+#: but connect / pool waits are short so a half-dead network fails fast.
+CRM_HTTP_TIMEOUT = httpx.Timeout(60.0, connect=15.0, pool=20.0)
+
+
 def crm_payload(action: str, **kw) -> dict:
     # `device` rides on every call: it is both the heartbeat that puts this machine in the
     # CRM's "Run on" list and the key the CRM uses to route a targeted job here.
@@ -354,7 +359,9 @@ class CrmCloud:
 
     def __init__(self, base: str, token: str):
         self.url = base.rstrip("/") + "/lead-finder-agent"
-        self.c = httpx.Client(timeout=60, headers={"X-Agent-Token": token,
+        # W210/T1491: explicit per-phase limits — a dead TCP connect or a pool wait no longer
+        # gets the full read allowance.
+        self.c = httpx.Client(timeout=CRM_HTTP_TIMEOUT, headers={"X-Agent-Token": token,
                                                    "Content-Type": "application/json"})
 
     #: W69 — consecutive 401/403 answers from the CRM. A token that has been revoked or
@@ -365,7 +372,13 @@ class CrmCloud:
     _denied = 0
 
     def _post(self, payload: dict) -> httpx.Response:
-        r = self.c.post(self.url, json=payload)
+        try:
+            r = self.c.post(self.url, json=payload)
+        except httpx.HTTPError:
+            _loop_wd_answer_failed()                              # W210: alive, CRM unreachable
+            raise
+        if r.status_code >= 500:
+            _loop_wd_answer_failed()                              # W210: 503 from the Micro DB
         if r.status_code in (401, 403):
             CrmCloud._denied += 1
             if CrmCloud._denied == 1 or CrmCloud._denied % 20 == 0:
@@ -1728,6 +1741,23 @@ def _loop_wd_mark(key: str) -> None:
         _touch_alive()
 
 
+def _loop_wd_answer_failed() -> None:
+    """W210/T1491: a CRM call from the main loop came back with an error (network / 5xx). That is
+    the loop ALIVE and the CRM unreachable — stamp `err` so the watchdog's "offline" rule holds.
+    Before this only an HTTPError escaping `_tick` stamped it, while `_cloud_retry` and the lead
+    streams swallow theirs: a slow / 503-ing CRM during a big re-enrich left `ok` and `err` both
+    stale for 600 s and the watchdog restarted a perfectly alive loop (MAC #6629, 4x in 1 h)."""
+    if threading.current_thread() is threading.main_thread():
+        _loop_wd_mark("err")
+
+
+def _loop_wd_progress() -> None:
+    """W210/T1491: main-loop work that is not a CRM call (hydrating thousands of rows into SQLite
+    under the lanes' write load) is still the loop running."""
+    if threading.current_thread() is threading.main_thread():
+        _loop_wd_mark("ok")
+
+
 def _watchdog_should_restart(now: float, last_ok: float, last_attempt: float, last_err: float,
                              limit: float) -> bool:
     """Pure decision. Restart only when the loop stopped RUNNING — never because the network is
@@ -1752,6 +1782,24 @@ def _watchdog_restart(silent_sec: int) -> None:
     24x7). Kill our Chromes so the next agent's launches are not swallowed, exit 3 — the
     supervisor (`run-agent-loop.sh` / `.bat`) relaunches in 15 s."""
     log.error("watchdog: CRM loop silent for %ds — restarting the agent", silent_sec)
+    # W210/T1491: the clean-up (ship logs over HTTP, a sqlite Store per job, kill Chromes) runs
+    # in a helper thread with a hard deadline. ASUS went 36 min silent on 2026-11-01 with a 600 s
+    # watchdog: the exit path itself can wait on the same CRM / sqlite lock the loop hung on.
+    # Whatever the clean-up does, the process is gone WATCHDOG_CLEANUP_SEC later.
+    t = threading.Thread(target=_watchdog_cleanup, args=(silent_sec,), name="watchdog-cleanup",
+                         daemon=True)
+    t.start()
+    t.join(WATCHDOG_CLEANUP_SEC)
+    if t.is_alive():
+        log.error("watchdog: clean-up still running after %ds — exiting anyway", int(WATCHDOG_CLEANUP_SEC))
+    os._exit(3)
+
+
+#: W210/T1491: hard cap on the watchdog's pre-exit clean-up.
+WATCHDOG_CLEANUP_SEC = 45.0
+
+
+def _watchdog_cleanup(silent_sec: int) -> None:
     cloud = _LOOP_WD.get("cloud")
     if cloud is not None and _CRM_LOG:
         try:
@@ -1771,7 +1819,6 @@ def _watchdog_restart(silent_sec: int) -> None:
     except Exception:                                             # noqa: BLE001
         log.debug("watchdog could not log on the running jobs", exc_info=True)
     _close_browsers("watchdog restart")
-    os._exit(3)
 
 
 def _start_loop_watchdog() -> threading.Thread | None:
@@ -3541,10 +3588,14 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
         return 0
     from webscraper.models import Place
     n = 0
+    keys: set[str] = set()
     for r in rows:
         pk = r.get("place_key")
         if not pk:
             continue
+        keys.add(str(pk))
+        if n % 200 == 0:
+            _loop_wd_progress()                                   # W210: 1,919 rows is real work
         p = Place(
             job_id=local_id, place_key=str(pk), name=r.get("name"), country=r.get("country"),
             phone=r.get("phone"), website=r.get("website"), email=r.get("email"),
@@ -3568,6 +3619,15 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
                 (err, local_id, str(pk)))
         n += 1
     store.conn.commit()
+    _loop_wd_progress()
+    # W210/T1491: these rows came FROM the CRM — do not stream them straight back. Before this
+    # `places_after(job, 0)` re-sent every hydrated row (1,919 for #6629) in 200-row `sync`
+    # calls on the next tick, and the upsert's changed_at bump re-sent them again as updates,
+    # on the tiny CRM instance that was already answering 503 — the stall that tripped the watchdog.
+    try:
+        _HYDRATED[local_id] = store.hydration_watermark(local_id, keys)
+    except Exception:                                             # noqa: BLE001
+        log.debug("hydration watermark skipped", exc_info=True)
     log.info("hydrated %d place(s) for cloud job #%s -> local job #%s from CRM results",
               n, cloud_job_id, local_id)
     store.log(local_id, "job",
@@ -3575,6 +3635,10 @@ def _hydrate_enrichment_from_cloud(cloud: "Cloud | CrmCloud", store: Store, loca
               f"results (this job previously ran on another machine)")
     return n
 
+
+#: W210/T1491: local job id -> (rowid, changed_at) the CRM already holds after a hydrate.
+#: Consumed by `_tick`'s lead streams, which lift their watermarks to it.
+_HYDRATED: dict[int, tuple[int, str]] = {}
 
 #: local job id -> `changed_at` watermark of updates already streamed. In memory like
 #: `synced_upto`; a restart re-sends one tick's worth of updates, absorbed by the upsert.
@@ -3585,6 +3649,9 @@ _changed_upto: dict[int, str] = {}
 #: DNS hiccups) resolve within seconds; without an in-tick retry every one of them fell
 #: through to "will retry next tick" and waited a full poll interval.
 _CLOUD_RETRY_BACKOFF = (2.0, 5.0, 10.0)
+#: W210/T1491: total wall budget of one `_cloud_retry` — no new attempt starts after it, so a
+#: CRM answering slow 503s cannot hold the loop for 4 x (60 s read + backoff) per batch.
+CLOUD_RETRY_BUDGET_SEC = 90.0
 
 
 def _cloud_retry(fn: Callable[[], Any], what: str) -> Any:
@@ -3594,12 +3661,14 @@ def _cloud_retry(fn: Callable[[], Any], what: str) -> Any:
     get that far, so a batch already fetched does not sit unsent for a whole poll interval
     (and never has to be re-fetched/re-flattened for the next tick's attempt)."""
     last: httpx.HTTPError | None = None
+    t0 = time.monotonic()
     for attempt, wait in enumerate((*_CLOUD_RETRY_BACKOFF, None)):
         try:
             return fn()
         except httpx.HTTPError as e:
             last = e
-            if wait is None:
+            _loop_wd_answer_failed()                              # W210: loop alive, CRM not
+            if wait is None or time.monotonic() - t0 + wait > CLOUD_RETRY_BUDGET_SEC:
                 raise
             log.warning("%s: transient error (%s) — retry %d/%d in %.0fs",
                         what, e, attempt + 1, len(_CLOUD_RETRY_BACKOFF), wait)
@@ -3728,6 +3797,11 @@ def _tick(cloud: "Cloud | CrmCloud", store: Store, kind: str = "saas",
             # upserted on (job_id, place_key), so the full sync at the end still overwrites
             # these with their enriched/researched versions.
             if synced_upto is not None:
+                hyd = _HYDRATED.pop(row["id"], None)              # W210: CRM-sourced rows
+                if hyd is not None:
+                    synced_upto[row["id"]] = max(synced_upto.get(row["id"], 0), int(hyd[0]))
+                    if hyd[1] and hyd[1] > _changed_upto.get(row["id"], ""):
+                        _changed_upto[row["id"]] = hyd[1]
                 # Rows the CRM already has, updated since the last tick (enrichment /
                 # WhatsApp verdicts). Before the new-row stream so the watermark of "what
                 # the CRM holds" is the one this query was scoped to.
