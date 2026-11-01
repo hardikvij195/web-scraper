@@ -2337,7 +2337,10 @@ _CONFIG_REFRESH_PREFIXES = (# W212: AI research keys / order / models — a key 
                             # W200 (CRM T1440): parallel websites per job + pooled WhatsApp idle close
                             "ENRICH_CONCURRENCY__", "WA_KEEP_OPEN_IDLE_MIN",
                             # W205 (CRM T1472): in-app WhatsApp checks + audit cadence + pipelining
-                            "WA_INAPP")
+                            "WA_INAPP",
+                            # W213 (CRM T1493): unknown re-tries on/off (`wa_reverify_unknown`) — was read only at start,
+                            # so turning it on left a re-verify of unknown numbers finishing with 0 checks
+                            "WA_REVERIFY_UNKNOWN")
 
 #: W186: the lane-pause knob alone is re-read this often (the CRM switch should bite within ~1 min;
 #: the other knobs keep the 5-min cadence).
