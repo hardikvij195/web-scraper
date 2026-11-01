@@ -41,3 +41,11 @@ def test_new_cloud_ai_key_adopted_on_refresh(monkeypatch):
     assert os.environ["GROQ_API_KEY_2"] == "k2"
     assert os.environ["AI_RESEARCH_PROVIDERS"] == "groq,openrouter"
     monkeypatch.delenv("GROQ_API_KEY_2"); monkeypatch.delenv("AI_RESEARCH_PROVIDERS")
+
+
+def test_ollama_enabled_by_base_url_alone(monkeypatch):
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.setenv("AI_RESEARCH_BASE_OLLAMA", "http://192.168.1.10:11434/v1")
+    monkeypatch.setenv("AI_RESEARCH_PROVIDERS", "groq,openrouter")
+    assert research._keys_for("ollama") == ["ollama"]
+    assert research._provider_order() == ["groq", "ollama", "openrouter"]

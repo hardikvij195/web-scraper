@@ -82,6 +82,11 @@ def _keys_for(name: str) -> list[str]:
             return []
         env = spec[1]
         first = os.getenv(env)
+        # W212: Ollama needs no real key — the CRM setting `ai_research_base_ollama` (the PC's
+        # 5070 Ti on the LAN) is enough. A cloud `*_api_key` for a provider outside the key
+        # selection is stripped by the CRM, so the base URL is the switch that survives.
+        if not first and name == "ollama" and os.getenv("AI_RESEARCH_BASE_OLLAMA"):
+            first = "ollama"
     if not first:
         return []
     keys = [first]
@@ -241,7 +246,7 @@ def _provider_order() -> list[str]:
     # W212: the CRM key selection writes AI_RESEARCH_PROVIDERS from its own (cloud) keys only,
     # so a machine-local Ollama would never be in it. When this machine has one, it goes right
     # after groq (owner: groq first, then the local GPU), or first when groq is not listed.
-    if "ollama" not in order and os.getenv("OLLAMA_API_KEY"):
+    if "ollama" not in order and (os.getenv("OLLAMA_API_KEY") or os.getenv("AI_RESEARCH_BASE_OLLAMA")):
         at = order.index("groq") + 1 if "groq" in order else 0
         order.insert(at, "ollama")
     return order
