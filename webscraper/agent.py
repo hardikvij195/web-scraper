@@ -21,6 +21,7 @@ from webscraper.config import settings
 from datetime import datetime, timezone
 
 from webscraper import eta
+from webscraper import remote_access as _remote_access
 from webscraper import server as srv
 from webscraper.store import Store, now_iso
 from webscraper.lanes import STAGE_GATES
@@ -2757,6 +2758,10 @@ def _poll_command(cloud: "CrmCloud", force: bool = False) -> None:
             elif cmd["command"] == "restart":
                 # W46: plain restart, no pull — body in _do_restart (W100 shares it).
                 _do_restart(cloud, int(cmd["id"]))
+            elif cmd["command"] in _remote_access.COMMANDS:
+                # W214 (CRM T1555): RustDesk + always-on Claude. The arg (remote_setup's RustDesk
+                # password) goes to the script's env only; the result comes back redacted.
+                ok, result = _remote_access.run(cmd["command"], cmd.get("arg"), device=DEVICE_NAME)
             else:
                 result = f"unknown command {cmd['command']}"
                 log.error("command %s: unknown on agent %s - Update agent first", cmd["command"], AGENT_VERSION if 'AGENT_VERSION' in globals() else '?')
