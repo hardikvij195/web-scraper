@@ -1615,6 +1615,23 @@ class WhatsAppLane(Lane):
                 # pins its own account and its own sqlite connection; the progress
                 # callback is the one shared thing and is locked.
                 accounts = store.enabled_wa_accounts()
+                # W215 (CRM T1557): a number in its per-number cooldown (1k checks -> 2 h) leaves the
+                # session list — its worker is released (Chrome closes), the other numbers carry on.
+                from webscraper import wa_budget as _wb
+                _cooling = _wb.BUDGET.cooling_names(accounts)
+                if accounts and _cooling and len(_cooling) == len(accounts):
+                    _until = min(_wb.BUDGET.cooling_until(a) or 0 for a in accounts)
+                    for nm in list(self._wa_workers or {}):
+                        (self._wa_workers or {}).pop(nm, None)
+                        wa_verify.POOL.release(nm)
+                    self._slot_idle("every WhatsApp number is cooling down (W215)", force=True)
+                    if time.monotonic() - mem_note_at >= 600:
+                        mem_note_at = time.monotonic()
+                        self.note(f"WhatsApp checks on hold — every linked number reached its per-number cap and is "
+                                  f"cooling down until {_wb.fmt_until(_until)}; numbers stay queued (W215)", "info")
+                    time.sleep(IDLE_POLL_SEC)
+                    continue
+                accounts = [a for a in accounts if a not in _cooling]
                 want = _wa_parallel()
                 n = max(1, min(want, len(accounts)))
                 if n > 1:

@@ -45,6 +45,11 @@ from webscraper.browser_recovery import (MAX_RELAUNCH, RESTORE_BUBBLE_ARGS, Rela
 from webscraper.config import settings
 from webscraper.extractors import normalise_phone
 from webscraper.store import Store, plus
+from webscraper import wa_budget as _wb
+
+#: W215 (CRM T1557): the account the current thread's last check ran on — the re-verify progress
+#: callback reads it to send `wa_checked_by` to the CRM.
+LAST_CHECK_ACCOUNT: dict[int, str | None] = {}
 
 log = logging.getLogger("webscraper.wa_verify")
 
@@ -1757,9 +1762,32 @@ def verify_places(
                 relaunchers.pop(_p, None)
             if account and account in _PAUSED and not _wait_while_paused(should_stop, account):
                 break
-            name = account if account else store.pick_wa_account(cap, today, exclude=unavailable | _PAUSED)
+            # W215 (CRM T1557): a number in its per-number cooldown is out of the rotation too.
+            _cool = _wb.BUDGET.cooling_names(str(a["name"]) for a in accounts)
+            name = account if account else store.pick_wa_account(cap, today, exclude=unavailable | _PAUSED | _cool)
             if name is None and not account and _PAUSED and _wait_while_paused(should_stop):
-                name = store.pick_wa_account(cap, today, exclude=unavailable | _PAUSED)
+                name = store.pick_wa_account(cap, today, exclude=unavailable | _PAUSED | _cool)
+            if name is None and not account and _cool:
+                log.info("every usable WhatsApp number is cooling down (W215) — slice ends, numbers stay queued")
+                break
+            if name is not None and name not in unavailable:
+                _ok, _until, _ev = _wb.BUDGET.take(name)
+                if _ev == "end" and job_id is not None:
+                    store.log(job_id, "whatsapp", f"{name}: per-number cooldown over — checks resume (W215)", "info")
+                if not _ok:
+                    if _ev == "start":
+                        msg = (f"{name}: {_wb.number_cap()} checks reached on this number — cooling down until "
+                               f"{_wb.fmt_until(_until)} ({int(_wb.cooldown_sec() / 60)} min), other numbers "
+                               "carry on (W215)")
+                        log.warning("[%s] %s", name, msg)
+                        if job_id is not None:
+                            store.log(job_id, "whatsapp", msg, "warn")
+                    _close_account(name)
+                    relaunchers.pop(name, None)
+                    if account:
+                        break     # pinned slice: this number goes back to the queue
+                    continue
+            LAST_CHECK_ACCOUNT[threading.get_ident()] = name
             if name is None or name in unavailable:
                 if name in unavailable:
                     break                       # this slice's own account cannot render — done here

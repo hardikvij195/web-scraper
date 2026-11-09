@@ -611,6 +611,22 @@ class CrmCloud:
         d = r.json()
         return d if isinstance(d, list) else []
 
+    def wa_budget(self, number: str, n: int) -> dict | None:
+        """W215 (CRM T1557): reserve `n` checks on WhatsApp NUMBER `number` (RPC `wa_number_take`).
+        Short timeout — it sits in the check path; any failure -> None (local fail-safe counter)."""
+        try:
+            r = self.c.post(self.url, json=crm_payload("wa_budget", number=number, n=int(n)),
+                            timeout=httpx.Timeout(15.0, connect=8.0))
+        except httpx.HTTPError:
+            return None
+        if r.status_code >= 400:
+            return None
+        try:
+            d = r.json()
+        except ValueError:
+            return None
+        return d if isinstance(d, dict) and "allowed" in d else None
+
     def set_wa(self, jid: int, updates: list[dict]) -> None:
         self._post(crm_payload("set_wa", job_id=jid, updates=updates)).raise_for_status()
 
@@ -641,6 +657,8 @@ def _flat(r: dict) -> dict:
         # `sync` action deletes rows flagged `_delete` (2026-09-05).
         return {"place_key": r["place_key"], "_delete": True}
     out = {k: v for k, v in _row(r).items() if v is not None and v != ""}
+    if r.get("wa_verify_account"):                                # W215 (CRM T1557): account of the last check
+        out["wa_checked_by"] = str(r["wa_verify_account"])
     # W56 (2026-09-07): `site_phones` was never in `_row` (`supa._COLS` is the SaaS table's
     # shape, which lacks the column), so the CRM held NO website phone numbers at all —
     # 47 of 72 leads the CRM showed as "done, nothing found" had numbers sitting in the
@@ -1499,6 +1517,9 @@ def run_agent(base: str, token: str, poll_sec: int = 15, kind: str = "saas") -> 
         logging.getLogger().addHandler(crm_log)
         _CRM_LOG[:] = [crm_log]
     cloud = CrmCloud(base, token) if kind == "crm" else Cloud(base, token)
+    if isinstance(cloud, CrmCloud):
+        from webscraper import wa_budget as _wb                   # W215: per-number budget via the CRM
+        _wb.set_remote(cloud.wa_budget)
     # W142 (CRM T1020): the Mac stopped heartbeating at 15:11 with the process still alive, so
     # launchd never restarted it and every CRM command sat at "requested". A daemon thread
     # watches the loop's own clock and exits non-zero (the supervisor relaunches) when it goes
@@ -2341,7 +2362,9 @@ _CONFIG_REFRESH_PREFIXES = (# W212: AI research keys / order / models — a key 
                             "WA_INAPP",
                             # W213 (CRM T1493): unknown re-tries on/off (`wa_reverify_unknown`) — was read only at start,
                             # so turning it on left a re-verify of unknown numbers finishing with 0 checks
-                            "WA_REVERIFY_UNKNOWN")
+                            "WA_REVERIFY_UNKNOWN",
+                            # W215 (CRM T1557): per-number cap / cooldown / numbers list
+                            "WA_NUMBER_")
 
 #: W186: the lane-pause knob alone is re-read this often (the CRM switch should bite within ~1 min;
 #: the other knobs keep the 5-min cadence).
@@ -3197,6 +3220,10 @@ def _reverify_wa_run(cloud: "CrmCloud", store: Store, jid: int, leads_verify: bo
         r0 = name_by_pk.get(pk, {})
         _jlog(_wa_line(r0, status, num, source))
         upd: dict[str, Any] = {"place_key": pk, "wa_verified": agg}
+        from webscraper import wa_verify as _wv                   # W215: which account made this check
+        _by = _wv.LAST_CHECK_ACCOUNT.get(threading.get_ident())
+        if _by:
+            upd["wa_checked_by"] = _by
         # W104 (CRM T547): this run's verdict for THIS number, as a delta the Edge Function
         # merges into the lead's wa_numbers by number — `checks: 1` = "one more look
         # happened now". Without it the CRM never saw a second check from a re-verify, so a
