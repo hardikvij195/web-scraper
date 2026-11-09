@@ -13,7 +13,7 @@ CRM unreachable -> a local per-number counter enforces the same cap (fail-safe).
 
 Settings (lead_gen_settings -> env, live-refreshed): WA_NUMBER_CAP (default 1000; 0 = off),
 WA_NUMBER_COOLDOWN_MIN (default 120), WA_NUMBER_CAP_NUMBERS (comma list of 10-digit numbers, or
-`all`; default the five numbers below).
+`all`; default `all`).
 """
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
-DEFAULT_NUMBERS = "9315646352,9821243899,8588099649,9211256289,8287659741"
+#: Owner 2026-11-09 (after OnePlus 9773603818 was logged out too): every number is capped by default.
+DEFAULT_NUMBERS = "all"
 RESERVE = 10                     #: checks reserved per CRM call
 _NUM_RE = re.compile(r"(\d{10})$")
 

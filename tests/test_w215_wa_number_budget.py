@@ -50,7 +50,8 @@ def test_number_parsing():
     assert account_number("main") is None
     assert account_number(None) is None
     assert wa_budget.applies("9315646352")
-    assert not wa_budget.applies("9773603818")              # OnePlus excluded by default
+    assert wa_budget.applies("9773603818")                  # default `all` (OnePlus logged out too)
+    assert not wa_budget.applies(None)
 
 
 def test_numbers_list_all_and_off(monkeypatch):
@@ -72,10 +73,10 @@ def test_cap_reached_then_resumes_after_cooldown(tmp_path):
     assert crm.calls == 3                                    # reserved in blocks of 10
     ok, until, ev = b.take(name)
     assert not ok and ev == "start" and until == pytest.approx(clock.t + 7200)
-    assert b.cooling_names([name, "oneplus_biz_9773603818"]) == {name}
+    assert b.cooling_names([name, "main"]) == {name}
     ok, _, ev = b.take(name)
     assert not ok and ev is None                             # announced once
-    assert b.take("oneplus_biz_9773603818")[0]               # not capped -> unaffected
+    assert b.take("main")[0]                                 # no number -> never capped
     clock.t += 7201
     assert b.cooling_until(name) is None
     ok, _, ev = b.take(name)
